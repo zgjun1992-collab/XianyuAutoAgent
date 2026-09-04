@@ -2,5 +2,4 @@
 
 APP_EDITION = "V3.5"
 APP_VERSION = "0.9.5"
-BUILD_COMMIT = "development"
-
+BUILD_COMMIT = "acb5bf5"
