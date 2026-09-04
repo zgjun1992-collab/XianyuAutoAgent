@@ -2,6 +2,9 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('xianyuDesktop', {
   backend: (method, path, body) => ipcRenderer.invoke('backend:request', { method, path, body }),
+  licenseLogin: (payload) => ipcRenderer.invoke('license:login', payload),
+  licenseStatus: () => ipcRenderer.invoke('license:status'),
+  licenseLogout: () => ipcRenderer.invoke('license:logout'),
   setBrowserBounds: (bounds) => ipcRenderer.send('browser:set-bounds', bounds),
   browser: (action) => ipcRenderer.invoke('browser:action', action),
   chooseExcel: () => ipcRenderer.invoke('dialog:choose-excel'),

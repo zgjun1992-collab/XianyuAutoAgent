@@ -2,7 +2,9 @@ const { app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage, dial
 const { spawn } = require('child_process')
 const fs = require('fs')
 const net = require('net')
+const os = require('os')
 const path = require('path')
+const crypto = require('crypto')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -70,6 +72,90 @@ function decryptSecret(value) {
   }
 }
 
+function licenseSettings() {
+  const saved = readSettings()
+  if (!saved.device_id) {
+    saved.device_id = crypto.randomUUID()
+    writeSettings(saved)
+  }
+  return saved
+}
+
+async function licenseRequest(requestPath, body) {
+  const saved = licenseSettings()
+  const baseUrl = String(saved.license_server_url || 'http://127.0.0.1:8787').replace(/\/$/, '')
+  const response = await fetch(`${baseUrl}${requestPath}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+  const payload = await response.json()
+  if (!response.ok || !payload.ok) {
+    const error = new Error(payload.error || `授权服务器错误 ${response.status}`)
+    error.authoritative = true
+    throw error
+  }
+  return payload.data
+}
+
+async function licenseLogin(incoming) {
+  const saved = licenseSettings()
+  if (incoming.server_url) saved.license_server_url = String(incoming.server_url).trim().replace(/\/$/, '')
+  const result = await licenseRequest('/v1/auth/login', {
+    username: incoming.username,
+    password: incoming.password,
+    device_id: saved.device_id,
+    device_name: os.hostname()
+  })
+  saved.license_token_encrypted = encryptSecret(result.token)
+  saved.license_username = result.user.username
+  saved.license_snapshot_encrypted = encryptSecret(JSON.stringify({
+    user: result.user,
+    entitlement: result.entitlement,
+    checked_at: new Date().toISOString()
+  }))
+  writeSettings(saved)
+  return { ...result, token: undefined, server_url: saved.license_server_url, device_id: saved.device_id, mode: 'online' }
+}
+
+function cachedLicense(saved) {
+  try {
+    const value = JSON.parse(decryptSecret(saved.license_snapshot_encrypted))
+    const ageHours = (Date.now() - new Date(value.checked_at).getTime()) / 3600000
+    if (value.entitlement?.active && ageHours >= 0 && ageHours <= 48 && new Date(value.entitlement.expires_at) > new Date()) {
+      return { ...value, server_url: saved.license_server_url, device_id: saved.device_id, mode: 'offline_grace', grace_hours_left: Math.max(0, 48 - ageHours) }
+    }
+  } catch (_error) {}
+  return null
+}
+
+async function licenseStatus() {
+  const saved = licenseSettings()
+  const token = decryptSecret(saved.license_token_encrypted)
+  if (!token) return { active: false, logged_in: false, server_url: saved.license_server_url || 'http://127.0.0.1:8787', device_id: saved.device_id }
+  try {
+    const result = await licenseRequest('/v1/license/verify', { token, device_id: saved.device_id })
+    saved.license_snapshot_encrypted = encryptSecret(JSON.stringify(result))
+    writeSettings(saved)
+    return { ...result, active: true, logged_in: true, server_url: saved.license_server_url, device_id: saved.device_id, mode: 'online' }
+  } catch (error) {
+    if (!error.authoritative) {
+      const cached = cachedLicense(saved)
+      if (cached) return { ...cached, active: true, logged_in: true }
+    }
+    return { active: false, logged_in: true, error: error.message, server_url: saved.license_server_url, device_id: saved.device_id }
+  }
+}
+
+function licenseLogout() {
+  const saved = licenseSettings()
+  delete saved.license_token_encrypted
+  delete saved.license_snapshot_encrypted
+  delete saved.license_username
+  writeSettings(saved)
+  return { active: false, logged_in: false, server_url: saved.license_server_url, device_id: saved.device_id }
+}
+
 async function freePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -84,6 +170,10 @@ async function freePort() {
 
 async function requestBackend(method, requestPath, body) {
   if (!backendReady) await waitForBackend()
+  if (method === 'POST' && requestPath === '/service/start') {
+    const currentLicense = await licenseStatus()
+    if (!currentLicense.active) throw new Error(currentLicense.error || '请先登录并开通有效套餐')
+  }
   const response = await fetch(`http://127.0.0.1:${backendPort}${requestPath}`, {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -118,7 +208,7 @@ async function startBackend() {
     executable = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
     args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir]
   } else {
-    executable = path.join(process.resourcesPath, 'backend', 'xianyu-v3-backend.exe')
+    executable = path.join(process.resourcesPath, 'backend', 'xianyu-cloud-test-backend.exe')
     args = ['--port', String(backendPort), '--data-dir', dataDir]
   }
   backendProcess = spawn(executable, args, {
@@ -211,7 +301,7 @@ async function createWindow() {
     minWidth: 1180,
     minHeight: 760,
     backgroundColor: '#f4efe2',
-    title: '闲鱼卡券 AI 客服 V3.5',
+    title: '闲鱼卡券 AI 客服 V3.6 云端测试版',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
@@ -231,6 +321,9 @@ async function createWindow() {
 
 function registerIpc() {
   ipcMain.handle('backend:request', (_event, payload) => requestBackend(payload.method || 'GET', payload.path, payload.body))
+  ipcMain.handle('license:login', (_event, payload) => licenseLogin(payload || {}))
+  ipcMain.handle('license:status', () => licenseStatus())
+  ipcMain.handle('license:logout', () => licenseLogout())
   ipcMain.on('browser:set-bounds', (_event, bounds) => {
     if (!goofishView) return
     const safe = {

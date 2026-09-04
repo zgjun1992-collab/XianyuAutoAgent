@@ -14,9 +14,13 @@ develop-eggs/
 dist/
 dist-v2-backend/
 build-v2-backend/
+dist-cloud-backend/
+build-cloud-backend/
 desktop_v2/node_modules/
 desktop_v2/dist/
 desktop_v2/release/
+desktop_v2/release-cloud-test/
+work/
 downloads/
 eggs/
 .eggs/

@@ -15,6 +15,8 @@ const snapshot = reactive({
 })
 const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '', order_notice_enabled: true })
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
+const licenseDraft = reactive({ server_url: 'http://127.0.0.1:8787', username: '', password: '' })
+const license = reactive({ active: false, logged_in: false, mode: '', user: null, entitlement: null, error: '', device_id: '', server_url: '' })
 const policyDraft = reactive({ reply_mode: 'review', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
 const imageDraft = reactive({ id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
@@ -44,6 +46,7 @@ const navItems = [
   { id: 'reviews', icon: '审', label: '回复审核', badge: () => snapshot.dashboard.audits.pending || 0 },
   { id: 'guardrails', icon: '盾', label: '客服约束' },
   { id: 'testing', icon: '测', label: '测试中心' },
+  { id: 'license', icon: '权', label: '账号与授权' },
   { id: 'settings', icon: '设', label: 'AI与连接' },
   { id: 'logs', icon: '录', label: '运行记录' }
 ]
@@ -56,6 +59,7 @@ const filteredProducts = computed(() => {
   return snapshot.products.filter((item) => `${item.title} ${item.item_id}`.toLowerCase().includes(query))
 })
 const serviceActive = computed(() => ['starting', 'connected', 'reconnecting', 'stopping'].includes(snapshot.service.status))
+const licenseReady = computed(() => Boolean(license.active && license.entitlement?.active))
 const serviceLabel = computed(() => ({
   stopped: '客服已停止', starting: '正在启动', connected: '客服运行中', reconnecting: '正在重连', stopping: '正在停止', error: '连接异常'
 }[snapshot.service.status] || snapshot.service.status))
@@ -568,7 +572,47 @@ async function syncCookie() {
   notify(result.saved ? `已同步 ${result.count} 个闲鱼登录凭据` : '尚未检测到闲鱼登录，请先登录', result.saved ? 'ok' : 'error')
 }
 
+async function refreshLicense(quiet = false) {
+  try {
+    const result = await desktop.licenseStatus()
+    Object.assign(license, result)
+    if (result.server_url) licenseDraft.server_url = result.server_url
+    if (!quiet && result.active) notify(result.mode === 'offline_grace' ? '当前处于48小时离线宽限' : '授权状态正常')
+    return result
+  } catch (error) {
+    if (!quiet) notify(error.message || '授权检查失败', 'error')
+    return null
+  }
+}
+
+async function loginLicense() {
+  if (!licenseDraft.username || !licenseDraft.password) return notify('请输入账号和密码', 'error')
+  try {
+    loading.value = true
+    const result = await desktop.licenseLogin({ ...licenseDraft })
+    Object.assign(license, result, { active: true, logged_in: true, error: '' })
+    licenseDraft.password = ''
+    notify('登录成功，当前设备已授权')
+  } catch (error) {
+    notify(error.message || '登录失败', 'error')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function logoutLicense() {
+  Object.assign(license, await desktop.licenseLogout(), { user: null, entitlement: null, error: '' })
+  notify('已退出授权账号')
+}
+
 async function toggleService() {
+  if (!serviceActive.value) {
+    const current = await refreshLicense(true)
+    if (!current?.active) {
+      changeRoute('license')
+      return notify(current?.error || '请先登录并开通有效套餐', 'error')
+    }
+  }
   const endpoint = serviceActive.value ? '/service/stop' : '/service/start'
   await call('POST', endpoint, {})
   await refresh()
@@ -591,7 +635,7 @@ function syncBrowserBounds() {
 watch([route, aiPanelOpen, sidebarCollapsed], () => nextTick(syncBrowserBounds))
 
 onMounted(async () => {
-  await Promise.all([refresh(false), getConfig()])
+  await Promise.all([refresh(false), getConfig(), refreshLicense(true)])
   resizeObserver = new ResizeObserver(syncBrowserBounds)
   resizeObserver.observe(document.body)
   if (browserStage.value) resizeObserver.observe(browserStage.value)
@@ -619,7 +663,7 @@ onBeforeUnmount(() => {
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">券</div>
-        <div v-if="!sidebarCollapsed" class="brand-copy"><strong>闲鱼卡券</strong><span>AI 客服 V3.5</span></div>
+        <div v-if="!sidebarCollapsed" class="brand-copy"><strong>闲鱼卡券</strong><span>V3.6 云端测试版</span></div>
       </div>
       <nav class="nav-list">
         <button v-for="item in navItems" :key="item.id" :class="['nav-item', { active: route === item.id }]" @click="changeRoute(item.id)">
@@ -708,6 +752,36 @@ onBeforeUnmount(() => {
             <div v-else class="security-note">当前商品沿用全店默认政策。</div>
             <div class="button-row end"><button class="primary" @click="saveCustomPolicy">保存当前商品政策</button></div>
           </template>
+        </article>
+      </section>
+
+      <section v-else-if="route === 'license'" class="page scroll-page narrow-page">
+        <div class="page-heading">
+          <div><span class="eyebrow">订阅与设备</span><h2>账号与授权</h2><p>月卡、年卡和设备授权由云端统一管理，本地商品与聊天数据不会因此删除。</p></div>
+          <button v-if="license.logged_in" @click="refreshLicense(false)">刷新授权</button>
+        </div>
+        <article v-if="licenseReady" class="panel form-panel">
+          <div class="status-grid">
+            <div><i class="good"></i><span>授权状态</span><strong>{{ license.mode === 'offline_grace' ? '离线宽限' : '正常' }}</strong></div>
+            <div><i class="good"></i><span>当前套餐</span><strong>{{ license.entitlement?.name }}</strong></div>
+          </div>
+          <div class="license-details">
+            <p><b>登录账号：</b>{{ license.user?.username }}</p>
+            <p><b>到期时间：</b>{{ license.entitlement?.expires_at }}</p>
+            <p><b>设备上限：</b>{{ license.entitlement?.max_devices }} 台</p>
+            <p><b>闲鱼账号上限：</b>{{ license.entitlement?.max_xianyu_accounts }} 个</p>
+            <p v-if="license.mode === 'offline_grace'"><b>剩余离线宽限：</b>{{ Number(license.grace_hours_left || 0).toFixed(1) }} 小时</p>
+          </div>
+          <div class="security-note">授权到期只会停止自动客服，不会删除本机商品知识、门店、会话或审核记录。</div>
+          <div class="button-row end"><button class="danger" @click="logoutLicense">退出账号</button></div>
+        </article>
+        <article v-else class="panel form-panel">
+          <div v-if="license.error" class="security-note">{{ license.error }}</div>
+          <label>授权服务器<input v-model="licenseDraft.server_url" placeholder="https://license.example.com" /></label>
+          <label>账号<input v-model="licenseDraft.username" autocomplete="username" placeholder="管理员为你创建的账号" /></label>
+          <label>密码<input v-model="licenseDraft.password" type="password" autocomplete="current-password" @keyup.enter="loginLicense" /></label>
+          <div class="button-row end"><button class="primary" @click="loginLicense">登录并绑定本机</button></div>
+          <div class="security-note">测试版默认连接本机 127.0.0.1:8787。正式发布时替换为你的 HTTPS 授权域名。</div>
         </article>
       </section>
 

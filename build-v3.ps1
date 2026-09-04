@@ -19,10 +19,10 @@ if (-not (Test-Path -LiteralPath $pnpmPath)) {
     --clean `
     --onefile `
     --console `
-    --name "xianyu-v3-backend" `
-    --distpath "dist-v3-backend" `
-    --workpath "build-v3-backend" `
-    --specpath "build-v3-backend" `
+    --name "xianyu-cloud-test-backend" `
+    --distpath "dist-cloud-backend" `
+    --workpath "build-cloud-backend" `
+    --specpath "build-cloud-backend" `
     --add-data "$PSScriptRoot\prompts;prompts" `
     "$PSScriptRoot\v2_backend.py"
 if ($LASTEXITCODE -ne 0) {
@@ -60,4 +60,4 @@ try {
     Pop-Location
 }
 
-Write-Host "V3.5 installer generated under desktop_v2\release-v3.5" -ForegroundColor Green
+Write-Host "V3.6 cloud test installer generated under desktop_v2\release-cloud-test" -ForegroundColor Green

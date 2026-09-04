@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>闲鱼卡券AI客服 · 私售管理</title>
+<style>
+body{margin:0;background:#f4f1e8;color:#20231f;font:14px system-ui,"Microsoft YaHei"}.wrap{max-width:1100px;margin:40px auto;padding:0 20px}h1{font-size:28px}.card{background:#fff;border:1px solid #ded9ca;border-radius:16px;padding:20px;margin:16px 0;box-shadow:0 8px 30px #433b2520}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}input,select,button{box-sizing:border-box;width:100%;padding:11px;border:1px solid #cbc5b4;border-radius:9px;background:#fff}button{cursor:pointer;background:#242b24;color:#fff;border:0;font-weight:700}.danger{background:#8b3232}.muted{color:#746f63}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;border-bottom:1px solid #eee9dc}.actions{display:flex;gap:7px}.actions button{width:auto;padding:7px 10px}.ok{color:#247244}.bad{color:#a33131}@media(max-width:800px){.grid{grid-template-columns:1fr}table{display:block;overflow:auto}}
+</style></head><body><main class="wrap">
+<h1>闲鱼卡券AI客服 · 私售管理</h1><p class="muted">人工收款后，在这里创建客户并开通体验、月卡或年卡。</p>
+<section class="card"><h2>管理员验证</h2><div class="grid"><input id="adminKey" type="password" placeholder="LICENSE_ADMIN_KEY"><button onclick="loadUsers()">连接并刷新</button></div><p id="message"></p></section>
+<section class="card"><h2>创建客户</h2><div class="grid"><input id="username" placeholder="账号/邮箱"><input id="password" type="password" placeholder="初始密码（至少8位）"><input id="displayName" placeholder="客户备注名"><button onclick="createUser()">创建客户</button></div></section>
+<section class="card"><h2>客户与订阅</h2><table><thead><tr><th>ID</th><th>客户</th><th>状态</th><th>套餐</th><th>到期时间</th><th>操作</th></tr></thead><tbody id="users"><tr><td colspan="6" class="muted">请先连接</td></tr></tbody></table></section>
+</main><script>
+const msg=(text,ok=true)=>{const e=document.getElementById('message');e.textContent=text;e.className=ok?'ok':'bad'}
+const key=()=>document.getElementById('adminKey').value.trim()
+async function api(method,path,body){const r=await fetch(path,{method,headers:{'Content-Type':'application/json','X-Admin-Key':key()},body:body?JSON.stringify(body):undefined});const p=await r.json();if(!r.ok||!p.ok)throw new Error(p.error||'操作失败');return p.data}
+async function loadUsers(){try{const rows=await api('GET','/v1/admin/users');document.getElementById('users').innerHTML=rows.map(u=>`<tr><td>${u.id}</td><td><b>${escapeHtml(u.display_name||u.username)}</b><br><small>${escapeHtml(u.username)}</small></td><td>${u.status}</td><td>${u.plan_code||'未开通'}</td><td>${u.expires_at||'—'}</td><td><div class="actions"><button onclick="grant(${u.id},'trial')">体验</button><button onclick="grant(${u.id},'monthly')">月卡</button><button onclick="grant(${u.id},'yearly')">年卡</button><button class="danger" onclick="freezeUser(${u.id},'${u.status==='active'?'frozen':'active'}')">${u.status==='active'?'冻结':'恢复'}</button></div></td></tr>`).join('')||'<tr><td colspan="6">暂无客户</td></tr>';msg(`已加载 ${rows.length} 位客户`)}catch(e){msg(e.message,false)}}
+async function createUser(){try{await api('POST','/v1/admin/users',{username:username.value,password:password.value,display_name:displayName.value});password.value='';msg('客户创建成功');loadUsers()}catch(e){msg(e.message,false)}}
+async function grant(id,plan){try{await api('POST',`/v1/admin/users/${id}/subscription`,{plan_code:plan});msg('订阅开通/续费成功');loadUsers()}catch(e){msg(e.message,false)}}
+async function freezeUser(id,status){try{await api('POST',`/v1/admin/users/${id}/status`,{status});msg('客户状态已更新');loadUsers()}catch(e){msg(e.message,false)}}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+</script></body></html>
