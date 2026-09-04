@@ -39,6 +39,10 @@ let cookieTimer = null
 
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
+const OFFICIAL_LICENSE_SERVER_URL = 'https://api.yituan123.com'
+const DEFAULT_LICENSE_SERVER_URL = isDev
+  ? (process.env.XIANYU_LICENSE_SERVER_URL || OFFICIAL_LICENSE_SERVER_URL)
+  : OFFICIAL_LICENSE_SERVER_URL
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'desktop-settings.json')
@@ -74,20 +78,30 @@ function decryptSecret(value) {
 
 function licenseSettings() {
   const saved = readSettings()
+  let changed = false
   if (!saved.device_id) {
     saved.device_id = crypto.randomUUID()
-    writeSettings(saved)
+    changed = true
   }
+  if (!isDev && saved.license_server_url !== DEFAULT_LICENSE_SERVER_URL) {
+    saved.license_server_url = DEFAULT_LICENSE_SERVER_URL
+    delete saved.license_token_encrypted
+    delete saved.license_snapshot_encrypted
+    delete saved.license_username
+    changed = true
+  }
+  if (changed) writeSettings(saved)
   return saved
 }
 
 async function licenseRequest(requestPath, body) {
   const saved = licenseSettings()
-  const baseUrl = String(saved.license_server_url || 'http://127.0.0.1:8787').replace(/\/$/, '')
+  const baseUrl = String(saved.license_server_url || DEFAULT_LICENSE_SERVER_URL).replace(/\/$/, '')
   const response = await fetch(`${baseUrl}${requestPath}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000)
   })
   const payload = await response.json()
   if (!response.ok || !payload.ok) {
@@ -100,7 +114,14 @@ async function licenseRequest(requestPath, body) {
 
 async function licenseLogin(incoming) {
   const saved = licenseSettings()
-  if (incoming.server_url) saved.license_server_url = String(incoming.server_url).trim().replace(/\/$/, '')
+  if (isDev && incoming.server_url) {
+    const requested = new URL(String(incoming.server_url).trim())
+    const localHttp = requested.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(requested.hostname)
+    if (requested.protocol !== 'https:' && !localHttp) throw new Error('授权服务器必须使用HTTPS')
+    saved.license_server_url = requested.origin
+  } else {
+    saved.license_server_url = DEFAULT_LICENSE_SERVER_URL
+  }
   const result = await licenseRequest('/v1/auth/login', {
     username: incoming.username,
     password: incoming.password,
@@ -132,7 +153,7 @@ function cachedLicense(saved) {
 async function licenseStatus() {
   const saved = licenseSettings()
   const token = decryptSecret(saved.license_token_encrypted)
-  if (!token) return { active: false, logged_in: false, server_url: saved.license_server_url || 'http://127.0.0.1:8787', device_id: saved.device_id }
+  if (!token) return { active: false, logged_in: false, server_url: saved.license_server_url || DEFAULT_LICENSE_SERVER_URL, device_id: saved.device_id }
   try {
     const result = await licenseRequest('/v1/license/verify', { token, device_id: saved.device_id })
     saved.license_snapshot_encrypted = encryptSecret(JSON.stringify(result))
@@ -208,7 +229,7 @@ async function startBackend() {
     executable = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
     args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir]
   } else {
-    executable = path.join(process.resourcesPath, 'backend', 'xianyu-cloud-test-backend.exe')
+    executable = path.join(process.resourcesPath, 'backend', 'xianyu-cloud-preview-backend.exe')
     args = ['--port', String(backendPort), '--data-dir', dataDir]
   }
   backendProcess = spawn(executable, args, {

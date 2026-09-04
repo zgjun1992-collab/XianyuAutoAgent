@@ -1,8 +1,9 @@
 {
-  "name": "xianyu-card-ai-cloud-test",
-  "version": "0.10.0",
+  "name": "xianyu-card-ai-cloud-preview",
+  "version": "0.11.0",
   "private": true,
-  "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端授权测试版",
+  "author": "Yituan",
+  "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
@@ -22,12 +23,12 @@
     "yargs": "17.7.2"
   },
   "build": {
-    "appId": "cn.xianyu.cardai.cloudtest",
-    "productName": "闲鱼卡券AI客服云端测试版",
+    "appId": "cn.yituan123.xianyucardai.cloud",
+    "productName": "闲鱼卡券AI客服云端内测版",
     "electronDist": "node_modules/electron/dist",
     "asar": true,
     "directories": {
-      "output": "release-cloud-test"
+      "output": "release-cloud-prod"
     },
     "files": [
       "dist/**/*",
@@ -47,7 +48,7 @@
       "target": [
         "nsis"
       ],
-      "artifactName": "XianyuCardAI-V3.6-CloudTest-${version}.${ext}"
+      "artifactName": "XianyuCardAI-V3.6-CloudPreview-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

@@ -1,0 +1,30 @@
+api.yituan123.com {
+    encode zstd gzip
+
+    request_body {
+        max_size 1MB
+    }
+
+    reverse_proxy 127.0.0.1:8787 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Real-IP {remote_host}
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/xianyu-license-access.json {
+            roll_size 20MiB
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
+

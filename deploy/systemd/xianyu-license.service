@@ -1,0 +1,32 @@
+[Unit]
+Description=XianyuCardAI license service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xianyu-license
+Group=xianyu-license
+WorkingDirectory=/opt/xianyu-license/app
+EnvironmentFile=/etc/xianyu-license.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/xianyu-license/venv/bin/python -m cloud_license.server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/xianyu-license /var/log/xianyu-license
+
+[Install]
+WantedBy=multi-user.target
+

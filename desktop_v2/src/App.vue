@@ -15,7 +15,7 @@ const snapshot = reactive({
 })
 const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '', order_notice_enabled: true })
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
-const licenseDraft = reactive({ server_url: 'http://127.0.0.1:8787', username: '', password: '' })
+const licenseDraft = reactive({ server_url: 'https://api.yituan123.com', username: '', password: '' })
 const license = reactive({ active: false, logged_in: false, mode: '', user: null, entitlement: null, error: '', device_id: '', server_url: '' })
 const policyDraft = reactive({ reply_mode: 'review', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
@@ -777,11 +777,11 @@ onBeforeUnmount(() => {
         </article>
         <article v-else class="panel form-panel">
           <div v-if="license.error" class="security-note">{{ license.error }}</div>
-          <label>授权服务器<input v-model="licenseDraft.server_url" placeholder="https://license.example.com" /></label>
+          <label>授权服务器<input v-model="licenseDraft.server_url" readonly /></label>
           <label>账号<input v-model="licenseDraft.username" autocomplete="username" placeholder="管理员为你创建的账号" /></label>
           <label>密码<input v-model="licenseDraft.password" type="password" autocomplete="current-password" @keyup.enter="loginLicense" /></label>
           <div class="button-row end"><button class="primary" @click="loginLicense">登录并绑定本机</button></div>
-          <div class="security-note">测试版默认连接本机 127.0.0.1:8787。正式发布时替换为你的 HTTPS 授权域名。</div>
+          <div class="security-note">正式版固定连接 https://api.yituan123.com，账号和密码仅发送到该 HTTPS 授权服务。</div>
         </article>
       </section>
 
