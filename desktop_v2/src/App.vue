@@ -8,6 +8,7 @@ const aiPanelOpen = ref(true)
 const browserStage = ref(null)
 const loading = ref(false)
 const toast = reactive({ text: '', kind: 'ok', visible: false })
+const appIdentity = reactive({ edition: 'V3.5', frontend_version: '', backend_version: '', build_commit: '' })
 const snapshot = reactive({
   dashboard: { products: 0, enabled_products: 0, store_lists: 0, stores: 0, audits: {}, events: [] },
   products: [], store_lists: [], reviews: [], service: { status: 'stopped', message: '' },
@@ -591,7 +592,8 @@ function syncBrowserBounds() {
 watch([route, aiPanelOpen, sidebarCollapsed], () => nextTick(syncBrowserBounds))
 
 onMounted(async () => {
-  await Promise.all([refresh(false), getConfig()])
+  const [, , identity] = await Promise.all([refresh(false), getConfig(), desktop.getVersion()])
+  Object.assign(appIdentity, identity || {})
   resizeObserver = new ResizeObserver(syncBrowserBounds)
   resizeObserver.observe(document.body)
   if (browserStage.value) resizeObserver.observe(browserStage.value)
@@ -619,7 +621,7 @@ onBeforeUnmount(() => {
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">券</div>
-        <div v-if="!sidebarCollapsed" class="brand-copy"><strong>闲鱼卡券</strong><span>AI 客服 V3.5</span></div>
+        <div v-if="!sidebarCollapsed" class="brand-copy"><strong>闲鱼卡券</strong><span>AI 客服 {{ appIdentity.edition }} · {{ appIdentity.backend_version || appIdentity.frontend_version }}</span></div>
       </div>
       <nav class="nav-list">
         <button v-for="item in navItems" :key="item.id" :class="['nav-item', { active: route === item.id }]" @click="changeRoute(item.id)">

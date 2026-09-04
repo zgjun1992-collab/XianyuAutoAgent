@@ -11,6 +11,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+from build_info import APP_EDITION, APP_VERSION, BUILD_COMMIT
+
 from openai import OpenAI
 
 from XianyuAgent import XianyuReplyBot
@@ -597,7 +599,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path.rstrip("/") or "/"
             if path == "/health":
-                return self._ok({"status": "ok", "version": "3.4.0"})
+                return self._ok({
+                    "status": "ok",
+                    "edition": APP_EDITION,
+                    "version": APP_VERSION,
+                    "build_commit": BUILD_COMMIT,
+                })
             if path == "/snapshot":
                 return self._ok({
                     "dashboard": self.state.store.dashboard(),

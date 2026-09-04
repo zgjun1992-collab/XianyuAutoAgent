@@ -32,6 +32,7 @@ let goofishView = null
 let backendProcess = null
 let backendPort = null
 let backendReady = false
+let backendIdentity = null
 let lastPendingCount = 0
 let cookieTimer = null
 
@@ -100,10 +101,23 @@ async function waitForBackend() {
     try {
       const response = await fetch(`http://127.0.0.1:${backendPort}/health`)
       if (response.ok) {
+        const payload = await response.json()
+        const identity = payload?.data || {}
+        const expectedVersion = app.getVersion()
+        if (identity.edition !== 'V3.5' || identity.version !== expectedVersion) {
+          throw new Error(
+            `前后端版本不一致：桌面端 V3.5/${expectedVersion}，` +
+            `后台 ${identity.edition || '未知版本'}/${identity.version || '未知版本'}。` +
+            '请关闭旧程序后重新安装当前版本。'
+          )
+        }
+        backendIdentity = identity
         backendReady = true
         return
       }
-    } catch (_error) {}
+    } catch (error) {
+      if (String(error?.message || error).includes('前后端版本不一致')) throw error
+    }
     await new Promise((resolve) => setTimeout(resolve, 250))
   }
   throw new Error('本地AI服务启动超时')
@@ -135,6 +149,7 @@ async function startBackend() {
   })
   backendProcess.on('exit', (code) => {
     backendReady = false
+    backendIdentity = null
     mainWindow?.webContents.send('app:event', { type: 'backend-exit', code })
   })
   await waitForBackend()
@@ -231,6 +246,12 @@ async function createWindow() {
 
 function registerIpc() {
   ipcMain.handle('backend:request', (_event, payload) => requestBackend(payload.method || 'GET', payload.path, payload.body))
+  ipcMain.handle('app:version', () => ({
+    edition: 'V3.5',
+    frontend_version: app.getVersion(),
+    backend_version: backendIdentity?.version || '',
+    build_commit: backendIdentity?.build_commit || ''
+  }))
   ipcMain.on('browser:set-bounds', (_event, bounds) => {
     if (!goofishView) return
     const safe = {
