@@ -93,6 +93,7 @@ python main.py
 - `classify_prompt.txt`: 意图分类提示词
 - `price_prompt.txt`: 价格专家提示词
 - `tech_prompt.txt`: 技术专家提示词
+- `semantic_prompt.txt`: 可选的语义拆分提示词；只允许识别问题和抽取槽位，业务答案仍由本地规则核验
 - `default_prompt.txt`: 默认回复提示词
 
 ## 🤝 参与贡献

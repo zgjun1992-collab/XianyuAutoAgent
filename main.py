@@ -1254,10 +1254,10 @@ class XianyuLive:
             actual_paid_amount = self.extract_actual_paid_amount(message)
             predecision = PolicyEngine(policies).evaluate(send_message, "")
             resolver = getattr(self.app_store, "resolve_deterministic", None)
+            query_context = dict(conversation.get("query_context") or {})
+            query_context.update(self._query_contexts.get(scope_id) or {})
+            query_context.update(self._store_contexts.get(scope_id) or {})
             if resolver:
-                query_context = dict(conversation.get("query_context") or {})
-                query_context.update(self._query_contexts.get(scope_id) or {})
-                query_context.update(self._store_contexts.get(scope_id) or {})
                 try:
                     deterministic = resolver(
                         item_id, send_message, actual_paid_amount,
@@ -1266,6 +1266,56 @@ class XianyuLive:
                     )
                 except TypeError:
                     deterministic = resolver(item_id, send_message)
+
+            # The optional model pass can only interpret unresolved/compound
+            # wording. Every extracted question is sent back through the same
+            # deterministic resolver, so the model never decides store, SKU,
+            # price, date or aftersales facts.
+            semantic_checker = getattr(self.bot, "should_analyze_message", None)
+            semantic_parser = getattr(self.bot, "analyze_message", None)
+            semantic_resolver = getattr(self.app_store, "resolve_semantic_analysis", None)
+            if (
+                predecision.action != "replace" and semantic_checker
+                and semantic_parser and semantic_resolver
+                and semantic_checker(send_message, deterministic)
+            ):
+                try:
+                    product_getter = getattr(self.app_store, "get_v2_product", None)
+                    product = product_getter(item_id) if product_getter else None
+                    sku_getter = getattr(self.app_store, "list_product_skus", None)
+                    sku_names = []
+                    if sku_getter and product:
+                        sku_names = [
+                            str(sku.get("sku_name") or "")
+                            for sku in sku_getter(item_id, product)
+                            if sku.get("sku_name")
+                        ]
+                    semantic_context = {
+                        "product_title": str((product or {}).get("title") or ""),
+                        "sku_names": sku_names[:30],
+                        "last_store_query": str(query_context.get("query") or ""),
+                        "last_store_names": [
+                            str(store.get("branch") or store.get("brand") or "")
+                            for store in list(query_context.get("matches") or [])[:3]
+                        ],
+                        "last_selected_sku": str(query_context.get("selected_sku_name") or ""),
+                        "pending_store_query": str(query_context.get("pending_store_query") or ""),
+                    }
+                    semantic_history = self.context_manager.get_context_by_chat(scope_id)
+                    analysis = await asyncio.to_thread(
+                        semantic_parser, send_message, semantic_history, semantic_context,
+                    )
+                    enhanced = semantic_resolver(
+                        item_id, send_message, analysis, actual_paid_amount,
+                        query_context or None,
+                        getattr(self, "_order_routes", {}).get(scope_id) or None,
+                        deterministic,
+                    )
+                    if enhanced:
+                        deterministic = enhanced
+                        logger.info("语义辅助仅完成问题拆分，答案已由本地规则重新核验")
+                except Exception as exc:
+                    logger.warning(f"语义辅助失败，保留原有命中结果：{exc}")
             if deterministic and deterministic.get("query_context_update"):
                 stored_context = dict(conversation.get("query_context") or {})
                 for key, value in deterministic["query_context_update"].items():
@@ -1288,14 +1338,20 @@ class XianyuLive:
                     if context_updater:
                         context_updater(scope_id, stored_context)
             if deterministic and "store_matches" in deterministic:
-                self._store_contexts[scope_id] = {
+                next_store_context = {
                     "query": deterministic.get("store_query", ""),
                     "matches": deterministic.get("store_matches", []),
                     "status": deterministic.get("store_status", "available"),
+                    "store_sku_matrix": deterministic.get("store_sku_matrix", []),
                     "selected_sku_key": deterministic.get("query_context_update", {}).get(
                         "selected_sku_key", query_context.get("selected_sku_key", "")
                     ),
+                    "selected_sku_name": deterministic.get("query_context_update", {}).get(
+                        "selected_sku_name", query_context.get("selected_sku_name", "")
+                    ),
                 }
+                next_store_context.update(deterministic.get("store_context_update") or {})
+                self._store_contexts[scope_id] = next_store_context
             elif not deterministic or deterministic.get("kind") not in {"stores"}:
                 self._store_contexts.pop(scope_id, None)
             image_resolver = getattr(self.app_store, "resolve_image_asset", None)

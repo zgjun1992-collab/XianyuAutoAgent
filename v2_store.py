@@ -4441,6 +4441,9 @@ class V2Store(AppStore):
             output.append({
                 "sku_key": key, "sku_name": str(option.get("name") or "商品规格"),
                 "sale_price": str(option.get("sale_price") or ""),
+                "face_value": str(option.get("face_value") or ""),
+                "composition": str(option.get("composition") or ""),
+                "max_stack": str(option.get("max_stack") or ""),
                 "option_type": str(option.get("option_type") or ""),
                 "people_counts": option.get("people_counts") or [],
                 "audience_types": option.get("audience_types") or [],
@@ -4552,6 +4555,378 @@ class V2Store(AppStore):
             if result.get("status") == "available":
                 output.append({**sku, "matches": result.get("matches") or []})
         return output
+
+    @classmethod
+    def _physical_store_key(cls, store: Dict) -> tuple:
+        """Identify one physical branch across duplicated per-SKU store lists."""
+        branch = cls._store_fuzzy_key(store.get("branch") or store.get("brand"))
+        return (
+            cls._area_key(store.get("province")),
+            cls._area_key(store.get("city")),
+            branch or normalize_match_text(store.get("address")),
+        )
+
+    def _multi_sku_store_scope(self, item_id: str, product: Optional[Dict] = None) -> Dict:
+        """Build the read-only product-wide store scope for differing SKU rules."""
+        product = product or self.get_v2_product(item_id) or {}
+        skus = self.list_product_skus(item_id, product)
+        ready_skus = []
+        unknown_skus = []
+        all_list_ids = set()
+        effective_sets = set()
+        for sku in skus:
+            list_ids, mode, ready = self.effective_store_list_ids(item_id, sku["sku_key"])
+            normalized_ids = tuple(sorted(int(value) for value in list_ids))
+            effective_sets.add(normalized_ids if ready else ("unconfigured", sku["sku_key"]))
+            enriched = {
+                **sku,
+                "effective_list_ids": list(normalized_ids),
+                "mode": mode,
+                "configuration_ready": bool(ready),
+            }
+            if ready:
+                ready_skus.append(enriched)
+                all_list_ids.update(normalized_ids)
+            else:
+                unknown_skus.append(enriched)
+        return {
+            "skus": skus,
+            "ready_skus": ready_skus,
+            "unknown_skus": unknown_skus,
+            "list_ids": sorted(all_list_ids),
+            "stores_differ": len(effective_sets) > 1,
+        }
+
+    def _store_sku_matrix(self, item_id: str, stores: List[Dict], scope: Dict) -> List[Dict]:
+        """Map each matched physical store to confirmed and unconfigured SKUs."""
+        list_ids = sorted({
+            int(list_id)
+            for sku in scope.get("ready_skus") or []
+            for list_id in sku.get("effective_list_ids") or []
+        })
+        rows_by_list = {list_id: [] for list_id in list_ids}
+        if list_ids:
+            placeholders = ",".join("?" for _ in list_ids)
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM stores WHERE list_id IN ({placeholders})",
+                    list_ids,
+                ).fetchall()
+            for row in rows:
+                value = dict(row)
+                rows_by_list.setdefault(int(value["list_id"]), []).append(value)
+
+        output = []
+        for store in stores:
+            store_key = self._physical_store_key(store)
+            supported = []
+            for sku in scope.get("ready_skus") or []:
+                candidate_rows = [
+                    row
+                    for list_id in sku.get("effective_list_ids") or []
+                    for row in rows_by_list.get(int(list_id), [])
+                ]
+                if any(self._physical_store_key(row) == store_key for row in candidate_rows):
+                    supported.append(sku)
+            output.append({
+                "store": store,
+                "supported_skus": supported,
+                "unknown_skus": list(scope.get("unknown_skus") or []),
+            })
+        return output
+
+    @classmethod
+    def _store_display_name(cls, store: Dict) -> str:
+        branch = str(store.get("branch") or store.get("brand") or "该门店").strip()
+        city = str(store.get("city") or "").strip()
+        return branch if not city or cls._area_key(city) in cls._area_key(branch) else city + branch
+
+    @classmethod
+    def _format_store_sku_matrix(cls, query: str, matrix: List[Dict],
+                                 selected_skus: Optional[List[Dict]] = None) -> str:
+        selected_skus = list(selected_skus or [])
+        selected_keys = {str(sku.get("sku_key") or "") for sku in selected_skus}
+        lines = [f"根据“{query}”查询到以下可用门店及规格："]
+        for index, row in enumerate(matrix, start=1):
+            store_name = cls._store_display_name(row.get("store") or {})
+            supported = list(row.get("supported_skus") or [])
+            supported_keys = {str(sku.get("sku_key") or "") for sku in supported}
+            labels = "、".join(cls._sku_public_label(sku) for sku in supported)
+            line = f"{index}. {store_name}：{labels or '暂无已确认的可用规格'}。"
+            if selected_skus:
+                usable = [sku for sku in selected_skus if str(sku.get("sku_key") or "") in supported_keys]
+                unusable = [sku for sku in selected_skus if str(sku.get("sku_key") or "") not in supported_keys]
+                direct = []
+                if usable:
+                    direct.append("您询问的" + "、".join(cls._sku_public_label(sku) for sku in usable) + "可以使用")
+                if unusable:
+                    direct.append("您询问的" + "、".join(cls._sku_public_label(sku) for sku in unusable) + "不适用")
+                if direct:
+                    line += " " + "；".join(direct) + "。"
+            unknown = [
+                sku for sku in row.get("unknown_skus") or []
+                if not selected_keys or str(sku.get("sku_key") or "") in selected_keys
+            ]
+            if unknown:
+                line += " " + "、".join(cls._sku_public_label(sku) for sku in unknown) + "的门店资料暂未配置。"
+            lines.append(line)
+        lines.append("请按对应门店支持的规格拍下。")
+        return "\n".join(lines)
+
+    def _explicit_store_skus(self, item_id: str, message: str,
+                             product: Optional[Dict] = None) -> List[Dict]:
+        product = product or self.get_v2_product(item_id) or {}
+        matched = self.match_message_skus(item_id, message, product)
+        if matched:
+            return matched
+        values = {
+            self._format_number(value)
+            for match in re.finditer(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*元?\s*(?:代金券|优惠券|券|面额)|"
+                r"(?:代金券|优惠券|券|面额)\s*(\d+(?:\.\d+)?)",
+                str(message or ""),
+            )
+            for value in match.groups() if value
+        }
+        if not values and re.search(r"可以用|能用|可用|适用|使用", str(message or "")):
+            values = {
+                self._format_number(match.group(1))
+                for match in re.finditer(
+                    r"(?<![\d.])(\d+(?:\.\d+)?)(?:元)?"
+                    r"(?!\s*(?:年|月|日|号|路|街|道|点|个|人|位|张|桌|份))",
+                    str(message or ""),
+                )
+            }
+        if not values:
+            return []
+        return [
+            sku for sku in self.list_product_skus(item_id, product)
+            if self._format_number(sku.get("face_value") or "") in values
+        ]
+
+    def _strip_store_sku_edges(
+        self, item_id: str, query: str, product: Optional[Dict] = None,
+    ) -> str:
+        """Remove a real denomination only at a store-query boundary."""
+        value = str(query or "").strip()
+        faces = sorted({
+            self._format_number(sku.get("face_value") or "")
+            for sku in self.list_product_skus(item_id, product)
+            if self._format_number(sku.get("face_value") or "")
+        }, key=len, reverse=True)
+        for face in faces:
+            token = rf"{re.escape(face)}\s*(?:元)?\s*(?:的)?\s*(?:代金券|优惠券|券)?"
+            value = re.sub(rf"^\s*{token}", "", value).strip()
+            value = re.sub(rf"{token}\s*$", "", value).strip()
+        return value
+
+    def resolve_multi_sku_store_query(
+        self, item_id: str, product: Dict, message: str,
+        store_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Resolve store questions against all SKU lists without city fallback."""
+        scope = self._multi_sku_store_scope(item_id, product)
+        if not scope.get("stores_differ"):
+            return None
+
+        raw_query = extract_store_query(
+            message, product=product, product_brand=self.extract_brand(product)
+        )
+        raw_query = self._strip_store_sku_edges(item_id, raw_query, product)
+        pending_area = str((store_context or {}).get("pending_store_query") or "").strip()
+        query = raw_query
+        if pending_area and query and not any(
+            self._area_key(query).startswith(self._area_key(area))
+            for area in KNOWN_CITY_NAMES | KNOWN_PROVINCE_NAMES if len(self._area_key(area)) >= 2
+        ):
+            query = pending_area + query
+        if not is_meaningful_store_query(query):
+            return None
+        if not scope.get("list_ids"):
+            return {
+                "reply": "当前各商品规格都还没有配置可用门店资料，暂时无法准确查询。",
+                "source": "多规格门店资料均未配置",
+                "decision": "review", "kind": "stores",
+                "store_matches": [], "store_query": query,
+                "store_status": "unconfigured",
+            }
+
+        result = self.search_store(
+            item_id, query, list_ids_override=scope["list_ids"]
+        )
+        resolved_query = str(result.get("resolved_query") or query).strip()
+        if not self.is_explicit_store_query(message, resolved_query, result):
+            return None
+        if result.get("status") != "available":
+            return {
+                "reply": self.format_store_unavailable(
+                    query,
+                    area_only=bool((result.get("province") or result.get("city"))
+                                   and not result.get("search_term")),
+                ),
+                "source": "多规格商品级门店全集未匹配",
+                "decision": "deny", "kind": "stores",
+                "store_matches": [], "store_query": query,
+                "store_status": "unavailable",
+            }
+
+        matches = list(result.get("matches") or [])
+        if len(matches) > 3:
+            return {
+                "reply": (
+                    f"根据“{resolved_query}”匹配到多家可用门店，请补充区县、商圈、"
+                    "商场名称或完整门店名，我再帮您准确查询对应卡券规格。"
+                ),
+                "source": "多规格门店查询超过3家需缩小范围",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": matches, "store_query": resolved_query,
+                "store_status": "too_many",
+                "store_context_update": {
+                    "pending_store_query": resolved_query,
+                    "candidate_count": len(matches),
+                },
+            }
+
+        selected_skus = self._explicit_store_skus(item_id, message, product)
+        unconfigured_selected = [
+            sku for sku in selected_skus if not sku.get("configuration_ready")
+        ]
+        if unconfigured_selected:
+            labels = "、".join(self._sku_public_label(sku) for sku in unconfigured_selected)
+            return {
+                "reply": f"{labels}暂未配置适用门店资料，无法准确确认{resolved_query}是否可用。",
+                "source": "买家指定规格的门店资料未配置",
+                "decision": "review", "kind": "stores",
+                "store_matches": matches, "store_query": resolved_query,
+                "store_status": "unconfigured",
+            }
+        matrix = self._store_sku_matrix(item_id, matches, scope)
+        return {
+            "reply": self._format_store_sku_matrix(resolved_query, matrix, selected_skus),
+            "source": "多规格商品级门店与规格对应关系",
+            "decision": "allow", "kind": "stores_sku_recommendation",
+            "store_matches": matches, "store_query": resolved_query,
+            "store_status": "available", "store_sku_matrix": matrix,
+            "query_context_update": ({
+                "selected_sku_key": selected_skus[0]["sku_key"],
+                "selected_sku_name": selected_skus[0].get("sku_name", ""),
+            } if len(selected_skus) == 1 else {}),
+        }
+
+    def resolve_store_matrix_followup(
+        self, item_id: str, product: Dict, message: str,
+        store_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Answer only strict follow-ups to a recent <=3-store SKU matrix."""
+        context = store_context if isinstance(store_context, dict) else {}
+        matrix = list(context.get("store_sku_matrix") or [])
+        if not matrix:
+            return None
+        text = str(message or "").strip()
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", text)
+        if not compact:
+            return None
+
+        ordinal = None
+        ordinal_patterns = (
+            (0, r"第一(?:家|个)|第1(?:家|个)|前面那家"),
+            (1, r"第二(?:家|个)|第2(?:家|个)|后面那家"),
+            (2, r"第三(?:家|个)|第3(?:家|个)"),
+        )
+        for index, pattern in ordinal_patterns:
+            if re.search(pattern, compact):
+                ordinal = index
+                break
+
+        amount_followup = re.fullmatch(
+            r"(?:那|这个|这张|该)?(\d+(?:\.\d+)?)\s*(?:元)?(?:的|代金券|优惠券|券)?"
+            r"(?:呢|可以吗|能用吗|可用吗|行吗|怎么样|咋样)?",
+            compact,
+        )
+        selected_skus = self._explicit_store_skus(item_id, text, product)
+        if not selected_skus:
+            bare_amount = amount_followup
+            if bare_amount:
+                amount = self._format_number(bare_amount.group(1))
+                selected_skus = [
+                    sku for sku in self.list_product_skus(item_id, product)
+                    if self._format_number(sku.get("face_value") or "") == amount
+                ]
+
+        followup_words = bool(re.search(
+            r"这家|这个店|该店|那家|刚才|上面|这些店|这几个|"
+            r"第一(?:家|个)|第二(?:家|个)|第三(?:家|个)|第[123](?:家|个)|"
+            r"哪些面额|什么面额|哪些规格|什么规格|买哪|可以用吗|能用吗|可用吗|的呢|怎么样|咋样",
+            compact,
+        ))
+        if not followup_words and not selected_skus:
+            return None
+
+        # A new explicit location always overrides old context and is handled
+        # by the ordinary store resolver below.
+        new_query = extract_store_query(
+            text, product=product, product_brand=self.extract_brand(product)
+        )
+        if ordinal is None and not amount_followup and is_meaningful_store_query(new_query) and not re.fullmatch(
+            r"(?:这家|这个店|该店|那家店|那里|刚才那家|这些店|这几个店)",
+            normalize_text(new_query),
+        ):
+            return None
+
+        rows = matrix
+        if ordinal is not None:
+            if ordinal >= len(matrix):
+                return {
+                    "reply": "刚才的查询结果中没有这家门店，请发送完整门店名称重新查询。",
+                    "source": "门店上下文序号超出候选范围",
+                    "decision": "allow", "kind": "stores_clarify",
+                    "store_matches": [row.get("store") or {} for row in matrix],
+                    "store_query": str(context.get("query") or ""),
+                    "store_status": "ambiguous",
+                }
+            rows = [matrix[ordinal]]
+        elif len(matrix) > 1 and re.search(r"这家|这个店|该店|那家店", compact) and not selected_skus:
+            names = "、".join(
+                self._store_display_name(row.get("store") or {}) for row in matrix
+            )
+            return {
+                "reply": f"刚才查询到多家门店：{names}。请发送完整门店名，或回复第一家、第二家进行确认。",
+                "source": "多门店上下文中的单数指代不明确",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [row.get("store") or {} for row in matrix],
+                "store_query": str(context.get("query") or ""),
+                "store_status": "ambiguous",
+            }
+
+        unconfigured = [
+            sku for sku in selected_skus if not sku.get("configuration_ready")
+        ]
+        if unconfigured:
+            labels = "、".join(self._sku_public_label(sku) for sku in unconfigured)
+            return {
+                "reply": f"{labels}暂未配置适用门店资料，无法准确确认。",
+                "source": "上下文追问所指定规格的门店资料未配置",
+                "decision": "review", "kind": "stores",
+                "store_matches": [row.get("store") or {} for row in rows],
+                "store_query": str(context.get("query") or ""),
+                "store_status": "unconfigured",
+            }
+
+        query = str(context.get("query") or "刚才查询的门店")
+        result = {
+            "reply": self._format_store_sku_matrix(query, rows, selected_skus),
+            "source": "当前会话最近一次门店—规格查询结果",
+            "decision": "allow", "kind": "stores_sku_recommendation",
+            "store_matches": [row.get("store") or {} for row in rows],
+            "store_query": query, "store_status": "available",
+            "store_sku_matrix": rows,
+        }
+        if len(selected_skus) == 1:
+            result["query_context_update"] = {
+                "selected_sku_key": selected_skus[0]["sku_key"],
+                "selected_sku_name": selected_skus[0].get("sku_name", ""),
+            }
+        return result
 
     @staticmethod
     def _area_key(value: object) -> str:
@@ -4709,8 +5084,9 @@ class V2Store(AppStore):
         store_specific_tail = any(
             marker in query_key for marker in (
                 "门店", "分店", "旗舰店", "购物中心", "商业广场", "商场", "商圈",
-                "万达", "万象城", "万科里", "天街", "银泰", "吾悦", "大悦城",
-                "来福士", "太古里", "印象城", "奥特莱斯", "ifs", "mall", "店",
+                "万达", "万象城", "万象汇", "壹方城", "壹方天地", "万科里",
+                "海岸城", "天街", "银泰", "吾悦", "大悦城", "来福士",
+                "太古里", "印象城", "奥特莱斯", "ifs", "mall", "店",
             )
         )
         if area_candidates and not store_specific_tail:
@@ -4773,7 +5149,7 @@ class V2Store(AppStore):
         return province, city, remainder
 
     def search_store(self, item_id: str, query: str, limit: Optional[int] = None,
-                     sku_key: str = "") -> Dict:
+                     sku_key: str = "", list_ids_override: Optional[List[int]] = None) -> Dict:
         query_norm = normalize_text(query)
         # Intent words such as “问题/门店/查询” are not locations.  Refuse them
         # before fuzzy matching so a generic question can never accidentally
@@ -4783,7 +5159,11 @@ class V2Store(AppStore):
         # A standalone number is a denomination/amount, never a store name.
         if re.fullmatch(r"\d+(?:\.\d+)?(?:元)?", query_norm):
             return {"status": "unavailable", "matches": []}
-        list_ids, mode, ready = self.effective_store_list_ids(item_id, sku_key)
+        if list_ids_override is None:
+            list_ids, mode, ready = self.effective_store_list_ids(item_id, sku_key)
+        else:
+            list_ids = sorted({int(value) for value in list_ids_override})
+            mode, ready = "product_union", bool(list_ids)
         if not ready:
             return {"status": "sku_store_unconfigured", "matches": [], "sku_key": sku_key}
         if not list_ids:
@@ -4900,10 +5280,7 @@ class V2Store(AppStore):
         unique = []
         seen = set()
         for item in matches:
-            key = (
-                normalize_text(item.get("city")), normalize_text(item.get("branch") or item.get("brand")),
-                normalize_text(item.get("address")),
-            )
+            key = self._physical_store_key(item)
             if key in seen:
                 continue
             seen.add(key)
@@ -5428,6 +5805,7 @@ class V2Store(AppStore):
         store_query = extract_store_query(
             text, product=product, product_brand=self.extract_brand(product)
         )
+        store_query = self._strip_store_sku_edges(item_id, store_query, product)
         store_probe = None
         resolved_store_query = store_query
         store_trigger = re.search(
@@ -5439,22 +5817,33 @@ class V2Store(AppStore):
             re.I,
         )
         if store_trigger:
+            multi_store_scope = self._multi_sku_store_scope(item_id, product)
+            union_ids = (
+                multi_store_scope.get("list_ids")
+                if multi_store_scope.get("stores_differ") else None
+            )
+
+            def probe_store(value: str) -> Dict:
+                return self.search_store(
+                    item_id, value, list_ids_override=union_ids,
+                )
+
             # First let the configured store dictionary extract the smallest
             # grounded location directly from the untouched sentence.  Only
             # fall back to phrase deletion when no known location was found.
-            raw_probe = self.search_store(item_id, text) if is_meaningful_store_query(text) else None
+            raw_probe = probe_store(text) if is_meaningful_store_query(text) else None
             if (
                 raw_probe and raw_probe.get("resolved_query")
                 and normalize_text(raw_probe.get("resolved_query")) != normalize_text(text)
             ):
                 store_probe = raw_probe
             elif is_meaningful_store_query(store_query):
-                store_probe = self.search_store(item_id, store_query)
+                store_probe = probe_store(store_query)
             resolved_store_query = str(
                 (store_probe or {}).get("resolved_query") or store_query
             ).strip()
             if self.is_explicit_store_query(text, resolved_store_query, store_probe):
-                explicit_store_skus = self.match_message_skus(item_id, text, product)
+                explicit_store_skus = self._explicit_store_skus(item_id, text, product)
                 explicit_store_sku_text = (
                     str(explicit_store_skus[0].get("sku_name") or "").strip()
                     if len(explicit_store_skus) == 1 else ""
@@ -5496,7 +5885,14 @@ class V2Store(AppStore):
                     r"(?=[^。！？]{0,12}(?:可以|能|可)(?:使用|用))",
                     text,
                 )
-            if sku_question_match and not value_match and not purchase_reply:
+            sku_is_store_applicability = bool(
+                multi_store_scope.get("stores_differ")
+                and not re.search(r"有(?:没有|吗|么)|卖不卖|什么规格|哪些规格", text)
+            )
+            if (
+                sku_question_match and not value_match and not purchase_reply
+                and not sku_is_store_applicability
+            ):
                 requested_value = self._format_number(
                     sku_question_match.group(1) if sku_question_match.lastindex
                     else next(iter(re.findall(r"\d+(?:\.\d+)?", sku_question_match.group(0))), "")
@@ -5603,7 +5999,121 @@ class V2Store(AppStore):
         ), None)
         if store_child:
             for key in (
-                "store_matches", "store_query", "store_status", "query_context_update",
+                "store_matches", "store_query", "store_status", "store_sku_matrix",
+                "store_context_update", "query_context_update",
+            ):
+                if key in store_child:
+                    result[key] = store_child[key]
+        return result
+
+    def resolve_semantic_analysis(
+        self, item_id: str, message: str, analysis: Optional[Dict],
+        actual_paid_amount: object = None, store_context: Optional[Dict] = None,
+        order_context: Optional[Dict] = None,
+        original_result: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Re-resolve model-extracted questions exclusively through local facts."""
+        if not isinstance(analysis, dict) or analysis.get("needs_clarification"):
+            return None
+        labels = {
+            "store": "适用门店", "sku": "商品规格", "price": "商品价格",
+            "usage": "使用方式", "stacking": "使用张数", "restrictions": "使用限制",
+            "purchase": "购买", "date": "使用日期", "conditions": "使用条件",
+            "delivery": "发货方式", "aftersale": "售后问题",
+        }
+
+        def normalized_question(question: Dict) -> str:
+            intent = str(question.get("intent") or "")
+            evidence = str(question.get("evidence") or "").strip()
+            slots = question.get("slots") if isinstance(question.get("slots"), dict) else {}
+            sku_amount = self._format_number(slots.get("sku_amount") or "")
+            paid_amount = self._format_number(slots.get("paid_amount") or "")
+            face_value = self._format_number(slots.get("face_value") or "")
+            if intent == "store":
+                query = str(slots.get("store_query") or "").strip()
+                if not query and question.get("uses_context"):
+                    query = str((store_context or {}).get("query") or "").strip()
+                sku_text = f"{sku_amount}元代金券" if sku_amount else ""
+                return f"{sku_text}{query}可以用吗" if query else evidence
+            if intent == "sku" and sku_amount:
+                return f"{sku_amount}元代金券有吗"
+            if intent == "price":
+                if paid_amount and face_value:
+                    return f"{paid_amount}拍下直接抵{face_value}吗"
+                if sku_amount:
+                    return f"{sku_amount}元代金券多少钱"
+            if intent == "usage":
+                return "怎么使用"
+            if intent == "stacking":
+                return f"{sku_amount + '元代金券' if sku_amount else ''}一次可以用几张"
+            if intent == "restrictions":
+                return "有什么使用限制"
+            if intent == "purchase" and sku_amount:
+                return f"{sku_amount}元代金券可以直接拍吗"
+            if intent == "delivery":
+                return "怎么发货"
+            return evidence
+
+        resolved = []
+        seen = set()
+        for question in list(analysis.get("questions") or [])[:5]:
+            if not isinstance(question, dict):
+                continue
+            intent = str(question.get("intent") or "").strip().lower()
+            if intent not in labels:
+                continue
+            child_message = normalized_question(question)
+            if not child_message:
+                continue
+            child = self.resolve_deterministic(
+                item_id, child_message, actual_paid_amount,
+                store_context, order_context, _allow_multi=False,
+            )
+            reply = str((child or {}).get("reply") or "").strip()
+            if not child or not reply or child.get("decision") in {"silent", "silent_review"}:
+                continue
+            key = (str(child.get("kind") or ""), normalize_match_text(reply))
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append((intent, labels[intent], child))
+
+        # A complete existing deterministic answer is never replaced by one
+        # model-inferred interpretation. Only a genuinely recovered compound
+        # question may supersede a partial single-intent result.
+        if len(resolved) == 1:
+            if original_result:
+                return None
+            child = dict(resolved[0][2])
+            child["source"] = f"语义辅助理解后由本地规则核验：{child.get('source', '')}"
+            child["semantic_assisted"] = True
+            return child
+        if len(resolved) < 2:
+            return None
+
+        result = {
+            "reply": "\n".join(
+                f"{index}. {label}：{child['reply'].rstrip()}"
+                for index, (_, label, child) in enumerate(resolved, start=1)
+            ),
+            "source": "大模型仅拆分问题，全部答案由当前商品本地规则重新核验",
+            "decision": (
+                "review" if any(
+                    child.get("decision") in {"review", "clarify"}
+                    for _, _, child in resolved
+                ) else "allow"
+            ),
+            "kind": "semantic_multi_intent",
+            "resolved_intents": [intent for intent, _, _ in resolved],
+            "semantic_assisted": True,
+        }
+        store_child = next((
+            child for _, _, child in resolved if "store_matches" in child
+        ), None)
+        if store_child:
+            for key in (
+                "store_matches", "store_query", "store_status", "store_sku_matrix",
+                "store_context_update", "query_context_update",
             ):
                 if key in store_child:
                     result[key] = store_child[key]
@@ -5971,6 +6481,14 @@ class V2Store(AppStore):
                 "decision": "allow",
                 "kind": "sku_availability",
             }
+
+        # A strict reference to the previous <=3-store result must be handled
+        # before product-wide catalog questions such as “第一家有哪些面额”.
+        store_followup = self.resolve_store_matrix_followup(
+            item_id, product, message, store_context,
+        )
+        if store_followup:
+            return store_followup
 
         if any(word in message for word in (
             "多少代多少", "有哪些代金券", "有什么代金券", "代金券有哪些", "代金券有什么", "有哪些面额",
@@ -6595,6 +7113,12 @@ class V2Store(AppStore):
             prior_key = str(store_context.get("selected_sku_key") or "")
             selected_sku = next((sku for sku in skus if sku["sku_key"] == prior_key), None)
         selected_key = selected_sku["sku_key"] if selected_sku else ""
+        if sku_stores_differ:
+            multi_sku_store = self.resolve_multi_sku_store_query(
+                item_id, product, message, store_context,
+            )
+            if multi_sku_store:
+                return multi_sku_store
         raw_store_result = (
             self.search_store(item_id, message, sku_key=selected_key)
             if is_meaningful_store_query(message) else {}
