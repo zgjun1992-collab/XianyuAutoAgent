@@ -1817,7 +1817,9 @@ class V2Store(AppStore):
         ))
         availability_intent = bool(re.search(
             r"有吗|有没有|有无|有么|有嘛|有哪些|有什么|还有吗|有货吗|"
-            r"能拍吗|可以拍吗|能买到吗|能不能买|卖不卖",
+            r"能拍吗|可以拍吗|能买到吗|能不能买|卖不卖|"
+            r"能不能(?:使用|用)|可不可以(?:使用|用)|是否可用|"
+            r"可以(?:使用|用)|能(?:使用|用)|可用",
             text,
         ))
         previous = dict((query_context or {}).get("price_filters") or {})
@@ -1833,6 +1835,21 @@ class V2Store(AppStore):
                 previous = {}
 
         direct_slots = self._conditional_query_slots(text)
+        if (
+            availability_intent
+            and any(word.lower() in text.lower() for word in STORE_LANDMARK_WORDS)
+            and re.search(
+                r"(?:单人|双人|三人|四人|五人|六人|\d+\s*人)"
+                r"[^，,。；;]{0,12}(?:套餐|券|自助)",
+                text,
+            )
+            and not direct_slots.get("day_type")
+            and not direct_slots.get("meal_period")
+        ):
+            # This is a named option + store applicability question.  The SKU
+            # aware store resolver must decide it; answering only “the option
+            # exists” would silently drop the store half of the question.
+            return None
         awaiting = str(previous.get("awaiting") or "")
         pending_filled = False
         bare_value = re.fullmatch(
@@ -2183,6 +2200,8 @@ class V2Store(AppStore):
                 reply = f"当前商品没有“{named_subject or subject}”这一规格。"
             elif complete:
                 reply = f"当前商品没有符合“{subject}”的商品选项。"
+            elif effective_intent == "availability":
+                reply = f"当前商品资料暂未明确“{subject}”是否有对应商品或是否适用，暂时无法准确确认。"
             else:
                 reply = f"当前商品资料暂未明确“{subject}”对应的商品和价格，暂时无法准确报价。"
             return {
@@ -2521,7 +2540,10 @@ class V2Store(AppStore):
             if self._format_number(item.get("face_value")) == requested
         ), None)
         if not option:
-            return f"当前商品没有{requested}元代金券，请选择商品页面已有的规格。"
+            plan = self.consumption_plan_reply(
+                product, Decimal(requested), missing_denomination=True,
+            )
+            return plan or f"当前商品没有{requested}元代金券，请选择商品页面已有的规格。"
         return f"可以直接拍下，{self.format_product_option(option, self.extract_brand(product))}。"
 
     def named_sku_price_reply(self, product: Dict, message: str) -> str:
@@ -5430,6 +5452,11 @@ class V2Store(AppStore):
                 (store_probe or {}).get("resolved_query") or store_query
             ).strip()
             if self.is_explicit_store_query(text, resolved_store_query, store_probe):
+                explicit_store_skus = self.match_message_skus(item_id, text, product)
+                explicit_store_sku_text = (
+                    str(explicit_store_skus[0].get("sku_name") or "").strip()
+                    if len(explicit_store_skus) == 1 else ""
+                )
                 position = min(
                     (text.find(value) for value in (
                         resolved_store_query,
@@ -5441,7 +5468,7 @@ class V2Store(AppStore):
                     "store", "适用门店", store_trigger,
                     {
                         "query": resolved_store_query,
-                        "sku_text": next(iter(re.findall(
+                        "sku_text": explicit_store_sku_text or next(iter(re.findall(
                             r"(?<!\d)\d+(?:\.\d+)?\s*元?\s*(?:的)?\s*(?:代金券|券)", text
                         )), ""),
                     },
@@ -5450,6 +5477,17 @@ class V2Store(AppStore):
 
         has_store_task = any(task[1] == "store" for task in tasks)
         if has_store_task:
+            sku_question_match = re.search(
+                r"(?<!\d)\d+(?:\.\d+)?\s*元?\s*(?:的)?\s*(?:代金券|券)",
+                text,
+            )
+            if sku_question_match and not value_match and not purchase_reply:
+                sku_reply = self.sku_availability_reply(
+                    product, f"{sku_question_match.group(0)}有吗",
+                )
+                if sku_reply:
+                    add_task("sku", "商品规格", sku_question_match, sku_reply)
+
             date_child = self.date_availability_reply(product, text)
             date_match = re.search(
                 r"(?:\d{4}[-/.年])?\d{1,2}[-/.月]\d{1,2}(?:日|号)?|"
@@ -5461,7 +5499,7 @@ class V2Store(AppStore):
 
             condition_match = re.search(
                 r"周末|工作日|平日|节假日|早餐|中午|午餐|晚餐|晚市|"
-                r"单人|双人|三人|四人|\d+\s*(?:人|位)",
+                r"\d+\s*(?:人|位)|[一二两三四五六七八九十]+\s*(?:个)?(?:人|位)",
                 text,
             )
             conditional_child = (
@@ -5506,6 +5544,8 @@ class V2Store(AppStore):
                 child = dict(payload or {})
                 reply = str(child.get("reply") or "").strip()
             elif kind == "price":
+                reply = str(payload or "")
+            elif kind == "sku":
                 reply = str(payload or "")
             else:
                 store_payload = dict(payload or {})
@@ -5621,7 +5661,7 @@ class V2Store(AppStore):
 
         refund_request = bool(re.search(
             r"退款|退货|退钱|退一下|申请退|可以退|能退|退吗|给我退|帮我退|"
-            r"我要退|想退|退了吧|退掉|取消退款|取消订单",
+            r"我要退|想退|退了吧|退掉|退\s*\d+(?:\.\d+)?%|取消退款|取消订单",
             message,
         ))
         refund_status_question = bool(re.search(
@@ -6823,6 +6863,16 @@ class V2Store(AppStore):
 def extract_store_query(message: str, product: Optional[Dict] = None,
                         product_brand: str = "") -> str:
     text = str(message or "").strip()
+    # Product titles are frequently followed by a parenthesized branch.  That
+    # bracket is a reliable entity boundary; use it before deleting intent
+    # words from the rest of the sentence.
+    bracket_locations = [
+        part.strip(" ，,。；;：:")
+        for part in re.findall(r"[（(]([^（）()]{2,40})[）)]", text)
+        if any(word.lower() in part.lower() for word in STORE_LANDMARK_WORDS)
+    ]
+    if bracket_locations:
+        return bracket_locations[-1]
     if re.search(r"不是|不要|别查|不查", text):
         correction = re.search(r"(?:而是|改成|[，,；;]\s*(?:是|查|要))\s*(.+)$", text)
         if correction:
@@ -6853,6 +6903,7 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "地址在哪里", "地址", "位置", "在哪里", "在哪儿", "在哪", "怎么走",
         "联系电话", "联系方式", "电话", "号码", "营业时间", "几点开门", "几点关门",
         "几点打烊", "开门", "关门", "打烊", "营业",
+        "多少钱", "多钱", "什么价格", "价格多少", "价钱", "售价", "什么价", "怎么卖",
     ):
         text = text.replace(phrase, " ")
     text = re.sub(r"[~～。！!，,、：:]+", " ", text)

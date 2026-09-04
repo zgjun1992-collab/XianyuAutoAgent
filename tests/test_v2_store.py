@@ -2042,8 +2042,10 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic(
             "10001", "200的券深圳壹方城可以用不",
         )
-        self.assertEqual("stores", result["kind"])
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["sku", "store"], result["resolved_intents"])
         self.assertEqual("深圳壹方城", result["store_query"])
+        self.assertIn("商品规格", result["reply"])
         self.assertIn("宝安壹方城店", result["reply"])
         self.assertNotIn("广州", result["reply"])
 
