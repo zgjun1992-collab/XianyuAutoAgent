@@ -66,6 +66,12 @@ STORE_LANDMARK_WORDS = (
     "ifs", "mall", "地址", "位置", "在哪", "电话", "号码", "营业", "开门", "打烊", "使用嘛", "用嘛",
 )
 
+GENERIC_STORE_LANDMARKS = (
+    "万达", "万象城", "万象汇", "壹方城", "壹方天地", "万科里", "天街",
+    "银泰", "吾悦", "大悦城", "来福士", "太古里", "印象城", "海岸城",
+    "奥特莱斯", "ifs", "mall",
+)
+
 try:
     CHINA_TZ = ZoneInfo("Asia/Shanghai")
 except ZoneInfoNotFoundError:
@@ -4646,32 +4652,185 @@ class V2Store(AppStore):
                                  selected_skus: Optional[List[Dict]] = None) -> str:
         selected_skus = list(selected_skus or [])
         selected_keys = {str(sku.get("sku_key") or "") for sku in selected_skus}
-        lines = [f"根据“{query}”查询到以下可用门店及规格："]
+        lines = []
         for index, row in enumerate(matrix, start=1):
             store_name = cls._store_display_name(row.get("store") or {})
             supported = list(row.get("supported_skus") or [])
             supported_keys = {str(sku.get("sku_key") or "") for sku in supported}
-            labels = "、".join(cls._sku_public_label(sku) for sku in supported)
-            line = f"{index}. {store_name}：{labels or '暂无已确认的可用规格'}。"
             if selected_skus:
                 usable = [sku for sku in selected_skus if str(sku.get("sku_key") or "") in supported_keys]
                 unusable = [sku for sku in selected_skus if str(sku.get("sku_key") or "") not in supported_keys]
                 direct = []
                 if usable:
-                    direct.append("您询问的" + "、".join(cls._sku_public_label(sku) for sku in usable) + "可以使用")
+                    direct.append(cls._compact_sku_names(usable) + "可以使用")
                 if unusable:
-                    direct.append("您询问的" + "、".join(cls._sku_public_label(sku) for sku in unusable) + "不适用")
-                if direct:
-                    line += " " + "；".join(direct) + "。"
+                    direct.append(cls._compact_sku_names(unusable) + "不适用")
+                if unusable and supported:
+                    direct.append("可用规格为" + cls._compact_sku_names(supported))
+                line = f"【{store_name}】：{'；'.join(direct) or '暂无已确认的可用规格'}。"
+            else:
+                labels = "；".join(cls._sku_public_label(sku) for sku in supported)
+                line = f"{index}. 【{store_name}】：{labels or '暂无已确认的可用规格'}。"
             unknown = [
                 sku for sku in row.get("unknown_skus") or []
                 if not selected_keys or str(sku.get("sku_key") or "") in selected_keys
             ]
             if unknown:
-                line += " " + "、".join(cls._sku_public_label(sku) for sku in unknown) + "的门店资料暂未配置。"
+                line += " " + cls._compact_sku_names(unknown) + "的门店资料暂未配置。"
             lines.append(line)
-        lines.append("请按对应门店支持的规格拍下。")
-        return "\n".join(lines)
+        if selected_skus and len(lines) == 1:
+            return lines[0]
+        heading = (
+            f"根据“{query}”查询结果："
+            if selected_skus else f"根据“{query}”查询到以下可用门店及规格："
+        )
+        return "\n\n".join((heading, "\n".join(lines), "请按对应门店支持的规格拍下。"))
+
+    @classmethod
+    def _compact_sku_names(cls, skus: List[Dict]) -> str:
+        """Render voucher faces compactly without dropping non-voucher SKU names."""
+        faces = [
+            cls._format_number(sku.get("face_value") or "")
+            for sku in skus
+        ]
+        if skus and all(faces) and all((sku.get("option_type") or "voucher") == "voucher" for sku in skus):
+            return "、".join(f"{face}元" for face in faces) + "代金券"
+        return "、".join(str(sku.get("sku_name") or "当前规格") for sku in skus)
+
+    def _store_search_clarification(
+        self, query: str, result: Dict, selected_skus: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
+        """Turn uncertain store matches into a confirmation, never an availability claim."""
+        status = str(result.get("status") or "")
+        if status == "ambiguous_area":
+            count = int(result.get("candidate_count") or len(result.get("matches") or []))
+            return {
+                "reply": (
+                    f"“{query}”在多个地区匹配到{count}家同名或同类门店。"
+                    "请补充城市或区县后再查询，我会按具体门店核对可用规格。"
+                ),
+                "source": "通用商场名称缺少地域锚点",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [], "store_query": query,
+                "store_status": "missing_area",
+                "store_context_update": {
+                    "pending_store_query": query,
+                    "pending_store_query_mode": "generic_landmark",
+                    "candidate_count": count,
+                },
+            }
+        if status != "needs_confirmation":
+            return None
+
+        matches = list(result.get("matches") or [])
+        candidates = matches[:3]
+        names = [self._store_display_name(row) for row in candidates]
+        if not names:
+            return None
+        if len(matches) > 3:
+            reply = (
+                f"根据“{query}”找到多家名称相近的门店，请再补充区县、商圈"
+                "或完整门店名后查询。"
+            )
+        elif len(names) == 1:
+            reply = f"您是想查询【{names[0]}】吗？请回复“是”确认，或发送完整门店名。"
+        else:
+            choices = "\n".join(f"{index}. 【{name}】" for index, name in enumerate(names, start=1))
+            reply = (
+                f"根据“{query}”找到以下名称相近的门店：\n\n{choices}\n\n"
+                "请回复序号确认，或发送完整门店名。"
+            )
+        return {
+            "reply": reply,
+            "source": "同地域门店名称近似候选待买家确认",
+            "decision": "allow", "kind": "stores_clarify",
+            "store_matches": candidates, "store_query": query,
+            "store_status": "candidate_confirmation",
+            "store_context_update": {
+                "pending_store_candidates": candidates,
+                "pending_store_query": query,
+                "pending_store_query_mode": "candidate_confirmation",
+                "pending_selected_sku_keys": [
+                    str(sku.get("sku_key") or "") for sku in (selected_skus or [])
+                    if sku.get("sku_key")
+                ],
+            },
+        }
+
+    def resolve_store_candidate_followup(
+        self, item_id: str, product: Dict, message: str,
+        store_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Resolve a strict yes/ordinal reply against locally stored candidates."""
+        context = store_context if isinstance(store_context, dict) else {}
+        if context.get("status") != "candidate_confirmation":
+            return None
+        candidates = list(context.get("pending_store_candidates") or context.get("matches") or [])[:3]
+        if not candidates:
+            return None
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
+        selected_index = None
+        if len(candidates) == 1 and re.fullmatch(r"(?:是|是的|对|对的|嗯|好的|可以|没错|就是)", compact):
+            selected_index = 0
+        else:
+            ordinal_patterns = (
+                (0, r"(?:第)?一(?:家|个)?|第1(?:家|个)?|1"),
+                (1, r"(?:第)?二(?:家|个)?|第2(?:家|个)?|2"),
+                (2, r"(?:第)?三(?:家|个)?|第3(?:家|个)?|3"),
+            )
+            for index, pattern in ordinal_patterns:
+                if re.fullmatch(pattern, compact):
+                    selected_index = index
+                    break
+        if re.fullmatch(r"(?:不是|不对|都不是|不是这家|不是的)", compact):
+            return {
+                "reply": "好的，请发送更完整的城市、区县、商圈或门店名称，我重新查询。",
+                "source": "买家否定门店近似候选",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [], "store_query": str(context.get("query") or ""),
+                "store_status": "missing_query",
+            }
+        if selected_index is None:
+            return None
+        if selected_index >= len(candidates):
+            return {
+                "reply": "候选结果中没有这个序号，请回复已列出的序号或发送完整门店名。",
+                "source": "门店近似候选序号超出范围",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": candidates,
+                "store_query": str(context.get("query") or ""),
+                "store_status": "candidate_confirmation",
+                "store_context_update": {
+                    "pending_store_candidates": candidates,
+                    "pending_store_query": str(context.get("pending_store_query") or context.get("query") or ""),
+                    "pending_store_query_mode": "candidate_confirmation",
+                    "pending_selected_sku_keys": list(context.get("pending_selected_sku_keys") or []),
+                },
+            }
+
+        match = candidates[selected_index]
+        query = self._store_display_name(match)
+        skus = self.list_product_skus(item_id, product)
+        selected_keys = set(context.get("pending_selected_sku_keys") or [])
+        selected_skus = [sku for sku in skus if sku.get("sku_key") in selected_keys]
+        scope = self._multi_sku_store_scope(item_id, product)
+        if scope.get("stores_differ"):
+            matrix = self._store_sku_matrix(item_id, [match], scope)
+            return {
+                "reply": self._format_store_sku_matrix(query, matrix, selected_skus),
+                "source": "买家确认门店候选后按本地门店与规格对应关系核验",
+                "decision": "allow", "kind": "stores_sku_recommendation",
+                "store_matches": [match], "store_query": query,
+                "store_status": "available", "store_sku_matrix": matrix,
+            }
+        prefix = f"{self._sku_public_label(selected_skus[0])}：" if len(selected_skus) == 1 else ""
+        return {
+            "reply": prefix + self.format_store_reply(match, str(message or "")),
+            "source": "买家确认门店候选后按当前商品门店表核验",
+            "decision": "allow", "kind": "stores",
+            "store_matches": [match], "store_query": query,
+            "store_status": "available",
+        }
 
     def _explicit_store_skus(self, item_id: str, message: str,
                              product: Optional[Dict] = None) -> List[Dict]:
@@ -4734,10 +4893,13 @@ class V2Store(AppStore):
         )
         raw_query = self._strip_store_sku_edges(item_id, raw_query, product)
         pending_area = str((store_context or {}).get("pending_store_query") or "").strip()
+        pending_mode = str((store_context or {}).get("pending_store_query_mode") or "")
         query = raw_query
-        if pending_area and query and not any(
-            self._area_key(query).startswith(self._area_key(area))
-            for area in KNOWN_CITY_NAMES | KNOWN_PROVINCE_NAMES if len(self._area_key(area)) >= 2
+        if pending_area and query and pending_mode == "generic_landmark":
+            query = query + pending_area
+        elif pending_area and query and not any(
+                self._area_key(query).startswith(self._area_key(area))
+                for area in KNOWN_CITY_NAMES | KNOWN_PROVINCE_NAMES if len(self._area_key(area)) >= 2
         ):
             query = pending_area + query
         if not is_meaningful_store_query(query):
@@ -4755,18 +4917,26 @@ class V2Store(AppStore):
             item_id, query, list_ids_override=scope["list_ids"]
         )
         resolved_query = str(result.get("resolved_query") or query).strip()
+        if result.get("status") != "available":
+            resolved_query = str(result.get("specific_query") or resolved_query).strip()
         if not self.is_explicit_store_query(message, resolved_query, result):
             return None
+        selected_skus = self._explicit_store_skus(item_id, message, product)
+        clarification = self._store_search_clarification(
+            resolved_query, result, selected_skus,
+        )
+        if clarification:
+            return clarification
         if result.get("status") != "available":
             return {
                 "reply": self.format_store_unavailable(
-                    query,
+                    resolved_query,
                     area_only=bool((result.get("province") or result.get("city"))
                                    and not result.get("search_term")),
                 ),
                 "source": "多规格商品级门店全集未匹配",
                 "decision": "deny", "kind": "stores",
-                "store_matches": [], "store_query": query,
+                "store_matches": [], "store_query": resolved_query,
                 "store_status": "unavailable",
             }
 
@@ -4787,7 +4957,6 @@ class V2Store(AppStore):
                 },
             }
 
-        selected_skus = self._explicit_store_skus(item_id, message, product)
         unconfigured_selected = [
             sku for sku in selected_skus if not sku.get("configuration_ready")
         ]
@@ -4943,6 +5112,50 @@ class V2Store(AppStore):
             value = value.replace(token, "")
         return value
 
+    @staticmethod
+    def _admin_key(value: object) -> str:
+        value = normalize_match_text(value)
+        return re.sub(
+            r"(?:壮族自治区|回族自治区|维吾尔自治区|特别行政区|自治区|"
+            r"省|市|区|县|旗|镇|乡|街道)$",
+            "", value,
+        )
+
+    @classmethod
+    def _local_branch_key(cls, row: Dict, branch_key: str) -> str:
+        value = branch_key
+        prefixes = sorted({
+            cls._store_fuzzy_key(row.get(field))
+            for field in ("province", "city", "district")
+            if row.get(field)
+        }, key=len, reverse=True)
+        for prefix in prefixes:
+            if len(prefix) >= 2 and value.startswith(prefix) and len(value) > len(prefix) + 1:
+                value = value[len(prefix):]
+        return value
+
+    @staticmethod
+    def _within_one_edit(left: str, right: str) -> bool:
+        """Small typo gate used only after a geographic scope was established."""
+        if left == right:
+            return True
+        if abs(len(left) - len(right)) > 1 or min(len(left), len(right)) < 2:
+            return False
+        if len(left) == len(right):
+            return sum(a != b for a, b in zip(left, right)) <= 1
+        short, long = (left, right) if len(left) < len(right) else (right, left)
+        index_short = index_long = differences = 0
+        while index_short < len(short) and index_long < len(long):
+            if short[index_short] == long[index_long]:
+                index_short += 1
+                index_long += 1
+                continue
+            differences += 1
+            index_long += 1
+            if differences > 1:
+                return False
+        return True
+
     @classmethod
     def _best_location_query(cls, rows: List[Dict], query: str) -> str:
         """Extract the most specific known location from a noisy buyer sentence.
@@ -4956,15 +5169,14 @@ class V2Store(AppStore):
         query_key = normalize_match_text(query)
         if not query_key:
             return ""
+        query_province, query_city, query_district, _ = cls._extract_store_scope(
+            rows, normalize_text(query)
+        )
 
         row_candidates = []
         area_candidates = []
         street_candidates = []
-        landmark_aliases = (
-            "万象城", "万象汇", "壹方城", "壹方天地", "万达", "万科里",
-            "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里",
-            "印象城", "海岸城", "奥特莱斯", "ifs", "mall",
-        )
+        landmark_aliases = GENERIC_STORE_LANDMARKS
 
         def variants(value: object, suffixes=()):
             display = str(value or "").strip()
@@ -5014,7 +5226,15 @@ class V2Store(AppStore):
             if row_area_hit:
                 for landmark in landmark_aliases:
                     alias = normalize_match_text(landmark)
-                    if len(alias) >= 2 and alias in query_key and alias in branch_key:
+                    row_scope_compatible = (
+                        (not query_province or not province or cls._admin_key(province) == query_province)
+                        and (not query_city or cls._admin_key(city) == query_city)
+                        and (not query_district or cls._admin_key(district) == query_district)
+                    )
+                    if (
+                        row_scope_compatible and len(alias) >= 2
+                        and alias in query_key and alias in branch_key
+                    ):
                         branch_hits.append(alias)
             if branch_hits:
                 best_alias = max(branch_hits, key=len)
@@ -5090,7 +5310,27 @@ class V2Store(AppStore):
             )
         )
         if area_candidates and not store_specific_tail:
-            return max(area_candidates, key=lambda value: (value[0], value[1]))[2]
+            _, _, _, remainder = cls._extract_store_scope(rows, normalize_text(query))
+            remainder = re.sub(
+                r"(?:可以|能|可)?直接(?:拍|买|购买|下单).*$|"
+                r"(?:拍下|下单|购买)(?:后)?.*$",
+                "", remainder,
+            )
+            remainder = re.sub(r"\d+(?:\.\d+)?", "", remainder)
+            for noise in (
+                "可以使用吗", "可以用吗", "能不能用", "可不可以用", "是否可用",
+                "可以使用", "可以用", "能用", "可用", "适用", "支持",
+                "有哪些门店", "哪些门店", "有门店吗", "有吗", "有没有",
+                "请问", "老板", "亲", "您好", "你好", "是吧", "的那个", "那个",
+                "可以", "是", "吗", "嘛", "么", "呀", "呢", "吧",
+            ):
+                remainder = remainder.replace(normalize_text(noise), "")
+            if not remainder:
+                return max(area_candidates, key=lambda value: (value[0], value[1]))[2]
+            # A meaningful suffix remains (for example “济南弘扬”). Keep the
+            # whole local query so the suffix can be matched inside that city;
+            # never silently downgrade it to the city alone.
+            return ""
         if store_specific_tail:
             # Keep an unmatched mall/branch term intact. Reducing “焦作万达” or
             # “郑州万象城” to the city alone would turn a precise negative query
@@ -5113,40 +5353,78 @@ class V2Store(AppStore):
 
     @classmethod
     def _extract_store_scope(cls, rows: List[Dict], query_norm: str):
-        """Use only a leading province/city as a hard filter.
+        """Find all administrative tokens and keep the smallest grounded unit.
 
-        District and business-area words deliberately remain in the fuzzy term:
-        “深圳龙岗万科里” is scoped to Shenzhen and matched as “龙岗万科里”.
+        Buyer text commonly contains a hierarchy such as “山东潍坊寿光万达”.
+        The last equally-ranked unit is normally the smaller county-level city,
+        while a district/borough always outranks a city and a city outranks a
+        province.  All detected hierarchy tokens are removed from the local
+        branch search term so they cannot become fuzzy noise.
         """
-        provinces = {
-            cls._area_key(value)
-            for value in KNOWN_PROVINCE_NAMES
-        } | {
-            cls._area_key(row.get("province")) for row in rows if row.get("province")
+        query_key = normalize_match_text(query_norm)
+        field_values = {
+            "province": {
+                cls._admin_key(value) for value in KNOWN_PROVINCE_NAMES
+            } | {
+                cls._admin_key(row.get("province")) for row in rows if row.get("province")
+            },
+            "city": {
+                cls._admin_key(value) for value in KNOWN_CITY_NAMES
+            } | {
+                cls._admin_key(row.get("city")) for row in rows if row.get("city")
+            },
+            "district": {
+                cls._admin_key(row.get("district")) for row in rows if row.get("district")
+            },
         }
-        cities = {
-            cls._area_key(value)
-            for value in KNOWN_CITY_NAMES
-        } | {
-            cls._area_key(row.get("city")) for row in rows if row.get("city")
+        grounded_values = {
+            field: {
+                cls._admin_key(row.get(field)) for row in rows if row.get(field)
+            }
+            for field in ("province", "city", "district")
         }
-        remainder = query_norm
-        province = ""
-        city = ""
-
-        def consume(values, suffixes):
-            nonlocal remainder
+        all_admin_values = {
+            value for values in field_values.values() for value in values if len(value) >= 2
+        }
+        hits = {"province": [], "city": [], "district": []}
+        removable = []
+        suffixes = {
+            "province": ("壮族自治区", "回族自治区", "维吾尔自治区", "特别行政区", "自治区", "省", "市"),
+            "city": ("市",),
+            "district": ("区", "县", "旗", "市"),
+        }
+        for field, values in field_values.items():
             for value in sorted((item for item in values if len(item) >= 2), key=len, reverse=True):
-                variants = [value + suffix for suffix in suffixes] + [value]
+                variants = tuple(dict.fromkeys((*(value + suffix for suffix in suffixes[field]), value)))
+                best = None
                 for variant in variants:
-                    if remainder.startswith(variant):
-                        remainder = remainder[len(variant):]
-                        return value
-            return ""
+                    start = query_key.rfind(variant)
+                    # A built-in city/province absent from this store table is
+                    # useful for a clean negative only at the beginning of the
+                    # cleaned query. This prevents “南山西丽” from inventing the
+                    # cross-boundary province token “山西”.
+                    if start > 0 and value not in grounded_values[field]:
+                        prefix = query_key[:start]
+                        if not any(prefix.endswith(area) for area in all_admin_values):
+                            continue
+                    if start >= 0 and (best is None or len(variant) > len(best[2])):
+                        best = (start, start + len(variant), variant)
+                if best:
+                    hits[field].append((best[0], value))
+                    removable.append((best[0], best[1]))
 
-        province = consume(provinces, ("省", "市", "自治区", "特别行政区"))
-        city = consume(cities, ("市",))
-        return province, city, remainder
+        def last_hit(field: str) -> str:
+            return max(hits[field], default=(-1, ""), key=lambda item: item[0])[1]
+
+        province = last_hit("province")
+        city = last_hit("city")
+        district = last_hit("district")
+        chars = list(query_key)
+        for start, end in removable:
+            for index in range(start, end):
+                chars[index] = ""
+        remainder = "".join(chars)
+        return province, city, district, remainder
 
     def search_store(self, item_id: str, query: str, limit: Optional[int] = None,
                      sku_key: str = "", list_ids_override: Optional[List[int]] = None) -> Dict:
@@ -5188,22 +5466,24 @@ class V2Store(AppStore):
         if resolved_query:
             query = resolved_query
             query_norm = normalize_text(query)
-        province_scope, city_scope, search_term = self._extract_store_scope(rows, query_norm)
+        province_scope, city_scope, district_scope, search_term = self._extract_store_scope(rows, query_norm)
         if province_scope:
             rows = [
                 row for row in rows
-                if self._area_key(row.get("province")) == province_scope
+                if self._admin_key(row.get("province")) == province_scope
                 or (city_scope and not self._area_key(row.get("province")))
             ]
         if city_scope:
-            rows = [row for row in rows if self._area_key(row.get("city")) == city_scope]
+            rows = [row for row in rows if self._admin_key(row.get("city")) == city_scope]
+        if district_scope:
+            rows = [row for row in rows if self._admin_key(row.get("district")) == district_scope]
 
         # Buyers often repeat the brand after a city (for example
         # “深圳同仁四季有吗”).  A brand is not a concrete branch name; after the
         # region has been fixed, return all branches in that region.  A very
         # small typo is accepted only here, where both the region and a
         # four-character brand provide strong evidence.
-        if (province_scope or city_scope) and search_term:
+        if (province_scope or city_scope or district_scope) and search_term:
             term_key = self._store_fuzzy_key(search_term)
             brand_keys = {
                 self._store_fuzzy_key(row.get("brand"))
@@ -5225,9 +5505,10 @@ class V2Store(AppStore):
                 search_term = ""
 
         # A province/city-only question must return every branch in that scope.
-        if (province_scope or city_scope) and not search_term:
+        if (province_scope or city_scope or district_scope) and not search_term:
             for item in rows:
                 item["score"] = 1.1
+                item["match_quality"] = "area"
             matches = rows
         else:
             query_key = self._store_fuzzy_key(search_term or query_norm)
@@ -5238,6 +5519,7 @@ class V2Store(AppStore):
                 if self._looks_like_product_title(store_name):
                     continue
                 branch_key = self._store_fuzzy_key(item.get("branch"))
+                local_branch_key = self._local_branch_key(item, branch_key)
                 combined_key = self._store_fuzzy_key("".join(str(item.get(key) or "") for key in (
                     "district", "branch",
                 )))
@@ -5248,22 +5530,37 @@ class V2Store(AppStore):
                     address_key = self._store_fuzzy_key(item.get("address"))
                 if not query_key:
                     score = 0.0
-                elif query_key == branch_key:
+                    quality = "none"
+                elif query_key == branch_key or query_key == local_branch_key:
                     score = 1.1
-                elif query_key in branch_key or branch_key in query_key:
+                    quality = "exact"
+                elif (
+                    query_key in branch_key or branch_key in query_key
+                    or query_key in local_branch_key or local_branch_key in query_key
+                ):
                     score = 1.02
+                    quality = "contained"
                 elif query_key in combined_key or (address_key and query_key in address_key):
                     score = 1.0
+                    quality = "contained"
                 else:
                     scores = [
                         SequenceMatcher(None, query_key, branch_key).ratio(),
+                        SequenceMatcher(None, query_key, local_branch_key).ratio(),
                         SequenceMatcher(None, query_key, combined_key).ratio(),
                     ]
                     if address_key:
                         scores.append(SequenceMatcher(None, query_key, address_key).ratio())
                     score = max(scores)
+                    if (
+                        (province_scope or city_scope or district_scope)
+                        and self._within_one_edit(query_key, local_branch_key)
+                    ):
+                        score = max(score, 0.86)
+                    quality = "fuzzy"
                 item["score"] = round(score, 3)
-                if score >= 0.94:
+                item["match_quality"] = quality
+                if quality in {"exact", "contained"}:
                     direct.append(item)
                 elif score >= 0.76:
                     fuzzy.append(item)
@@ -5286,15 +5583,41 @@ class V2Store(AppStore):
             seen.add(key)
             unique.append(item)
         matches = unique[: max(1, int(limit))] if limit else unique
+        scoped_query = "".join(filter(None, (
+            district_scope or city_scope or province_scope,
+            search_term,
+        ))) or query
+        generic_key = self._store_fuzzy_key(search_term or query_norm)
+        generic_without_area = (
+            not (province_scope or city_scope or district_scope)
+            and generic_key in {self._store_fuzzy_key(value) for value in GENERIC_STORE_LANDMARKS}
+        )
+        if generic_without_area and len(matches) > 1:
+            return {
+                "status": "ambiguous_area", "matches": matches,
+                "province": province_scope, "city": city_scope,
+                "district": district_scope, "search_term": search_term,
+                "resolved_query": query, "specific_query": scoped_query,
+                "candidate_count": len(matches),
+            }
         if not matches:
             return {
                 "status": "unavailable", "matches": [], "province": province_scope,
-                "city": city_scope, "search_term": search_term,
-                "resolved_query": query,
+                "city": city_scope, "district": district_scope, "search_term": search_term,
+                "resolved_query": query, "specific_query": scoped_query,
+            }
+        if all(item.get("match_quality") == "fuzzy" for item in matches):
+            return {
+                "status": "needs_confirmation", "matches": matches,
+                "province": province_scope, "city": city_scope,
+                "district": district_scope, "search_term": search_term,
+                "sku_key": sku_key, "mode": mode, "resolved_query": query,
+                "specific_query": scoped_query,
             }
         return {
             "status": "available", "matches": matches, "province": province_scope,
-            "city": city_scope, "search_term": search_term, "sku_key": sku_key, "mode": mode,
+            "city": city_scope, "district": district_scope, "search_term": search_term,
+            "sku_key": sku_key, "mode": mode,
             "resolved_query": query,
         }
 
@@ -5692,7 +6015,14 @@ class V2Store(AppStore):
             else self.search_store(item_id, query, sku_key=selected_key)
         )
         query = str(result.get("resolved_query") or query).strip()
+        if result.get("status") != "available":
+            query = str(result.get("specific_query") or query).strip()
         prefix = f"{self._sku_public_label(selected_sku)}：" if selected_sku else ""
+        clarification = self._store_search_clarification(
+            query, result, [selected_sku] if selected_sku else [],
+        )
+        if clarification:
+            return clarification
         if result.get("status") == "available":
             return {
                 "reply": prefix + self.format_store_matches(result["matches"], query, text),
@@ -6473,6 +6803,12 @@ class V2Store(AppStore):
                 "kind": "stock",
             }
 
+        candidate_followup = self.resolve_store_candidate_followup(
+            item_id, product, message, store_context,
+        )
+        if candidate_followup:
+            return candidate_followup
+
         direct_purchase = self.direct_coupon_purchase_reply(product, message)
         if direct_purchase:
             return {
@@ -7104,6 +7440,10 @@ class V2Store(AppStore):
         query = extract_store_query(
             message, product=product, product_brand=self.extract_brand(product)
         )
+        pending_mode = str((store_context or {}).get("pending_store_query_mode") or "")
+        pending_query = str((store_context or {}).get("pending_store_query") or "").strip()
+        if pending_mode == "generic_landmark" and pending_query and is_meaningful_store_query(query):
+            query = query + pending_query
         skus = self.list_product_skus(item_id, product)
         effective_sets = {tuple(sorted(sku.get("effective_list_ids") or [])) for sku in skus}
         sku_stores_differ = len(effective_sets) > 1
@@ -7120,8 +7460,14 @@ class V2Store(AppStore):
             if multi_sku_store:
                 return multi_sku_store
         raw_store_result = (
-            self.search_store(item_id, message, sku_key=selected_key)
-            if is_meaningful_store_query(message) else {}
+            self.search_store(
+                item_id,
+                query if pending_mode == "generic_landmark" else message,
+                sku_key=selected_key,
+            )
+            if is_meaningful_store_query(
+                query if pending_mode == "generic_landmark" else message
+            ) else {}
         )
         if (
             raw_store_result.get("resolved_query")
@@ -7133,6 +7479,8 @@ class V2Store(AppStore):
         else:
             store_result = {"status": "missing_query", "matches": []}
         query = str(store_result.get("resolved_query") or query).strip()
+        if store_result.get("status") != "available":
+            query = str(store_result.get("specific_query") or query).strip()
         if self.is_explicit_store_query(message, query, store_result):
             if not is_meaningful_store_query(query):
                 return {
@@ -7141,6 +7489,11 @@ class V2Store(AppStore):
                     "decision": "allow",
                     "kind": "stores_clarify",
                 }
+            clarification = self._store_search_clarification(
+                query, store_result, [selected_sku] if selected_sku else [],
+            )
+            if clarification:
+                return clarification
             if sku_stores_differ and not selected_sku:
                 supported = self.reverse_store_sku_matches(item_id, query, product)
                 if supported:
@@ -7167,6 +7520,21 @@ class V2Store(AppStore):
                 }
             if store_result["status"] == "available":
                 prefix = f"{self._sku_public_label(selected_sku)}：" if selected_sku else ""
+                if len(store_result.get("matches") or []) > 3:
+                    return {
+                        "reply": (
+                            f"根据“{query}”匹配到多家可用门店，请补充区县、商圈、"
+                            "商场名称或完整门店名，我再帮您准确查询。"
+                        ),
+                        "source": "门店查询超过3家需缩小范围",
+                        "decision": "allow", "kind": "stores_clarify",
+                        "store_matches": store_result["matches"], "store_query": query,
+                        "store_status": "too_many",
+                        "store_context_update": {
+                            "pending_store_query": query,
+                            "candidate_count": len(store_result["matches"]),
+                        },
+                    }
                 # When store applicability differs and the buyer did not name a
                 # specification, reverse-match the store instead of presenting
                 # a product-wide claim.

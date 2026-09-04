@@ -231,16 +231,121 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("125元代金券", result["reply"])
         self.assertNotIn("200元代金券", result["reply"])
         self.assertNotIn("根据“合肥”", result["reply"])
+        self.assertEqual(
+            "根据“合肥之心城店”查询到以下可用门店及规格：\n\n"
+            "1. 【合肥之心城店】：100元代金券（售价64元）；300元代金券（售价192元）。\n\n"
+            "请按对应门店支持的规格拍下。",
+            result["reply"],
+        )
 
         unavailable_sku = self.store.resolve_deterministic(
             "10001", "合肥之心城200可以用吗",
         )
         self.assertEqual("stores_sku_recommendation", unavailable_sku["kind"])
-        self.assertIn("200元代金券（售价120元）不适用", unavailable_sku["reply"])
+        self.assertEqual(
+            "【合肥之心城店】：200元代金券不适用；可用规格为100元、300元代金券。",
+            unavailable_sku["reply"],
+        )
         available_sku = self.store.resolve_deterministic(
             "10001", "合肥之心城300可以用吗",
         )
-        self.assertIn("300元代金券（售价192元）可以使用", available_sku["reply"])
+        self.assertEqual("【合肥之心城店】：300元代金券可以使用。", available_sku["reply"])
+
+    def test_city_plus_typo_store_name_requires_confirmation_before_specs(self):
+        self.store.save_v2_product(
+            "10001", "多规格代金券",
+            "100元代金券：售价64元\n300元代金券：售价192元",
+        )
+        first = self.store.import_store_text(
+            "【山东省】\n【济南】济南弘阳广场店", "100门店", [],
+        )
+        second = self.store.import_store_text(
+            "【山东省】\n【济南】济南弘阳广场店", "300门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = first["id"] if sku["face_value"] == "100" else second["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        result = self.store.resolve_deterministic("10001", "济南弘扬")
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("candidate_confirmation", result["store_status"])
+        self.assertIn("【济南弘阳广场店】", result["reply"])
+        self.assertNotIn("100元代金券", result["reply"])
+        self.assertNotEqual("济南", result["store_query"])
+
+        context = {
+            "query": result["store_query"],
+            "matches": result["store_matches"],
+            "status": result["store_status"],
+            **result["store_context_update"],
+        }
+        confirmed = self.store.resolve_deterministic(
+            "10001", "是", store_context=context,
+        )
+        self.assertEqual("stores_sku_recommendation", confirmed["kind"])
+        self.assertIn("100元代金券（售价64元）", confirmed["reply"])
+        self.assertIn("300元代金券（售价192元）", confirmed["reply"])
+
+    def test_nested_city_county_and_landmark_uses_smallest_grounded_area(self):
+        self.store.save_v2_product(
+            "10001", "多规格代金券",
+            "100元代金券：售价64元\n300元代金券：售价192元",
+        )
+        first = self.store.import_store_text(
+            "【山东省】\n【寿光】寿光万达广场店\n【潍坊】潍坊万达广场店",
+            "100门店", [],
+        )
+        second = self.store.import_store_text(
+            "【山东省】\n【寿光】寿光万达广场店", "300门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = first["id"] if sku["face_value"] == "100" else second["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        result = self.store.resolve_deterministic("10001", "山东潍坊寿光万达能用吗")
+        self.assertEqual("stores_sku_recommendation", result["kind"])
+        self.assertEqual(["寿光万达广场店"], [row["branch"] for row in result["store_matches"]])
+        self.assertNotIn("潍坊万达广场店", result["reply"])
+
+    def test_generic_landmark_across_cities_requires_geographic_anchor(self):
+        self.store.save_v2_product(
+            "10001", "多规格代金券",
+            "100元代金券：售价64元\n300元代金券：售价192元",
+        )
+        first = self.store.import_store_text(
+            "【山东省】\n【寿光】寿光万达广场店\n【潍坊】潍坊万达广场店\n【青岛】青岛万达广场店",
+            "100门店", [],
+        )
+        second = self.store.import_store_text(
+            "【山东省】\n【寿光】寿光万达广场店", "300门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = first["id"] if sku["face_value"] == "100" else second["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        result = self.store.resolve_deterministic("10001", "万达能用吗")
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("missing_area", result["store_status"])
+        self.assertIn("请补充城市或区县", result["reply"])
+        self.assertNotIn("100元代金券", result["reply"])
+
+        context = {
+            "query": result["store_query"],
+            "matches": result["store_matches"],
+            "status": result["store_status"],
+            **result["store_context_update"],
+        }
+        narrowed = self.store.resolve_deterministic(
+            "10001", "寿光", store_context=context,
+        )
+        self.assertEqual("stores_sku_recommendation", narrowed["kind"])
+        self.assertEqual(["寿光万达广场店"], [row["branch"] for row in narrowed["store_matches"]])
 
     def test_multi_sku_unknown_specific_store_never_degrades_to_city(self):
         self.store.save_v2_product(
@@ -314,6 +419,9 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("200元代金券", david)
         self.assertIn("100元代金券", wanda)
         self.assertIn("200元代金券", wanda)
+        self.assertIn("\n\n1. 【", result["reply"])
+        self.assertIn("；", wanda)
+        self.assertNotIn("&#x20;", result["reply"])
 
     def test_multi_sku_store_matrix_supports_amount_followup(self):
         self.store.save_v2_product(
@@ -529,7 +637,8 @@ class V2StoreTests(unittest.TestCase):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
         self.assertEqual("北京", extract_store_query("北京哪些店能用"))
         result = self.store.resolve_deterministic("10001", "北京哪些店能用")
-        self.assertEqual("stores", result["kind"])
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("too_many", result["store_status"])
         self.assertIn("北京", result["reply"])
 
     def test_store_negative_confirmation_stays_in_store_intent(self):
@@ -748,9 +857,9 @@ class V2StoreTests(unittest.TestCase):
         imported = self.store.import_store_text(text, "文本门店", ["10001"])
         self.assertEqual(4, imported["store_count"])
         deterministic = self.store.resolve_deterministic("10001", "万象城")
-        self.assertEqual("stores", deterministic["kind"])
-        self.assertIn("武汉", deterministic["reply"])
-        self.assertIn("成都", deterministic["reply"])
+        self.assertEqual("stores_clarify", deterministic["kind"])
+        self.assertEqual("missing_area", deterministic["store_status"])
+        self.assertIn("请补充城市或区县", deterministic["reply"])
 
     def test_fixed_replies_do_not_use_llm(self):
         greeting = self.store.resolve_deterministic("10001", "你好")
@@ -1177,7 +1286,8 @@ class V2StoreTests(unittest.TestCase):
     def test_store_query_discards_pronouns_and_accepts_city(self):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
         city = self.store.resolve_deterministic("10001", "北京可以吗")
-        self.assertEqual("stores", city["kind"])
+        self.assertEqual("stores_clarify", city["kind"])
+        self.assertEqual("too_many", city["store_status"])
         self.assertIn("北京", city["reply"])
         unclear = self.store.resolve_deterministic("10001", "该门店不可用吗")
         self.assertEqual("stores_clarify", unclear["kind"])
@@ -2368,6 +2478,47 @@ class V2StoreTests(unittest.TestCase):
             "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
             result["reply"],
         )
+
+    def test_non_store_reply_snapshots_remain_byte_for_byte_stable(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价54元，最多叠加2张。"
+            "付款后发送美团电子券，到店出示券码核销。仅限堂食。",
+        )
+        expected = {
+            "你好": (
+                "greeting",
+                "您好，请问想咨询当前商品的使用规则、适用门店还是发货问题？",
+            ),
+            "108拍下直接代200吗": (
+                "voucher_value",
+                "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+            ),
+            "消费235咋拍": (
+                "consumption_plan",
+                "235元消费的话，可以购买2张100元代金券，共支付108元，可抵扣200元。"
+                "剩余35元到店自行支付。当前同面额代金券每次最多使用2张。",
+            ),
+            "怎么发货": (
+                "delivery_usage",
+                "当前商品发放的是美团电子券，付款后发送领取信息，到店出示券码核销。",
+            ),
+            "一次可以用几张": (
+                "stacking",
+                "该商品购买后发放100元代金券，一桌一次最多使用2张，共可抵扣200元；"
+                "不同面额的券不能混用。",
+            ),
+            "人工": (
+                "manual_handoff",
+                "已切换至人工处理，请稍候。后续消息将保留给人工查看。",
+            ),
+        }
+        actual = {
+            message: (result["kind"], result["reply"])
+            for message in expected
+            if (result := self.store.resolve_deterministic("10001", message))
+        }
+        self.assertEqual(expected, actual)
 
     def test_colloquial_consumption_amount_builds_grounded_purchase_plan(self):
         self.store.save_v2_product(
