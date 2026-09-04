@@ -2,6 +2,8 @@ import time
 import os
 import re
 import sys
+import json
+import mimetypes
 
 import requests
 from loguru import logger
@@ -9,7 +11,8 @@ from utils.xianyu_utils import generate_sign
 
 
 class XianyuApis:
-    def __init__(self):
+    def __init__(self, interactive=True):
+        self.interactive = interactive
         self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
         self.session = requests.Session()
         self.session.headers.update({
@@ -28,6 +31,37 @@ class XianyuApis:
             'sec-fetch-site': 'same-site',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
         })
+
+    def upload_media(self, media_path):
+        """Upload a local image to Xianyu's chat media service."""
+        media_path = os.path.abspath(str(media_path or ""))
+        if not os.path.isfile(media_path):
+            raise FileNotFoundError("套餐图片文件不存在")
+        mime_type = mimetypes.guess_type(media_path)[0] or "image/png"
+        if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise ValueError("套餐图片仅支持 PNG、JPG、JPEG 或 WebP")
+        headers = {
+            "accept": "*/*",
+            "origin": "https://www.goofish.com",
+            "referer": "https://www.goofish.com/",
+            "user-agent": self.session.headers.get("user-agent", "Mozilla/5.0"),
+        }
+        params = {"floderId": "0", "appkey": "xy_chat", "_input_charset": "utf-8"}
+        with open(media_path, "rb") as handle:
+            files = {"file": (os.path.basename(media_path), handle, mime_type)}
+            response = self.session.post(
+                "https://stream-upload.goofish.com/api/upload.api",
+                headers=headers,
+                params=params,
+                files=files,
+                timeout=45,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        image_object = payload.get("object") if isinstance(payload, dict) else None
+        if not isinstance(image_object, dict) or not image_object.get("url"):
+            raise RuntimeError("闲鱼图片上传失败，请检查登录状态后重试")
+        return payload
         
     def clear_duplicate_cookies(self):
         """清理重复的cookies"""
@@ -146,8 +180,11 @@ class XianyuApis:
                 return self.get_token(device_id, 0)  # 重置重试次数
             else:
                 logger.error("重新登录失败，Cookie已失效")
-                logger.error("🔴 程序即将退出，请更新.env文件中的COOKIES_STR后重新启动")
-                sys.exit(1)  # 直接退出程序
+                message = "Cookie已失效，请更新Cookie后重新启动客服"
+                logger.error(f"🔴 {message}")
+                if not self.interactive:
+                    raise RuntimeError(message)
+                sys.exit(1)
 
         params = {
             'jsv': '2.7.2',
@@ -204,6 +241,8 @@ class XianyuApis:
                     if 'RGV587_ERROR' in error_msg or '被挤爆啦' in error_msg:
                         logger.error(f"❌ 触发风控: {ret_value}")
                         logger.error("🔴 系统目前无法自动解决，请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie")
+                        if not self.interactive:
+                            raise RuntimeError("闲鱼触发风控，请在网页版完成验证并更新Cookie")
                         
                         # 获取用户输入的新Cookie
                         print("\n" + "="*50)
@@ -317,3 +356,73 @@ class XianyuApis:
             logger.error(f"商品信息API请求异常: {str(e)}")
             time.sleep(0.5)
             return self.get_item_info(item_id, retry_count + 1)
+
+    def get_user_items(self, user_id, page_number=1, page_size=20, page_state=None):
+        """Read one page of the logged-in seller's public item cards."""
+        payload = {
+            "needGroupInfo": page_number == 1,
+            "pageNumber": int(page_number),
+            "userId": str(user_id),
+            "pageSize": int(page_size),
+        }
+        if page_state:
+            for key in (
+                "groupName", "groupId", "defaultGroup", "groupSortId",
+                "filterPanelGroupId", "nextPageModel", "nextPageNum",
+            ):
+                if page_state.get(key) is not None:
+                    payload[key] = page_state[key]
+        data_val = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        request_time = str(int(time.time() * 1000))
+        token = self.session.cookies.get("_m_h5_tk", "").split("_")[0]
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": request_time,
+            "sign": generate_sign(request_time, token, data_val),
+            "v": "1.0",
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": "mtop.idle.web.xyh.item.list",
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21ybx.personal.0.0",
+        }
+        response = self.session.post(
+            "https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/",
+            params=params,
+            data={"data": data_val},
+            timeout=25,
+        )
+        result = response.json()
+        ret = result.get("ret", []) if isinstance(result, dict) else []
+        if not any("SUCCESS::调用成功" in value for value in ret):
+            raise RuntimeError("读取闲鱼商品列表失败：" + "；".join(ret or ["返回格式异常"]))
+        return result
+
+    def get_all_user_items(self, user_id, page_size=20, max_pages=50):
+        """Aggregate all cards and let the caller filter itemStatus=0 (on sale)."""
+        cards = []
+        page_state = {}
+        for page_number in range(1, max_pages + 1):
+            result = self.get_user_items(user_id, page_number, page_size, page_state)
+            data = result.get("data") or {}
+            cards.extend(data.get("cardList") or [])
+            if not data.get("nextPage"):
+                break
+            page_state.update({
+                "nextPageModel": data.get("nextPageModel"),
+                "nextPageNum": data.get("nextPageNum"),
+            })
+            if page_number == 1:
+                groups = data.get("itemGroupList") or []
+                default_group = next((group for group in groups if group.get("defaultGroup")), None)
+                if default_group:
+                    page_state.update({
+                        "groupName": default_group.get("groupName"),
+                        "groupId": default_group.get("groupId"),
+                        "defaultGroup": True,
+                    })
+            time.sleep(0.15)
+        return cards

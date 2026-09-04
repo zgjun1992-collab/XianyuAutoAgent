@@ -12,6 +12,14 @@ env/
 build/
 develop-eggs/
 dist/
+dist-v2-backend/
+build-v2-backend/
+dist-v3-backend/
+build-v3-backend/
+desktop_v2/node_modules/
+desktop_v2/dist/
+desktop_v2/release/
+desktop_v2/release-v*/
 downloads/
 eggs/
 .eggs/
@@ -51,4 +59,4 @@ htmlcov/
 .tox/
 .nox/
 .hypothesis/
-.coverage.* 
+.coverage.*

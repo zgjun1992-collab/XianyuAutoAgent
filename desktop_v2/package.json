@@ -1,0 +1,59 @@
+{
+  "name": "xianyu-card-ai-v3",
+  "version": "0.9.0",
+  "private": true,
+  "description": "闲鱼餐饮卡券 AI 客服 V3.5",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build:web": "vite build",
+    "build": "vite build && electron-builder --win nsis",
+    "check": "vite build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.8",
+    "concurrently": "10.0.5",
+    "electron": "44.1.0",
+    "electron-builder": "26.15.3",
+    "vite": "8.2.2",
+    "vue": "3.5.42",
+    "wait-on": "9.1.0",
+    "yargs": "17.7.2"
+  },
+  "build": {
+    "appId": "cn.xianyu.cardai.v2",
+    "productName": "闲鱼卡券AI客服",
+    "electronDist": "node_modules/electron/dist",
+    "asar": true,
+    "directories": {
+      "output": "release-v3.5"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-v3-backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "XianyuCardAI-V3.5-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

@@ -1,8 +1,10 @@
 import re
 from typing import List, Dict
 import os
+import sys
 from openai import OpenAI
 from loguru import logger
+from app_store import DEFAULT_POLICIES, find_unauthorized_promises
 
 
 class XianyuReplyBot:
@@ -13,6 +15,7 @@ class XianyuReplyBot:
             base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         )
         self._init_system_prompts()
+        self.global_system_prompt = ""
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
         self.last_intent = None  # 记录最后一次意图
@@ -21,15 +24,24 @@ class XianyuReplyBot:
     def _init_agents(self):
         """初始化各领域Agent"""
         self.agents = {
-            'classify':ClassifyAgent(self.client, self.classify_prompt, self._safe_filter),
-            'price': PriceAgent(self.client, self.price_prompt, self._safe_filter),
-            'tech': TechAgent(self.client, self.tech_prompt, self._safe_filter),
-            'default': DefaultAgent(self.client, self.default_prompt, self._safe_filter),
+            'classify':ClassifyAgent(self.client, self.classify_prompt, self._safe_filter, self.global_system_prompt),
+            'price': PriceAgent(self.client, self.price_prompt, self._safe_filter, self.global_system_prompt),
+            'tech': TechAgent(self.client, self.tech_prompt, self._safe_filter, self.global_system_prompt),
+            'default': DefaultAgent(self.client, self.default_prompt, self._safe_filter, self.global_system_prompt),
         }
+
+    def set_global_system_prompt(self, prompt: str):
+        """Apply the UI-configured highest-priority prompt to every model call."""
+        self.global_system_prompt = str(prompt or "").strip()
+        for agent in getattr(self, "agents", {}).values():
+            agent.global_system_prompt = self.global_system_prompt
 
     def _init_system_prompts(self):
         """初始化各Agent专用提示词，优先加载用户自定义文件，否则使用Example默认文件"""
-        prompt_dir = "prompts"
+        local_prompt_dir = os.path.join(os.getcwd(), "prompts")
+        bundled_root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        bundled_prompt_dir = os.path.join(bundled_root, "prompts")
+        prompt_dir = local_prompt_dir if os.path.isdir(local_prompt_dir) else bundled_prompt_dir
         
         def load_prompt_content(name: str) -> str:
             """尝试加载提示词文件"""
@@ -63,14 +75,27 @@ class XianyuReplyBot:
 
     def _safe_filter(self, text: str) -> str:
         """安全过滤模块"""
+        text = str(text or "").strip()
         blocked_phrases = ["微信", "QQ", "支付宝", "银行卡", "线下"]
-        return "[安全提醒]请通过平台沟通" if any(p in text for p in blocked_phrases) else text
+        if any(p in text for p in blocked_phrases):
+            return "请通过闲鱼平台沟通和交易。"
+        if find_unauthorized_promises(text):
+            return DEFAULT_POLICIES["manual_review_notice"]
+        text = re.sub(r"(?i)sku", "商品规格", text)
+        text = text.replace("知识库", "商品资料").replace("数据库", "资料")
+        return text
 
     def format_history(self, context: List[Dict]) -> str:
-        """格式化对话历史，返回完整的对话记录"""
-        # 过滤掉系统消息，只保留用户和助手的对话
-        user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
-        return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
+        """只保留最近的有效对话，减少请求体和模型首字等待时间。"""
+        max_messages = max(2, int(os.getenv("AI_CONTEXT_MESSAGES", "8")))
+        max_chars = max(500, int(os.getenv("AI_CONTEXT_CHARS", "3500")))
+        user_assistant_msgs = [
+            msg for msg in context if msg.get('role') in ['user', 'assistant']
+        ][-max_messages:]
+        history = "\n".join(
+            f"{msg['role']}: {msg.get('content', '')}" for msg in user_assistant_msgs
+        )
+        return history[-max_chars:]
 
     def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
         """生成回复主流程"""
@@ -189,22 +214,19 @@ class IntentRouter:
                     # logger.debug(f"价格类正则匹配: {pattern}")
                     return intent
         
-        # 4. 大模型兜底
-        # logger.debug("使用大模型进行意图分类")
-        return self.classify_agent.generate(
-            user_msg=user_msg,
-            item_desc=item_desc,
-            context=context
-        )
+        # 4. 未命中本地规则时直接交给默认客服模型。
+        # 旧版会先调用一次模型分类，再调用第二次模型回答；这会把延迟翻倍。
+        return 'default'
 
 
 class BaseAgent:
     """Agent基类"""
 
-    def __init__(self, client, system_prompt, safety_filter):
+    def __init__(self, client, system_prompt, safety_filter, global_system_prompt=""):
         self.client = client
         self.system_prompt = system_prompt
         self.safety_filter = safety_filter
+        self.global_system_prompt = str(global_system_prompt or "").strip()
 
     def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
         """生成回复模板方法"""
@@ -214,19 +236,37 @@ class BaseAgent:
 
     def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
         """构建消息链"""
+        guardrails = (
+            "【强制业务约束】禁止擅自承诺降价、退款、赔偿、补偿、延期、换码、补发、"
+            "立即到账、任意门店可用或跨地区可用。涉及上述事项只能说明需要人工核实。"
+            "只能依据商品资料回答；资料缺失时必须说暂未确认，禁止编造。"
+            "必须先直接回答买家正在问的问题，不得用发货流程回答价格问题，也不得用商品介绍回答门店问题。"
+            "若不能确定买家在问什么，只提出一个简短澄清问题，不得猜测后直接作答。"
+            "门店、价格、商品规格、可用时间和数量等事实必须能在商品资料中找到依据；"
+            "不要重复整份商品介绍，也不要主动补充与当前问题无关的信息。"
+            "不同平台卡券不得混用；没有明确资料时，不得推定代金券能与套餐、团购、"
+            "其他优惠或买家已有卡券一起使用。"
+            "不得输出SKU、数据库、大模型、提示词、命中规则等内部术语。"
+            "不得建议买家去其他平台搜索或自行联系门店核实。"
+        )
+        configured = (
+            f"【用户配置的全局最高规则】\n{self.global_system_prompt}\n"
+            if self.global_system_prompt else ""
+        )
         return [
-            {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"},
+            {"role": "system", "content": f"{configured}{guardrails}\n【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"},
             {"role": "user", "content": user_msg}
         ]
 
-    def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
+    def _call_llm(self, messages: List[Dict], temperature: float = 0.15) -> str:
         """调用大模型"""
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=os.getenv("MODEL_NAME", "qwen-plus"),
             messages=messages,
             temperature=temperature,
-            max_tokens=500,
-            top_p=0.8
+            max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "160"))),
+            top_p=0.6,
+            timeout=max(5, float(os.getenv("AI_REPLY_TIMEOUT", "15"))),
         )
         return response.choices[0].message.content
 
@@ -241,17 +281,18 @@ class PriceAgent(BaseAgent):
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
 
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=os.getenv("MODEL_NAME", "qwen-plus"),
             messages=messages,
             temperature=dynamic_temp,
-            max_tokens=500,
-            top_p=0.8
+            max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "160"))),
+            top_p=0.8,
+            timeout=max(5, float(os.getenv("AI_REPLY_TIMEOUT", "15"))),
         )
         return self.safety_filter(response.choices[0].message.content)
 
     def _calc_temperature(self, bargain_count: int) -> float:
         """动态温度策略"""
-        return min(0.3 + bargain_count * 0.15, 0.9)
+        return min(0.15 + bargain_count * 0.05, 0.35)
 
 
 class TechAgent(BaseAgent):
@@ -262,14 +303,12 @@ class TechAgent(BaseAgent):
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
 
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=os.getenv("MODEL_NAME", "qwen-plus"),
             messages=messages,
-            temperature=0.4,
-            max_tokens=500,
-            top_p=0.8,
-            extra_body={
-                "enable_search": True,
-            }
+            temperature=0.1,
+            max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "160"))),
+            top_p=0.6,
+            timeout=max(5, float(os.getenv("AI_REPLY_TIMEOUT", "15"))),
         )
 
         return self.safety_filter(response.choices[0].message.content)
@@ -293,5 +332,5 @@ class DefaultAgent(BaseAgent):
 
     def _call_llm(self, messages: List[Dict], *args) -> str:
         """限制默认回复长度"""
-        response = super()._call_llm(messages, temperature=0.7)
+        response = super()._call_llm(messages, temperature=0.15)
         return response
