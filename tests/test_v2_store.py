@@ -1397,6 +1397,21 @@ class V2StoreTests(unittest.TestCase):
         cooldown = self.store.resolve_image_asset("10001", "再发一次套餐图", "scope-a")
         self.assertEqual("cooldown", cooldown["status"])
 
+    def test_keyword_rule_can_send_text_without_an_image(self):
+        asset = self.store.save_image_asset({
+            "item_id": "10001",
+            "name": "停车说明",
+            "purpose": "买家咨询停车时发送",
+            "trigger_words": ["停车", "停车费"],
+            "reply_text": "商场提供停车场。{$分段符}停车收费以现场公示为准。",
+            "file_path": "",
+            "enabled": True,
+        })
+        self.assertEqual("", asset["file_path"])
+        matched = self.store.resolve_image_asset("10001", "停车费怎么算", "scope-text")
+        self.assertEqual("allow", matched["status"])
+        self.assertEqual(asset["id"], matched["asset"]["id"])
+
     def test_multiple_image_hits_require_review(self):
         for index in (1, 2):
             image_path = os.path.join(self.temp.name, f"menu-{index}.jpg")

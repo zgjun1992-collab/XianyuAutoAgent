@@ -20,6 +20,46 @@ from privacy_guard import redact_sensitive_text
 
 
 class XianyuLive:
+    TEMPLATE_SEGMENT_TOKEN = "{$分段符}"
+    TEMPLATE_IMAGE_PATTERN = re.compile(r"\{\$图片:(\d+)\}")
+
+    @classmethod
+    def parse_message_template(cls, text):
+        """Parse opt-in templates without changing ordinary reply behavior."""
+        source = str(text or "")
+        parts = []
+        cursor = 0
+        for match in cls.TEMPLATE_IMAGE_PATTERN.finditer(source):
+            before = source[cursor:match.start()]
+            for value in before.split(cls.TEMPLATE_SEGMENT_TOKEN):
+                value = value.strip()
+                if value:
+                    parts.append({"type": "text", "content": value})
+            parts.append({"type": "image", "asset_id": int(match.group(1))})
+            cursor = match.end()
+        for value in source[cursor:].split(cls.TEMPLATE_SEGMENT_TOKEN):
+            value = value.strip()
+            if value:
+                parts.append({"type": "text", "content": value})
+        return parts[:8]
+
+    async def send_message_template(self, ws, cid, toid, scope_id, item_id, text, *, sanitize=True):
+        """Send a saved first-reply/keyword template in order; ordinary replies never enter here."""
+        sent_text = []
+        parts = self.parse_message_template(text)
+        for index, part in enumerate(parts):
+            if part["type"] == "text":
+                value = self.sanitize_buyer_reply(part["content"]) if sanitize else part["content"]
+                await self.send_msg(ws, cid, toid, value, sanitize=False)
+                sent_text.append(value)
+            else:
+                asset = self.app_store.get_image_asset(part["asset_id"])
+                if not asset or str(asset.get("item_id")) != str(item_id) or not asset.get("file_path"):
+                    raise ValueError(f"首次回复引用的图片 #{part['asset_id']} 不存在或不属于当前商品")
+                await self.send_image_asset(ws, cid, toid, scope_id, asset)
+            if index + 1 < len(parts):
+                await asyncio.sleep(0.35)
+        return "\n\n".join(sent_text)
     def __init__(self, cookies_str, bot_instance=None, app_store=None, event_callback=None, interactive=True):
         self.xianyu = XianyuApis(interactive=interactive)
         self.base_url = 'wss://wss-goofish.dingtalk.com/'
@@ -273,8 +313,14 @@ class XianyuLive:
 
     async def _send_approved(self, audit, final_reply, resume_ai=True):
         final_reply = self.sanitize_buyer_reply(final_reply)
-        await self.send_msg(self.ws, audit["chat_id"], audit["user_id"], final_reply)
         scope_id = audit.get("scope_id") or self.scope_key(audit["chat_id"], audit["item_id"])
+        if audit.get("image_asset_id"):
+            await self.send_message_template(
+                self.ws, audit["chat_id"], audit["user_id"], scope_id,
+                audit["item_id"], final_reply,
+            )
+        else:
+            await self.send_msg(self.ws, audit["chat_id"], audit["user_id"], final_reply)
         self.context_manager.add_message_by_chat(
             scope_id, self.myid, audit["item_id"], "assistant", final_reply
         )
@@ -422,12 +468,20 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def _send_and_record_auto_reply(
-        self, websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply
+        self, websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply,
+        reply_parts=None,
     ):
         """Persist a reply as sent only after the WebSocket write succeeds."""
         final_reply = self.sanitize_buyer_reply(final_reply)
         try:
-            await self.send_msg(websocket, chat_id, send_user_id, final_reply)
+            parts = [str(value).strip() for value in (reply_parts or []) if str(value).strip()]
+            if parts:
+                for index, value in enumerate(parts):
+                    await self.send_msg(websocket, chat_id, send_user_id, value)
+                    if index + 1 < len(parts):
+                        await asyncio.sleep(0.35)
+            else:
+                await self.send_msg(websocket, chat_id, send_user_id, final_reply)
         except Exception:
             # Keep the draft for diagnosis/retry, but never claim delivery when
             # the transport rejected the message.
@@ -1163,8 +1217,9 @@ class XianyuLive:
                         and not int(conversation.get("first_reply_sent", 0))):
                     reply = self.prepare_product_first_reply(current_product)
                     try:
-                        await self.send_msg(
-                            websocket, chat_id, send_user_id, reply, sanitize=False
+                        await self.send_message_template(
+                            websocket, chat_id, send_user_id, scope_id, item_id,
+                            reply, sanitize=False,
                         )
                     except Exception as exc:
                         # AI-off products must not fall through to the global
@@ -1364,15 +1419,17 @@ class XianyuLive:
                 bot_reply = predecision.suggested_reply
                 logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif image_match and image_match.get("status") in {"allow", "review"}:
-                image_asset = image_match["asset"]
-                bot_reply = image_asset.get("reply_text") or "可以的，给您发一下对应的套餐图片。"
+                matched_asset = image_match["asset"]
+                image_asset = matched_asset if matched_asset.get("file_path") else None
+                bot_reply = matched_asset.get("reply_text") or "可以的，给您发一下对应的套餐图片。"
                 deterministic = {
                     "reply": bot_reply,
-                    "source": f"当前商品套餐图片：{image_asset.get('name', '')}",
+                    "source": f"当前商品关键词规则：{matched_asset.get('name', '')}",
                     "decision": image_match["status"],
+                    "kind": "keyword_rule",
                 }
                 logger.info(
-                    f"套餐图片命中: {image_asset.get('name')} ({image_match.get('status')})"
+                    f"关键词规则命中: {matched_asset.get('name')} ({image_match.get('status')})"
                 )
             elif image_match and image_match.get("status") == "cooldown":
                 bot_reply = "这张图片刚刚已经发过了，如需我可以继续帮您核对套餐信息。"
@@ -1474,9 +1531,9 @@ class XianyuLive:
                 )
                 first_reply_sent = False
                 if first_reply_to_send:
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, first_reply_to_send,
-                        sanitize=False,
+                    await self.send_message_template(
+                        websocket, chat_id, send_user_id, scope_id, item_id,
+                        first_reply_to_send, sanitize=False,
                     )
                     self.context_manager.add_message_by_chat(
                         scope_id, self.myid, item_id, "assistant", first_reply_to_send
@@ -1588,9 +1645,9 @@ class XianyuLive:
             first_reply_sent = False
             if first_reply_to_send:
                 try:
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, first_reply_to_send,
-                        sanitize=False,
+                    await self.send_message_template(
+                        websocket, chat_id, send_user_id, scope_id, item_id,
+                        first_reply_to_send, sanitize=False,
                     )
                     self.context_manager.add_message_by_chat(
                         scope_id, self.myid, item_id, "assistant", first_reply_to_send
@@ -1611,9 +1668,21 @@ class XianyuLive:
                 logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
                 await asyncio.sleep(total_delay)
                 
-            await self._send_and_record_auto_reply(
-                websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply
-            )
+            if image_asset:
+                await self.send_message_template(
+                    websocket, chat_id, send_user_id, scope_id, item_id, final_reply,
+                )
+                self.context_manager.add_message_by_chat(
+                    scope_id, self.myid, item_id, "assistant", final_reply
+                )
+                self.app_store.update_audit(audit_id, "sent", final_reply)
+                self.app_store.record_ai_reply(scope_id)
+            else:
+                await self._send_and_record_auto_reply(
+                    websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply,
+                    ([value for value in final_reply.split(self.TEMPLATE_SEGMENT_TOKEN) if value.strip()]
+                     if image_match else (deterministic or {}).get("reply_parts")),
+                )
             if deterministic and deterministic.get("kind") == "media":
                 recent_media = self._recent_buyer_media.get(scope_id)
                 self._media_notice_times[scope_id] = recent_media[0] if recent_media else time.monotonic()

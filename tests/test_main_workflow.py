@@ -35,6 +35,17 @@ class _Context:
 
 
 class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    def test_saved_template_parser_orders_text_and_images(self):
+        parts = XianyuLive.parse_message_template(
+            "第一段{$分段符}{$分段符}第二段{$图片:7}{$分段符}第三段"
+        )
+        self.assertEqual([
+            {"type": "text", "content": "第一段"},
+            {"type": "text", "content": "第二段"},
+            {"type": "image", "asset_id": 7},
+            {"type": "text", "content": "第三段"},
+        ], parts)
+
     def make_live(self):
         live = XianyuLive.__new__(XianyuLive)
         live.myid = "seller"

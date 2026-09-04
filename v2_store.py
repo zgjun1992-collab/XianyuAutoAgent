@@ -3721,13 +3721,14 @@ class V2Store(AppStore):
     def save_image_asset(self, payload: Dict) -> Dict:
         item_id = str(payload.get("item_id") or "").strip()
         name = str(payload.get("name") or "").strip()
-        file_path = os.path.abspath(str(payload.get("file_path") or "").strip())
+        file_value = str(payload.get("file_path") or "").strip()
+        file_path = os.path.abspath(file_value) if file_value else ""
         if not item_id:
             raise ValueError("请先选择商品")
         if not name:
             raise ValueError("请填写图片名称")
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError("套餐图片文件不存在")
+        if file_path and not os.path.isfile(file_path):
+            raise FileNotFoundError("关键词规则图片文件不存在")
         raw_words = payload.get("trigger_words") or []
         if isinstance(raw_words, str):
             raw_words = re.split(r"[\n,，;；]+", raw_words)
@@ -4970,8 +4971,14 @@ class V2Store(AppStore):
                 "store_status": "unconfigured",
             }
         matrix = self._store_sku_matrix(item_id, matches, scope)
+        reply = self._format_store_sku_matrix(resolved_query, matrix, selected_skus)
+        reply_parts = []
+        if not selected_skus and 1 < len(matrix) <= 3:
+            sections = reply.split("\n\n")
+            reply_parts = [sections[0], *sections[1].splitlines(), *sections[2:]]
         return {
-            "reply": self._format_store_sku_matrix(resolved_query, matrix, selected_skus),
+            "reply": reply,
+            "reply_parts": reply_parts,
             "source": "多规格商品级门店与规格对应关系",
             "decision": "allow", "kind": "stores_sku_recommendation",
             "store_matches": matches, "store_query": resolved_query,

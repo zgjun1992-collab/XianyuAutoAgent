@@ -28,7 +28,10 @@ SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供
 输出一个JSON对象，字段必须为：
 summary: 适合客服快速阅读的中文分点摘要字符串，禁止输出Python对象、JSON片段或字段字典；
 risk_fields: 需要人工确认的高风险或矛盾字段数组；
-facts: 对象，允许包含有效期、使用时间、使用规则、叠加规则、退款规则、发码方式；
+facts: 对象，按原文明确信息尽量完整提取，允许包含商品类型、有效期、适用日期、不可用日期、
+使用时间、预约要求、堂食限制、外带限制、外卖限制、包间限制、酒水限制、锅底限制、服务费限制、
+优惠同享、叠加规则、不同面额混用、单次或每桌限用数量、退款规则、发码平台、发码方式、领取方式、
+核销方式、发票规则、适用人群、人数限制和下单前提醒；原文未说明的内容不得猜测；
 products: 仅填写代金券规格数组，每个规格必须独立一项，字段为name、option_type、face_value、sale_price、applicable_time、composition、max_stack。
 sale_options: 仅填写套餐、自助餐、人数餐等非代金券商品选项数组，每项字段为name、option_type、sale_price、people_count、applicable_day、meal_period、applicable_time；
 stores: 商品文案明确列出的适用门店数组，每项字段为brand、branch、province、city、district、address、phone；
@@ -323,31 +326,35 @@ class BackendState:
 
     def save_image_asset(self, payload):
         item_id = str(payload.get("item_id") or "").strip()
-        source_path = os.path.abspath(str(payload.get("source_path") or "").strip())
+        source_value = str(payload.get("source_path") or "").strip()
+        source_path = os.path.abspath(source_value) if source_value else ""
         if not item_id:
             raise ValueError("请先选择商品")
-        if not os.path.isfile(source_path):
-            raise FileNotFoundError("请选择套餐图片")
-        extension = os.path.splitext(source_path)[1].lower()
-        if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
-            raise ValueError("套餐图片仅支持 PNG、JPG、JPEG 或 WebP")
-        if os.path.getsize(source_path) > 10 * 1024 * 1024:
-            raise ValueError("单张套餐图片不能超过10MB")
+        previous = self.store.get_image_asset(int(payload["id"])) if payload.get("id") else None
+        if source_path and not os.path.isfile(source_path):
+            raise FileNotFoundError("关键词规则图片不存在")
+        if not source_path and not str(payload.get("reply_text") or "").strip():
+            raise ValueError("请至少填写一段触发后发送的文字或选择图片")
+        extension = os.path.splitext(source_path)[1].lower() if source_path else ""
+        if extension and extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("图片仅支持 PNG、JPG、JPEG 或 WebP")
+        if source_path and os.path.getsize(source_path) > 10 * 1024 * 1024:
+            raise ValueError("单张图片不能超过10MB")
         safe_item_id = re.sub(r"[^0-9A-Za-z_-]+", "_", item_id)[:80] or "product"
         asset_dir = os.path.join(self.data_dir, "product-images", safe_item_id)
         os.makedirs(asset_dir, exist_ok=True)
-        target_path = os.path.join(asset_dir, f"{uuid.uuid4().hex}{extension}")
-        shutil.copy2(source_path, target_path)
-        previous = self.store.get_image_asset(int(payload["id"])) if payload.get("id") else None
+        target_path = os.path.join(asset_dir, f"{uuid.uuid4().hex}{extension}") if source_path else str((previous or {}).get("file_path") or "")
+        if source_path and source_path != target_path:
+            shutil.copy2(source_path, target_path)
         record = dict(payload)
         record.update({
             "item_id": item_id,
             "file_path": target_path,
-            "original_name": os.path.basename(source_path),
+            "original_name": os.path.basename(source_path) if source_path else str((previous or {}).get("original_name") or ""),
         })
         try:
             saved = self.store.save_image_asset(record)
-            if previous and previous.get("file_path") != target_path:
+            if source_path and previous and previous.get("file_path") != target_path:
                 try:
                     os.remove(previous["file_path"])
                 except OSError:
@@ -355,7 +362,8 @@ class BackendState:
             return saved
         except Exception:
             try:
-                os.remove(target_path)
+                if source_path:
+                    os.remove(target_path)
             except OSError:
                 pass
             raise

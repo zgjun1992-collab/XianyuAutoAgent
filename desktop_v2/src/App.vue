@@ -56,6 +56,22 @@ const filteredProducts = computed(() => {
   if (!query) return snapshot.products
   return snapshot.products.filter((item) => `${item.title} ${item.item_id}`.toLowerCase().includes(query))
 })
+const firstReplyParts = computed(() => {
+  const source = String(productDraft.first_reply_text || '')
+  const parts = []
+  const pattern = /\{\$图片:(\d+)\}/g
+  let cursor = 0
+  let match
+  const pushText = (value) => String(value).split('{$分段符}').map((item) => item.trim()).filter(Boolean).forEach((content) => parts.push({ type: 'text', content }))
+  while ((match = pattern.exec(source))) {
+    pushText(source.slice(cursor, match.index))
+    const asset = productDraft.image_assets.find((item) => Number(item.id) === Number(match[1]))
+    parts.push({ type: 'image', asset, assetId: Number(match[1]) })
+    cursor = match.index + match[0].length
+  }
+  pushText(source.slice(cursor))
+  return parts.slice(0, 8)
+})
 const serviceActive = computed(() => ['starting', 'connected', 'reconnecting', 'stopping'].includes(snapshot.service.status))
 const serviceLabel = computed(() => ({
   stopped: '客服已停止', starting: '正在启动', connected: '客服运行中', reconnecting: '正在重连', stopping: '正在停止', error: '连接异常'
@@ -67,6 +83,19 @@ function notify(text, kind = 'ok') {
   toast.kind = kind
   toast.visible = true
   toastTimer = setTimeout(() => { toast.visible = false }, 3200)
+}
+
+function appendFirstReplyToken(token) {
+  const current = String(productDraft.first_reply_text || '').trimEnd()
+  productDraft.first_reply_text = `${current}${current ? '\n' : ''}${token}\n`
+}
+
+function insertFirstReplySegment() {
+  appendFirstReplyToken('{$分段符}')
+}
+
+function insertFirstReplyImage(asset) {
+  appendFirstReplyToken(`{$图片:${asset.id}}`)
 }
 
 async function call(method, path, body, quiet = false) {
@@ -525,7 +554,7 @@ function editImageAsset(asset) {
 
 async function saveImageAsset() {
   if (!productDraft.item_id) return notify('请先选择商品', 'error')
-  if (!imageDraft.source_path) return notify('请先选择套餐图片', 'error')
+  if (!imageDraft.source_path && !imageDraft.reply_text.trim()) return notify('请填写触发后发送的文字或选择图片', 'error')
   const asset = await call('POST', `/products/${encodeURIComponent(productDraft.item_id)}/images`, {
     id: imageDraft.id,
     source_path: imageDraft.source_path,
@@ -731,7 +760,7 @@ onBeforeUnmount(() => {
             <div><span class="eyebrow">商品卡片</span><h2>{{ productDraft.title || '新建商品' }}</h2><p>ID {{ productDraft.item_id || '—' }} · ¥{{ productDraft.price || '—' }} · {{ productDraft.item_status === 'offline' ? '已下架' : '在售' }}</p></div>
             <div class="button-row"><button :class="productDraft.enabled ? '' : 'danger'" @click="setProductAiEnabled(productDraft)">{{ productDraft.enabled ? '关闭本商品AI客服' : '开启本商品AI客服' }}</button><button @click="confirmOpenProductPage()">打开商品页面</button><button @click="loadVersions">版本记录</button><button class="danger" @click="deleteProduct(productDraft)">删除</button><button class="primary" @click="saveProduct">保存人工修改</button></div>
           </div>
-          <div class="product-tabs"><button :class="{ active: productTab === 'knowledge' }" @click="productTab = 'knowledge'">商品资料与知识</button><button :class="{ active: productTab === 'firstReply' }" @click="productTab = 'firstReply'">首次回复</button><button :class="{ active: productTab === 'stores' }" @click="productTab = 'stores'">适用门店 <b>{{ productDraft.store_lists.reduce((sum, item) => sum + item.store_count, 0) }}</b></button><button :class="{ active: productTab === 'images' }" @click="productTab = 'images'">套餐图片 <b>{{ productDraft.image_assets.length }}</b></button></div>
+          <div class="product-tabs"><button :class="{ active: productTab === 'knowledge' }" @click="productTab = 'knowledge'">商品资料与知识</button><button :class="{ active: productTab === 'firstReply' }" @click="productTab = 'firstReply'">首次回复</button><button :class="{ active: productTab === 'stores' }" @click="productTab = 'stores'">适用门店 <b>{{ productDraft.store_lists.reduce((sum, item) => sum + item.store_count, 0) }}</b></button><button :class="{ active: productTab === 'images' }" @click="productTab = 'images'">关键词触发 <b>{{ productDraft.image_assets.length }}</b></button></div>
 
           <article v-if="productDraft.sync_status === 'source_updated'" class="knowledge-card source-update-card">
             <div class="knowledge-head"><div><span class="number">新</span><div><strong>闲鱼页面发现更新</strong><small>当前生效知识、门店和首次回复均未被覆盖；只有你确认的项目才会修改。</small></div></div><span class="authority">等待人工允许</span></div>
@@ -753,12 +782,12 @@ onBeforeUnmount(() => {
               <div class="source-images"><img v-for="url in productDraft.image_urls.slice(0, 8)" :key="url" :src="url" /></div>
               <pre>{{ productDraft.platform_summary || '当前没有同步到闲鱼页面资料。' }}</pre>
             </div>
-            <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>当前生效的商品知识</strong><small>AI已根据页面生成初稿，你可以直接改写；保存后永久优先于闲鱼页面</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="14" placeholder="同步后会自动生成初始知识；也可以直接粘贴自己的补充说明。"></textarea></article>
-            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>最近一次AI初始知识</strong><small>可以直接修改；点击保存后成为当前最高优先级知识，并自动保留历史版本</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_summary" v-model="productDraft.ai_summary" rows="14" placeholder="可在这里修改AI归纳结果"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">保存修改并设为当前知识</button></div><div v-if="productDraft.structured?.risk_fields?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in productDraft.structured.risk_fields" :key="field">{{ field }}</span></div></article>
+            <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea></article>
+            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>仅用于核对；重新归纳不会自动覆盖上方人工知识。确认无误后可人工采纳为当前知识，并保留历史版本</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_summary" v-model="productDraft.ai_summary" rows="16" placeholder="AI会尽量整理规格、价格、时间、适用限制、发券核销及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="productDraft.structured?.risk_fields?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in productDraft.structured.risk_fields" :key="field">{{ field }}</span></div></article>
           </div>
 
           <div v-else-if="productTab === 'firstReply'" class="product-tab-body">
-            <article class="knowledge-card raw first-reply-card"><div class="knowledge-head"><div><span class="number">首</span><div><strong>当前商品首次回复</strong><small>每位买家咨询当前商品时每个会话窗口只触发一次；{{ policyDraft.conversation_reset_hours }}小时无消息后重新计算</small></div></div><span class="authority">本地极速发送</span></div><label class="check-line"><input v-model="productDraft.first_reply_enabled" type="checkbox" />启用当前商品首次回复</label><textarea v-model="productDraft.first_reply_text" rows="12" placeholder="系统会把每个面额、售价、适用时间和发券组成分别渲染；不会发送JSON或字段对象。"></textarea><div class="first-reply-preview"><strong>实际发送预览</strong><pre>{{ productDraft.first_reply_text || '尚未生成首次回复。' }}</pre></div><div class="first-reply-meta"><span>生成时间：{{ productDraft.first_reply_generated_at || '尚未生成' }}</span><span>预览内容与实际发送文本一致</span></div><div class="button-row end"><button @click="regenerateFirstReply">重新从当前知识提取</button><button class="primary" @click="saveProduct">保存首次回复</button></div></article>
+            <article class="knowledge-card raw first-reply-card"><div class="knowledge-head"><div><span class="number">首</span><div><strong>当前商品首次回复</strong><small>AI默认从当前知识提取；可人工编辑、分段并插入当前商品图片。每个会话窗口只触发一次。</small></div></div><span class="authority">本地极速发送</span></div><label class="check-line"><input v-model="productDraft.first_reply_enabled" type="checkbox" />启用当前商品首次回复</label><div class="button-row"><button type="button" @click="insertFirstReplySegment">＋ 插入分段符</button><details><summary>＋ 插入图片</summary><div class="store-delete-popover"><button v-for="asset in productDraft.image_assets.filter((item) => item.file_path)" :key="asset.id" type="button" @click="insertFirstReplyImage(asset)">{{ asset.name }}</button><p v-if="!productDraft.image_assets.some((item) => item.file_path)">请先在“关键词触发”中添加图片。</p></div></details></div><textarea v-model="productDraft.first_reply_text" rows="12" placeholder="AI会生成默认内容；使用 {$分段符} 分成多个文字气泡，使用 {$图片:编号} 在指定位置发送图片。"></textarea><div class="first-reply-preview"><strong>实际发送预览 · {{ firstReplyParts.filter((item) => item.type === 'text').length }}条文字 + {{ firstReplyParts.filter((item) => item.type === 'image').length }}张图片</strong><template v-if="firstReplyParts.length"><div v-for="(part, index) in firstReplyParts" :key="`${part.type}-${index}`" class="security-note"><pre v-if="part.type === 'text'">{{ part.content }}</pre><div v-else><img v-if="part.asset && imagePreviews[part.asset.id]" :src="imagePreviews[part.asset.id]" style="max-width:240px;max-height:180px;border-radius:12px" /><span v-else>⚠ 图片 #{{ part.assetId }} 不存在</span></div></div></template><pre v-else>尚未生成首次回复。</pre></div><div class="first-reply-meta"><span>生成时间：{{ productDraft.first_reply_generated_at || '尚未生成' }}</span><span>{{ productDraft.first_reply_manual ? '当前版本已人工编辑' : '当前为AI默认稿' }}</span></div><div class="button-row end"><button @click="regenerateFirstReply">重新从当前知识提取</button><button class="primary" @click="saveProduct">保存首次回复</button></div></article>
           </div>
 
           <div v-else-if="productTab === 'stores'" class="product-tab-body">
@@ -788,14 +817,14 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-else-if="productTab === 'images'" class="product-tab-body image-library">
-            <article class="knowledge-card image-editor"><div class="knowledge-head"><div><span class="number">图</span><div><strong>当前商品的套餐图片</strong><small>图片仅保存在本机并在命中触发词后发给买家，不发送给AI模型</small></div></div><button v-if="imageDraft.id" @click="resetImageDraft">取消编辑</button></div>
+            <article class="knowledge-card image-editor"><div class="knowledge-head"><div><span class="number">词</span><div><strong>当前商品的关键词触发</strong><small>买家文字包含任意一个触发词时发送本规则文字和图片，并独占结束本轮，不再调用AI或追加其他回复。</small></div></div><button v-if="imageDraft.id" @click="resetImageDraft">取消编辑</button></div>
               <div class="image-form-grid">
                 <div class="image-picker"><button class="primary soft" @click="choosePackageImage">选择图片</button><span>{{ imageDraft.source_path ? imageDraft.source_path.split(/[\\/]/).pop() : '支持 PNG、JPG、JPEG、WebP，最大10MB' }}</span></div>
-                <label>图片名称<input v-model="imageDraft.name" placeholder="例如：双人套餐内容图" /></label>
-                <label>用途说明<input v-model="imageDraft.purpose" placeholder="例如：买家咨询套餐包含什么时发送" /></label>
+                <label>规则名称<input v-model="imageDraft.name" placeholder="例如：双人套餐介绍" /></label>
+                <label>用途说明<input v-model="imageDraft.purpose" placeholder="例如：买家咨询双人套餐时发送" /></label>
                 <label class="wide">触发词（每行一个）<textarea v-model="imageDraft.trigger_words_text" rows="5" placeholder="套餐图&#10;套餐有什么&#10;发一下菜单"></textarea><small>明确命中只发送当前商品这张图；同时命中多张或模糊匹配会转人工审核。</small></label>
-                <label class="wide">随图片发送的文字<input v-model="imageDraft.reply_text" placeholder="例如：可以的，给您发一下这款套餐的内容图。" /></label>
-                <label class="check-line"><input v-model="imageDraft.enabled" type="checkbox" />启用这张图片</label>
+                <label class="wide">触发后发送的文字<input v-model="imageDraft.reply_text" placeholder="例如：可以的，给您发一下这款套餐的内容图。可使用 {$分段符} 分段。" /></label>
+                <label class="check-line"><input v-model="imageDraft.enabled" type="checkbox" />启用这条关键词规则</label>
                 <button class="primary large" @click="saveImageAsset">{{ imageDraft.id ? '保存修改' : '添加到当前商品' }}</button>
               </div>
             </article>
