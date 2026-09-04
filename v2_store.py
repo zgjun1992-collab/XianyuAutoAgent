@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -76,6 +77,12 @@ def normalize_text(value: object) -> str:
         if text.endswith(suffix) and len(text) > len(suffix) + 1:
             text = text[: -len(suffix)]
     return text
+
+
+def normalize_match_text(value: object) -> str:
+    """Normalize user text for entity containment without changing display text."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
+    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
 
 
 MEDIA_MARKER_PATTERN = (
@@ -2336,6 +2343,82 @@ class V2Store(AppStore):
             return f"{product_name}当前售价{price_text}。"
         return "当前商品资料中暂未记录可以确认的实际售价，暂时无法准确报价。"
 
+    def voucher_value_confirmation_reply(self, product: Dict, message: str) -> str:
+        """Answer compact paid-price/face-value confirmations from real SKUs."""
+        match = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"(?:可?抵(?:用|扣)?|代)\s*"
+            r"(\d+(?:\.\d+)?)\s*(?:元|块)?",
+            str(message or ""),
+        )
+        if not match:
+            return ""
+        paid = self._format_number(match.group(1))
+        face = self._format_number(match.group(2))
+        options = self.extract_product_options(product)
+        exact = next((
+            option for option in options
+            if self._format_number(option.get("sale_price")) == paid
+            and self._format_number(option.get("face_value")) == face
+        ), None)
+        if exact:
+            contents = self._purchase_contents_label(exact)
+            return (
+                f"是的，售价{paid}元，购买后发放{contents}，"
+                f"共可抵扣{face}元。"
+            )
+
+        same_face = next((
+            option for option in options
+            if self._format_number(option.get("face_value")) == face
+        ), None)
+        if same_face:
+            actual_price = self._format_number(same_face.get("sale_price"))
+            contents = self._purchase_contents_label(same_face)
+            return (
+                f"不是，{face}元代金券当前售价{actual_price}元，"
+                f"购买后发放{contents}。"
+            )
+
+        same_price = next((
+            option for option in options
+            if self._format_number(option.get("sale_price")) == paid
+        ), None)
+        if same_price:
+            actual_face = self._format_number(same_price.get("face_value"))
+            contents = self._purchase_contents_label(same_price)
+            return (
+                f"当前售价{paid}元对应{actual_face}元代金券，"
+                f"购买后发放{contents}。"
+            )
+        return ""
+
+    def direct_coupon_purchase_reply(self, product: Dict, message: str) -> str:
+        """Confirm a specifically named denomination without expanding the catalog."""
+        text = str(message or "").strip()
+        if not re.search(
+            r"直接(?:拍|买)|(?:可以|能|可不可以|能不能)(?:直接)?(?:拍|买|购买)",
+            text,
+        ):
+            return ""
+        value_match = re.search(
+            r"(?:代|面额)\s*(\d+(?:\.\d+)?)|"
+            r"(\d+(?:\.\d+)?)\s*(?:元)?(?:代金券|券)",
+            text,
+        )
+        if not value_match:
+            return ""
+        requested = self._format_number(next(
+            value for value in value_match.groups() if value is not None
+        ))
+        option = next((
+            item for item in self.extract_product_options(product)
+            if self._format_number(item.get("face_value")) == requested
+        ), None)
+        if not option:
+            return f"当前商品没有{requested}元代金券，请选择商品页面已有的规格。"
+        return f"可以直接拍下，{self.format_product_option(option, self.extract_brand(product))}。"
+
     def named_sku_price_reply(self, product: Dict, message: str) -> str:
         """Resolve named ``xxx多少钱`` queries against SKU names first."""
         match = re.fullmatch(
@@ -3002,11 +3085,104 @@ class V2Store(AppStore):
             )
         return ""
 
+    def coupon_quantity_limit_reply(self, product: Dict, message: str) -> str:
+        """Explain delivered coupon units and the per-use cap without ambiguity."""
+        text = str(message or "")
+        if not re.search(
+            r"一次(?:可以|能)?用(?:几|多少)张|(?:可以|能)用(?:几|多少)张|"
+            r"每次(?:最多)?用(?:几|多少)张|一桌(?:最多)?用(?:几|多少)张",
+            text,
+        ):
+            return ""
+
+        values = list(dict.fromkeys(re.findall(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?(?:代金券|券)", text
+        )))
+        options = self.extract_product_options(product)
+        selected = None
+        for value in values:
+            selected = next((
+                option for option in options
+                if self._format_number(option.get("face_value")) == self._format_number(value)
+            ), None)
+            if selected:
+                break
+        if not selected and len(options) == 1:
+            selected = options[0]
+        if not selected:
+            return ""
+
+        composition = str(selected.get("composition") or "")
+        pairs = [
+            (Decimal(amount), int(count))
+            for amount, count in re.findall(r"(\d+(?:\.\d+)?)元券(\d+)张", composition)
+        ]
+        if not pairs:
+            try:
+                pairs = [(Decimal(str(selected.get("face_value") or "0")), 1)]
+            except InvalidOperation:
+                return ""
+        unit_values = {amount for amount, _ in pairs if amount > 0}
+        if len(unit_values) != 1:
+            return ""
+        unit_value = next(iter(unit_values))
+        knowledge = "\n".join((
+            str(product.get("raw_text") or ""),
+            str(product.get("ai_summary") or ""),
+            self._first_fact(
+                ((product.get("structured") or {}).get("facts") or {}),
+                ("使用规则", "使用条件", "核销规则", "限制", "usage", "conditions"),
+            ),
+        ))
+        amount_cap = re.search(
+            r"(?:一桌|每桌|单桌|每次)[^。；\n]{0,12}?"
+            r"(?:最多)?(?:可)?(?:代|抵(?:用|扣)?|使用)?\s*(\d+(?:\.\d+)?)\s*元",
+            knowledge,
+        )
+        maximum = 0
+        total_cap = Decimal("0")
+        if amount_cap and unit_value > 0:
+            total_cap = Decimal(amount_cap.group(1))
+            maximum = int(total_cap // unit_value)
+        if maximum <= 0:
+            try:
+                maximum = int(Decimal(str(selected.get("max_stack") or "0")))
+            except (InvalidOperation, ValueError):
+                maximum = 0
+        if maximum <= 0:
+            count_cap = re.search(
+                r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
+                knowledge,
+            )
+            maximum = int(count_cap.group(1)) if count_cap else 0
+        if maximum <= 0:
+            return ""
+        if total_cap <= 0:
+            total_cap = unit_value * maximum
+
+        delivered = self._purchase_contents_label(selected)
+        mixed = (
+            "支持不同面额代金券一起使用"
+            if re.search(
+                r"(?:支持|可以|可)[^。；\n]{0,10}不同面额[^。；\n]{0,8}叠加|"
+                r"不同面额[^。；\n]{0,10}(?:支持|可以|可)[^。；\n]{0,8}叠加|混合叠加",
+                knowledge,
+            )
+            else "不同面额的券不能混用"
+        )
+        return (
+            f"该商品购买后发放{delivered}，一桌一次最多使用{maximum}张，"
+            f"共可抵扣{self._format_number(total_cap)}元；{mixed}。"
+        )
+
     def stacking_reply(self, product: Dict, message: str) -> str:
         if not re.search(r"一起用|同时用|叠加|混用|合并用|一次(?:可以|能)?用|可以用几张|能用几张", message):
             return ""
         if not re.search(r"代金券|优惠券|券|面额|\d+(?:\.\d+)?|[一二两三四五六七八九十]\s*张|几张|多少张|叠加|混用", message):
             return ""
+        quantity_reply = self.coupon_quantity_limit_reply(product, message)
+        if quantity_reply:
+            return quantity_reply
         knowledge = str(product.get("raw_text") or "")
         values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*元", message)))
         if not values:
@@ -4243,6 +4419,142 @@ class V2Store(AppStore):
         return value
 
     @classmethod
+    def _best_location_query(cls, rows: List[Dict], query: str) -> str:
+        """Extract the most specific known location from a noisy buyer sentence.
+
+        The caller keeps the original sentence for all non-store intents.  This
+        helper works on a punctuation/whitespace-free copy and only returns
+        administrative units, streets, malls or branches grounded in the store
+        table (plus the built-in province/city list).  Words from another
+        question therefore cannot become part of a fuzzy store key.
+        """
+        query_key = normalize_match_text(query)
+        if not query_key:
+            return ""
+
+        row_candidates = []
+        area_candidates = []
+        street_candidates = []
+
+        def variants(value: object, suffixes=()):
+            display = str(value or "").strip()
+            key = normalize_match_text(display)
+            if not key:
+                return []
+            output = [(key, display)]
+            for suffix in suffixes:
+                suffix_key = normalize_match_text(suffix)
+                if key.endswith(suffix_key) and len(key) > len(suffix_key) + 1:
+                    output.append((key[:-len(suffix_key)], display))
+            return output
+
+        for row in rows:
+            province = str(row.get("province") or "").strip()
+            city = str(row.get("city") or "").strip()
+            district = str(row.get("district") or "").strip()
+            branch = str(row.get("branch") or "").strip()
+
+            branch_hits = []
+            for key, _ in variants(branch, ("旗舰店", "分店", "门店", "店")):
+                fuzzy_key = cls._store_fuzzy_key(key)
+                for alias in dict.fromkeys((key, fuzzy_key)):
+                    if len(alias) >= 2 and alias in query_key:
+                        branch_hits.append(alias)
+            if branch_hits:
+                best_alias = max(branch_hits, key=len)
+                pieces = []
+                for value, suffixes in (
+                    (province, ("省", "市", "自治区", "特别行政区")),
+                    (city, ("市",)),
+                    (district, ("区", "县")),
+                ):
+                    if not value:
+                        continue
+                    keys = [key for key, _ in variants(value, suffixes)]
+                    if any(len(key) >= 2 and key in query_key for key in keys):
+                        current = normalize_match_text("".join(pieces) + branch)
+                        if not any(key and key in current for key in keys):
+                            pieces.append(value)
+                pieces.append(branch)
+                canonical = "".join(pieces)
+                row_candidates.append((len(best_alias), canonical))
+
+            matched_areas = {}
+            for name, weight, value, suffixes in (
+                ("district", 4, district, ("区", "县")),
+                ("city", 3, city, ("市",)),
+                ("province", 2, province, ("省", "市", "自治区", "特别行政区")),
+            ):
+                hits = [
+                    key for key, _ in variants(value, suffixes)
+                    if len(key) >= 2 and key in query_key
+                ]
+                if hits:
+                    matched_areas[name] = (weight, max(len(key) for key in hits), value)
+            if matched_areas:
+                most_specific = max(matched_areas.values(), key=lambda value: value[0])
+                hierarchy = [
+                    matched_areas[name][2]
+                    for name in ("province", "city", "district")
+                    if name in matched_areas
+                ]
+                canonical = "".join(
+                    value for index, value in enumerate(hierarchy)
+                    if normalize_match_text(value) not in normalize_match_text(
+                        "".join(hierarchy[index + 1:])
+                    )
+                )
+                area_candidates.append((
+                    most_specific[0],
+                    sum(value[1] for value in matched_areas.values()),
+                    canonical,
+                ))
+
+            address = str(row.get("address") or "").strip()
+            normalized_address = unicodedata.normalize("NFKC", address)
+            for suffix_match in re.finditer(r"街道|大道|路|街|巷", normalized_address):
+                end = suffix_match.end()
+                start_floor = max(0, end - 24)
+                for start in range(start_floor, max(start_floor, end - 1)):
+                    street = normalized_address[start:end].strip(" ，,。；;：:0123456789")
+                    street_key = normalize_match_text(street)
+                    if len(street_key) >= 2 and street_key in query_key:
+                        street_candidates.append((len(street_key), street))
+
+        if row_candidates:
+            return max(row_candidates, key=lambda value: (value[0], len(value[1])))[1]
+        if street_candidates:
+            return max(street_candidates, key=lambda value: value[0])[1]
+        store_specific_tail = any(
+            marker in query_key for marker in (
+                "门店", "分店", "旗舰店", "购物中心", "商业广场", "商场", "商圈",
+                "万达", "万象城", "万科里", "天街", "银泰", "吾悦", "大悦城",
+                "来福士", "太古里", "印象城", "奥特莱斯", "ifs", "mall", "店",
+            )
+        )
+        if area_candidates and not store_specific_tail:
+            return max(area_candidates, key=lambda value: (value[0], value[1]))[2]
+        if store_specific_tail:
+            # Keep an unmatched mall/branch term intact. Reducing “焦作万达” or
+            # “郑州万象城” to the city alone would turn a precise negative query
+            # into a false city-wide positive result.
+            return ""
+
+        # A city/province that is absent from the current store table still has
+        # to produce a clean negative lookup instead of a fuzzy cross-city hit.
+        known = []
+        for weight, values, suffixes in (
+            (3, KNOWN_CITY_NAMES, ("市",)),
+            (2, KNOWN_PROVINCE_NAMES, ("省", "市", "自治区", "特别行政区")),
+        ):
+            for value in values:
+                for key, _ in variants(value, suffixes):
+                    if len(key) >= 2 and key in query_key:
+                        match = re.search(re.escape(key), query_key)
+                        known.append((weight, len(key), -(match.start() if match else 0), value))
+        return max(known, default=(0, 0, 0, ""))[3]
+
+    @classmethod
     def _extract_store_scope(cls, rows: List[Dict], query_norm: str):
         """Use only a leading province/city as a hard filter.
 
@@ -4311,6 +4623,10 @@ class V2Store(AppStore):
                 str(row["branch"] or row["brand"] or "")
             )
         ]
+        resolved_query = self._best_location_query(rows, query)
+        if resolved_query:
+            query = resolved_query
+            query_norm = normalize_text(query)
         province_scope, city_scope, search_term = self._extract_store_scope(rows, query_norm)
         if province_scope:
             rows = [
@@ -4416,10 +4732,12 @@ class V2Store(AppStore):
             return {
                 "status": "unavailable", "matches": [], "province": province_scope,
                 "city": city_scope, "search_term": search_term,
+                "resolved_query": query,
             }
         return {
             "status": "available", "matches": matches, "province": province_scope,
             "city": city_scope, "search_term": search_term, "sku_key": sku_key, "mode": mode,
+            "resolved_query": query,
         }
 
     @staticmethod
@@ -4560,7 +4878,11 @@ class V2Store(AppStore):
         }
         if any(query_key.startswith(area) for area in known_areas if len(area) >= 2):
             return True
-        if re.search(r"(?:省|市|区|县|镇|街道|商圈|商场|广场|购物中心|门店|分店|店)$", raw_query):
+        if re.search(
+            r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|"
+            r"商圈|商场|广场|购物中心|门店|分店|店)$",
+            raw_query,
+        ):
             return True
         # A bare store name is accepted only for an exact/contained branch-name
         # match. A weak fuzzy result is not enough to invent store intent.
@@ -4803,6 +5125,7 @@ class V2Store(AppStore):
             selected_sku = next((sku for sku in self.list_product_skus(item_id, product)
                                  if sku["sku_key"] == prior_key), None)
         result = self.search_store(item_id, query, sku_key=(selected_sku or {}).get("sku_key", ""))
+        query = str(result.get("resolved_query") or query).strip()
         prefix = f"{self._sku_public_label(selected_sku)}：" if selected_sku else ""
         if result.get("status") == "available":
             return {
@@ -4833,10 +5156,177 @@ class V2Store(AppStore):
             }
         return None
 
+    @classmethod
+    def usage_restrictions_reply(cls, product: Dict) -> str:
+        """Return only grounded usage limits for a targeted restriction question."""
+        facts = (product.get("structured") or {}).get("facts") or {}
+        raw_text = str(product.get("raw_text") or "")
+        options = cls.extract_product_options(product)
+        raw_restrictions = [
+            part.strip(" \t。；;，,")
+            for part in re.split(r"[\r\n。；;]+", raw_text)
+            if re.search(
+                r"仅限|不可|不能|不支持|最多|上限|叠加|混用|"
+                r"营业时间|前台|预约|包间|堂食|打包|找零|超出",
+                part,
+            )
+            and not re.search(r"(?:售价|价格)\s*\d", part)
+        ]
+        candidates = (
+            cls._stack_rule(facts, raw_text, options),
+            cls._use_time_text(product),
+            cls._use_rule_text(product),
+            *raw_restrictions,
+        )
+        parts = []
+        seen = set()
+        for candidate in candidates:
+            for part in re.split(r"[\r\n；;]+", str(candidate or "")):
+                value = part.strip(" \t。；;，,")
+                key = normalize_match_text(value)
+                if value and key not in seen:
+                    seen.add(key)
+                    parts.append(value)
+        if not parts:
+            return "当前商品资料暂未明确说明其他使用限制。"
+        return "；".join(parts) + "。"
+
+    def resolve_multi_question(
+        self, item_id: str, product: Dict, message: str,
+        actual_paid_amount: object = None, store_context: Optional[Dict] = None,
+        order_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Resolve the small set of independent questions buyers commonly combine."""
+        text = str(message or "").strip()
+        tasks = []
+
+        def add_task(kind: str, label: str, match, payload=None, position=None):
+            if match and not any(task[1] == kind for task in tasks):
+                tasks.append((match.start() if position is None else position, kind, label, payload))
+
+        usage_match = re.search(r"怎么用|如何使用|怎么核销|如何核销|到店怎么操作", text)
+        add_task("usage", "使用方式", usage_match)
+
+        value_match = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"(?:可?抵(?:用|扣)?|代)\s*(\d+(?:\.\d+)?)\s*(?:元|块)?",
+            text,
+        )
+        add_task("voucher_value", "售价与面额", value_match)
+
+        stacking_match = re.search(
+            r"一次(?:可以|能)?用(?:几|多少)张|(?:可以|能)用(?:几|多少)张|"
+            r"每次(?:最多)?用(?:几|多少)张|一桌(?:最多)?用(?:几|多少)张",
+            text,
+        )
+        add_task("stacking", "使用张数", stacking_match)
+
+        restriction_match = re.search(
+            r"有什么限制(?:条件)?|有哪些限制(?:条件)?|使用限制|限制条件|使用条件(?:是什么|有哪些|呢|吗)?",
+            text,
+        )
+        add_task("restrictions", "使用限制", restriction_match)
+
+        purchase_match = re.search(
+            r"直接(?:拍|买)|(?:可以|能|可不可以|能不能)(?:直接)?(?:拍|买|购买)",
+            text,
+        )
+        purchase_reply = self.direct_coupon_purchase_reply(product, text) if purchase_match else ""
+        if purchase_reply:
+            add_task("purchase", "购买", purchase_match, purchase_reply)
+
+        store_query = extract_store_query(
+            text, product=product, product_brand=self.extract_brand(product)
+        )
+        store_probe = None
+        resolved_store_query = store_query
+        store_trigger = re.search(
+            r"(?:可以|能|可)(?:在这)?(?:使用|用)|是否可用|适用|"
+            r"门店|店铺|商场|商圈|购物中心",
+            text,
+        )
+        if store_trigger and is_meaningful_store_query(store_query):
+            store_probe = self.search_store(item_id, store_query)
+            resolved_store_query = str(
+                (store_probe or {}).get("resolved_query") or store_query
+            ).strip()
+            if self.is_explicit_store_query(text, resolved_store_query, store_probe):
+                position = min(
+                    (text.find(value) for value in (
+                        resolved_store_query,
+                        self._area_key(resolved_store_query),
+                    ) if value and text.find(value) >= 0),
+                    default=store_trigger.start(),
+                )
+                add_task(
+                    "store", "适用门店", store_trigger,
+                    resolved_store_query, position=position,
+                )
+
+        if len(tasks) < 2:
+            return None
+
+        replies = []
+        child_results = []
+        for _, kind, label, payload in sorted(tasks, key=lambda value: value[0]):
+            child = None
+            if kind == "usage":
+                reply = self.coupon_usage_instructions(product)
+            elif kind == "voucher_value":
+                reply = self.voucher_value_confirmation_reply(product, text) or (
+                    "当前商品资料中暂未找到能确认的售价与面额对应关系。"
+                )
+            elif kind == "stacking":
+                reply = self.stacking_reply(product, text)
+            elif kind == "restrictions":
+                reply = self.usage_restrictions_reply(product)
+            elif kind == "purchase":
+                reply = str(payload or "")
+            else:
+                child = self.resolve_deterministic(
+                    item_id, f"{payload}可以用吗", actual_paid_amount,
+                    store_context, order_context, _allow_multi=False,
+                )
+                reply = str((child or {}).get("reply") or "").strip()
+                if not reply:
+                    reply = f"暂时无法确认{payload}是否属于当前商品的适用门店。"
+            if child:
+                child_results.append(child)
+            replies.append((label, reply.rstrip(" \t\r\n")))
+
+        result = {
+            "reply": "\n".join(
+                f"{index}. {label}：{reply}"
+                for index, (label, reply) in enumerate(replies, start=1)
+            ),
+            "source": "多个独立问题分别使用当前商品与门店资料回答",
+            "decision": (
+                "review" if any(
+                    child.get("decision") in {"review", "clarify"}
+                    for child in child_results
+                ) else "allow"
+            ),
+            "kind": "multi_intent",
+            "resolved_intents": [
+                kind for _, kind, _, _ in sorted(tasks, key=lambda value: value[0])
+            ],
+        }
+        store_child = next((
+            child for child in child_results if "store_matches" in child
+        ), None)
+        if store_child:
+            for key in (
+                "store_matches", "store_query", "store_status", "query_context_update",
+            ):
+                if key in store_child:
+                    result[key] = store_child[key]
+        return result
+
     def resolve_deterministic(
         self, item_id: str, message: str, actual_paid_amount: object = None,
         store_context: Optional[Dict] = None,
         order_context: Optional[Dict] = None,
+        _allow_multi: bool = True,
     ) -> Optional[Dict]:
         """Resolve facts that must never be invented by the language model."""
         message = str(message or "").strip()
@@ -5027,6 +5517,14 @@ class V2Store(AppStore):
                 "kind": "purchase_order_other",
             }
 
+        if _allow_multi and not aftersale_candidate:
+            multi = self.resolve_multi_question(
+                item_id, product, message, actual_paid_amount,
+                store_context, order_context,
+            )
+            if multi:
+                return multi
+
         # “202怎么拍/298怎么买”表示按实际消费额推荐，只使用真实SKU。
         amount_plan = re.fullmatch(
             r"\s*(?:(?:吃(?:了)?|消费(?:了)?|用了|一共|总共|结账|买单|账单)\s*)?"
@@ -5085,6 +5583,15 @@ class V2Store(AppStore):
                 "kind": "stock",
             }
 
+        direct_purchase = self.direct_coupon_purchase_reply(product, message)
+        if direct_purchase:
+            return {
+                "reply": direct_purchase,
+                "source": "当前商品真实SKU与在售状态",
+                "decision": "allow",
+                "kind": "sku_availability",
+            }
+
         if any(word in message for word in (
             "多少代多少", "有哪些代金券", "有什么代金券", "有哪些面额",
             "有什么面额", "卖哪些券", "有哪些券型", "有什么券型",
@@ -5094,6 +5601,15 @@ class V2Store(AppStore):
                 "source": "当前商品真实SKU列表",
                 "decision": "allow",
                 "kind": "coupon_catalog",
+            }
+
+        value_confirmation = self.voucher_value_confirmation_reply(product, message)
+        if value_confirmation:
+            return {
+                "reply": value_confirmation,
+                "source": "当前商品真实售价、面额与发券组成",
+                "decision": "allow",
+                "kind": "voucher_value",
             }
 
         combination = self.benefit_combination_reply(product, message)
@@ -5693,6 +6209,7 @@ class V2Store(AppStore):
         store_result = self.search_store(item_id, query, sku_key=selected_key) if is_meaningful_store_query(query) else {
             "status": "missing_query", "matches": [],
         }
+        query = str(store_result.get("resolved_query") or query).strip()
         if self.is_explicit_store_query(message, query, store_result):
             if not is_meaningful_store_query(query):
                 return {

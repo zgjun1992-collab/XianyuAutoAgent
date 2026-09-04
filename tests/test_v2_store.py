@@ -1930,6 +1930,109 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("324元", second["reply"])
         self.assertNotIn("全天双人", second["reply"])
 
+    def test_multi_question_separates_city_and_coupon_purchase(self):
+        self.store.save_v2_product(
+            "10001", "NEED韩国料理代金券",
+            "100元代金券：售价66.6元\n"
+            "300元代金券：售价199.8元，发100元券3张",
+        )
+        self.store.import_store_text(
+            "【山东省】\n【济南】济南万象城店", "济南门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "你好 济南可以用是吧 可以直接拍代300的那个",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "purchase"], result["resolved_intents"])
+        self.assertEqual("济南", result["store_query"])
+        self.assertIn("济南万象城店", result["reply"])
+        self.assertIn("300元代金券", result["reply"])
+        self.assertIn("售价199.8元", result["reply"])
+        self.assertNotIn("济南是吧", result["reply"])
+        self.assertNotIn("无法准确回答", result["reply"])
+
+    def test_location_matching_uses_most_specific_normalized_unit(self):
+        self.store.import_store_list(
+            self.create_multi_region_store_sheet(), "多地区门店", ["10001"],
+        )
+        district = self.store.resolve_deterministic(
+            "10001", "老板，深圳 南山区可以用吗？",
+        )
+        self.assertEqual("stores", district["kind"])
+        self.assertEqual("深圳南山区", district["store_query"])
+        self.assertIn("西丽益田假日里店", district["reply"])
+        self.assertNotIn("龙岗万科里店", district["reply"])
+
+        street = self.store.resolve_deterministic(
+            "10001", "留仙 大道，可以用吗？",
+        )
+        self.assertEqual("stores", street["kind"])
+        self.assertEqual("留仙大道", street["store_query"])
+        self.assertIn("西丽益田假日里店", street["reply"])
+
+    def test_multi_question_answers_usage_store_value_and_limits_once(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡代金券",
+            "200元代金券：售价108元，发100元券2张\n"
+            "一桌最多代200元；仅限前台验电子二维码",
+            coupon_type="meituan",
+        )
+        self.store.save_ai_summary("10001", "规则摘要", {
+            "facts": {
+                "使用规则": "仅支持同面额代金券叠加；一桌最多代200元；仅限前台验电子二维码",
+            },
+        })
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳壹方城店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "怎么用，深圳壹方城店可以用吗，108抵用200，有什么限制条件吗",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(
+            ["usage", "store", "voucher_value", "restrictions"],
+            result["resolved_intents"],
+        )
+        self.assertEqual("深圳壹方城店", result["store_query"])
+        self.assertIn("1. 使用方式", result["reply"])
+        self.assertIn("2. 适用门店", result["reply"])
+        self.assertIn("3. 售价与面额", result["reply"])
+        self.assertIn("4. 使用限制", result["reply"])
+        self.assertIn("查询到可用门店", result["reply"])
+        self.assertIn("深圳壹方城店", result["reply"])
+        self.assertIn("是的，售价108元", result["reply"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("一桌最多代200元", result["reply"])
+        self.assertNotIn("无法准确回答", result["reply"])
+
+    def test_paid_price_face_value_confirmation_is_direct_and_grounded(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡代金券",
+            "200元代金券：售价108元，发100元券2张",
+        )
+        result = self.store.resolve_deterministic("10001", "108抵200吗")
+        self.assertEqual("voucher_value", result["kind"])
+        self.assertEqual(
+            "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+            result["reply"],
+        )
+        self.assertNotIn("无法", result["reply"])
+
+    def test_composed_coupon_quantity_names_unit_count_and_total_cap(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡代金券",
+            "200元代金券：售价108元，发100元券2张\n"
+            "一桌最多代200元；不同面额不能混用",
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "200代金券一次可以用几张",
+        )
+        self.assertEqual("stacking", result["kind"])
+        self.assertIn("发放2张100元代金券", result["reply"])
+        self.assertIn("一次最多使用2张", result["reply"])
+        self.assertIn("共可抵扣200元", result["reply"])
+        self.assertNotIn("200元代金券可以叠加", result["reply"])
+
 
 if __name__ == "__main__":
     unittest.main()
