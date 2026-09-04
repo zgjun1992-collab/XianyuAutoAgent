@@ -144,6 +144,22 @@ class AppStoreTests(unittest.TestCase):
         self.assertEqual("sent", row["status"])
         self.assertEqual("您好", row["final_reply"])
 
+    def test_audit_redacts_order_and_voucher_credentials(self):
+        audit_id = self.store.create_audit(
+            chat_id="chat", user_id="buyer", user_name="买家", item_id="1001",
+            user_message=(
+                "3316384347100027780\n"
+                "卡号：示例-044175443178-100元代金券\n"
+                "密码：https://kms.example.invalid/xgj/private-token"
+            ),
+            draft_reply="", action="review", reasons=[], status="pending",
+        )
+        message = self.store.get_audit(audit_id)["user_message"]
+        self.assertNotIn("3316384347100027780", message)
+        self.assertNotIn("private-token", message)
+        self.assertNotIn("044175443178", message)
+        self.assertIn("已隐藏", message)
+
     def test_conversation_reply_count_resets_and_is_scoped(self):
         state = self.store.touch_conversation("seller:chat:item1", "seller", "chat", "buyer", "item1", 24)
         self.assertEqual(0, state["ai_reply_count"])
@@ -162,6 +178,15 @@ class AppStoreTests(unittest.TestCase):
         self.assertEqual(0, reset["ai_reply_count"])
         self.assertEqual(0, reset["first_reply_sent"])
         self.assertEqual("active", reset["state"])
+
+    def test_manual_conversation_state_is_persistent_and_resumable(self):
+        scope_id = "seller:chat:item1"
+        self.store.touch_conversation(scope_id, "seller", "chat", "buyer", "item1", 24)
+        self.store.pause_conversation(scope_id, "manual")
+        reopened = AppStore(self.store.db_path)
+        self.assertEqual("manual", reopened.get_conversation_state(scope_id))
+        reopened.resume_conversation(scope_id)
+        self.assertEqual("active", reopened.get_conversation_state(scope_id))
 
     def test_structured_query_context_is_persisted_and_cleared_on_reset(self):
         scope_id = "seller:chat:item1"

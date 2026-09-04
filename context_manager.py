@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from loguru import logger
 
+from privacy_guard import redact_sensitive_text
+
 
 class ChatContextManager:
     """
@@ -179,9 +181,10 @@ class ChatContextManager:
         
         try:
             # 插入新消息，使用chat_id作为额外标识
+            safe_content = redact_sensitive_text(content) if role == "user" else content
             cursor.execute(
                 "INSERT INTO messages (user_id, item_id, role, content, timestamp, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, item_id, role, content, datetime.now().isoformat(), chat_id)
+                (user_id, item_id, role, safe_content, datetime.now().isoformat(), chat_id)
             )
             
             # 检查是否需要清理旧消息（基于chat_id）
