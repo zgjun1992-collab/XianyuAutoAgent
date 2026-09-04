@@ -1872,7 +1872,8 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "两大一小多少钱")
         self.assertIn("176元", result["reply"])
         self.assertIn("没有售卖儿童票", result["reply"])
-        self.assertIn("到店咨询", result["reply"])
+        self.assertIn("暂时无法确认", result["reply"])
+        self.assertNotIn("到店咨询", result["reply"])
         self.assertNotIn("三人", result["reply"])
 
     def test_student_senior_and_female_tickets_are_not_conflated(self):
@@ -2032,6 +2033,119 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("一次最多使用2张", result["reply"])
         self.assertIn("共可抵扣200元", result["reply"])
         self.assertNotIn("200元代金券可以叠加", result["reply"])
+
+    def test_location_landmark_matches_branch_with_unspoken_district_prefix(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】宝安壹方城店\n【广州】天环广场店",
+            "广东门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "200的券深圳壹方城可以用不",
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("深圳壹方城", result["store_query"])
+        self.assertIn("宝安壹方城店", result["reply"])
+        self.assertNotIn("广州", result["reply"])
+
+    def test_store_and_unavailable_date_are_answered_as_two_intents(self):
+        self.store.save_v2_product(
+            "10001", "NEED韩国料理代金券",
+            "100元代金券：售价66.6元。除2026年9月25日至9月27日外营业时间可用。",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【深圳】宝安壹方城店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "深圳壹方城9月26日可以用吗",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "date"], result["resolved_intents"])
+        self.assertIn("宝安壹方城店", result["reply"])
+        self.assertIn("9月26日", result["reply"])
+        self.assertIn("不能使用", result["reply"])
+
+    def test_store_and_price_are_answered_separately(self):
+        self.store.save_v2_product(
+            "10001", "鱼酷烤鱼2-3人餐", "鱼酷活鱼烤鱼套餐：售价118元",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【广州】天环广场店", "广州门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "天环广场店多少钱")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "price"], result["resolved_intents"])
+        self.assertIn("天环广场店", result["reply"])
+        self.assertIn("118元", result["reply"])
+
+    def test_wrong_store_and_delivery_mismatch_are_aftersales_not_store_queries(self):
+        wrong_store = self.store.resolve_deterministic("10001", "我看错门店了")
+        self.assertEqual("aftersale_clarify", wrong_store["kind"])
+        self.assertIn("是否已经付款", wrong_store["reply"])
+        mismatch = self.store.resolve_deterministic(
+            "10001", "刚刚店里把券退了，现在发了三张500的，发错了吧",
+        )
+        self.assertEqual("delivery_mismatch_review", mismatch["kind"])
+        self.assertEqual("review", mismatch["decision"])
+        self.assertIn("发券", mismatch["reply"])
+        self.assertNotIn("可用门店", mismatch["reply"])
+
+    def test_minimal_order_followups_never_claim_backend_verification(self):
+        paid = self.store.resolve_deterministic("10001", "已付款")
+        self.assertEqual("aftersale_clarify", paid["kind"])
+        self.assertIn("您反馈", paid["reply"])
+        self.assertNotIn("已查询", paid["reply"])
+        applied = self.store.resolve_deterministic("10001", "已申请")
+        self.assertEqual("aftersale_clarify", applied["kind"])
+        self.assertIn("无法直接核验", applied["reply"])
+        manual = self.store.resolve_deterministic("10001", "人工")
+        self.assertEqual("manual_handoff", manual["kind"])
+
+    def test_atomic_coupon_facts_ground_composed_paid_and_face_value(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价54元，最多叠加2张",
+        )
+        result = self.store.resolve_deterministic("10001", "108抵200吗")
+        self.assertEqual("voucher_value", result["kind"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("共可抵扣200元", result["reply"])
+
+    def test_discount_and_catalog_phrasings_use_real_options(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券", "100元代金券：售价54元\n200元代金券：售价108元",
+        )
+        discount = self.store.resolve_deterministic("10001", "多少折")
+        self.assertEqual("discount", discount["kind"])
+        self.assertIn("约5.4折", discount["reply"])
+        catalog = self.store.resolve_deterministic("10001", "代金券有哪些")
+        self.assertEqual("coupon_catalog", catalog["kind"])
+        self.assertIn("100元代金券", catalog["reply"])
+        self.assertIn("200元代金券", catalog["reply"])
+
+    def test_new_audience_query_drops_old_purchase_quantity(self):
+        self.store.save_v2_product(
+            "10001", "晚市自助",
+            "晚市单人自助：售价80元\n晚市双人自助：售价162元",
+        )
+        first = self.store.resolve_deterministic("10001", "晚上两张多少钱")
+        context = first["query_context_update"]
+        second = self.store.resolve_deterministic(
+            "10001", "晚市双人多少钱", store_context=context,
+        )
+        self.assertIn("162元", second["reply"])
+        self.assertNotIn("324元", second["reply"])
+
+    def test_unheaded_flavor_lines_are_extracted_without_price_noise(self):
+        self.store.save_v2_product(
+            "10001", "鱼酷烤鱼套餐",
+            "贵州凯里酸汤牛肉烤鱼（不辣）\n经典蒜香烤鱼（不辣）\n"
+            "青花椒烤鱼（微辣）\n套餐售价118元",
+        )
+        result = self.store.resolve_deterministic("10001", "有什么口味")
+        self.assertEqual("product_attribute", result["kind"])
+        self.assertIn("贵州凯里酸汤牛肉烤鱼（不辣）", result["reply"])
+        self.assertIn("青花椒烤鱼（微辣）", result["reply"])
+        self.assertNotIn("118", result["reply"])
 
 
 if __name__ == "__main__":
