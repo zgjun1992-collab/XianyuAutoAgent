@@ -159,6 +159,13 @@ class PolicyEngine:
             r"[^。！？]{0,8}(?:可以|能|可)(?:使用|用)",
             user_message,
         ))
+        # “200可以用吗”中的“可以”描述的是券或门店可用性，不是出价。
+        # 议价仍需由“80元可以吗/便宜点”等明确价格措辞触发。
+        usage_availability_question = bool(re.search(
+            r"(?:可以|能|可否|是否|可不可以|能不能)(?:在这|在该店|直接)?"
+            r"(?:使用|用)|(?:使用|用)(?:吗|么|嘛|不|不了)",
+            user_message,
+        ))
         # “优惠券/优惠规则”不是议价。先去掉这类商品名词，再判断砍价意图。
         bargain_source = re.sub(r"优惠券|代金券|优惠规则|优惠活动|优惠叠加", "", user_message)
         bargain_patterns = (
@@ -167,7 +174,7 @@ class PolicyEngine:
             r"\d+(?:\.\d+)?元?(?:可以|行吗|能卖|出吗)",
             r"能不能[^。！？]{0,8}(?:少|便宜|优惠)",
         )
-        if not stacking_question and not date_usage_question and any(
+        if not stacking_question and not date_usage_question and not usage_availability_question and any(
             re.search(pattern, bargain_source) for pattern in bargain_patterns
         ):
             return PolicyDecision(

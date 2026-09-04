@@ -2112,6 +2112,46 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("2张100元代金券", result["reply"])
         self.assertIn("共可抵扣200元", result["reply"])
 
+    def test_compact_purchase_value_confirmation_uses_atomic_coupon_facts(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价54元，最多叠加2张",
+        )
+        result = self.store.resolve_deterministic("10001", "108拍下直接代200吗")
+        self.assertEqual("voucher_value", result["kind"])
+        self.assertEqual(
+            "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+            result["reply"],
+        )
+
+    def test_colloquial_consumption_amount_builds_grounded_purchase_plan(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价54元，最多叠加2张",
+        )
+        result = self.store.resolve_deterministic("10001", "消费235咋拍")
+        self.assertEqual("consumption_plan", result["kind"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("共支付108元", result["reply"])
+        self.assertIn("剩余35元到店自行支付", result["reply"])
+
+    def test_bare_amount_and_store_usage_are_resolved_as_two_questions(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价54元，最多叠加2张",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【深圳】宝安壹方城店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "深圳壹方城200可以用吗",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "sku"], result["resolved_intents"])
+        self.assertIn("宝安壹方城店", result["reply"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertNotIn("暂不支持议价", result["reply"])
+
     def test_discount_and_catalog_phrasings_use_real_options(self):
         self.store.save_v2_product(
             "10001", "测试代金券", "100元代金券：售价54元\n200元代金券：售价108元",

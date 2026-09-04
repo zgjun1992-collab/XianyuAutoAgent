@@ -2394,6 +2394,7 @@ class V2Store(AppStore):
         """Answer compact paid-price/face-value confirmations from real SKUs."""
         match = re.search(
             r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"(?:(?:拍下|下单|购买)(?:后)?(?:就|可|可以)?\s*)?(?:直接\s*)?"
             r"(?:可?抵(?:用|扣)?|代)\s*"
             r"(\d+(?:\.\d+)?)\s*(?:元|块)?",
             str(message or ""),
@@ -5397,6 +5398,7 @@ class V2Store(AppStore):
 
         value_match = re.search(
             r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"(?:(?:拍下|下单|购买)(?:后)?(?:就|可|可以)?\s*)?(?:直接\s*)?"
             r"(?:可?抵(?:用|扣)?|代)\s*(\d+(?:\.\d+)?)\s*(?:元|块)?",
             text,
         )
@@ -5481,9 +5483,26 @@ class V2Store(AppStore):
                 r"(?<!\d)\d+(?:\.\d+)?\s*元?\s*(?:的)?\s*(?:代金券|券)",
                 text,
             )
+            # Buyers often omit “元/代金券” in compact store questions such as
+            # “深圳壹方城200可以用吗”.  Treat the standalone amount as a voucher
+            # target only inside an already-confirmed store-usage question.
+            if not sku_question_match and not re.search(
+                r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?",
+                text,
+            ):
+                sku_question_match = re.search(
+                    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元)?"
+                    r"(?!\s*(?:年|月|日|号|点|个|人|位|张|桌|份))"
+                    r"(?=[^。！？]{0,12}(?:可以|能|可)(?:使用|用))",
+                    text,
+                )
             if sku_question_match and not value_match and not purchase_reply:
+                requested_value = self._format_number(
+                    sku_question_match.group(1) if sku_question_match.lastindex
+                    else next(iter(re.findall(r"\d+(?:\.\d+)?", sku_question_match.group(0))), "")
+                )
                 sku_reply = self.sku_availability_reply(
-                    product, f"{sku_question_match.group(0)}有吗",
+                    product, f"{requested_value}元代金券有吗",
                 )
                 if sku_reply:
                     add_task("sku", "商品规格", sku_question_match, sku_reply)
@@ -5890,7 +5909,7 @@ class V2Store(AppStore):
         amount_plan = re.fullmatch(
             r"\s*(?:(?:吃(?:了)?|消费(?:了)?|用了|一共|总共|结账|买单|账单)\s*)?"
             r"(\d+(?:\.\d+)?)\s*(?:元|块)?[\s，,。；;：:~-]*"
-            r"(?:怎么拍|如何拍|怎么买|如何买|怎么凑|如何凑|怎么办)\s*[？?]?\s*",
+            r"(?:怎么拍|如何拍|咋拍|怎么买|如何买|咋买|怎么凑|如何凑|咋凑|怎么办|咋弄)\s*[？?]?\s*",
             message,
         )
         if amount_plan:

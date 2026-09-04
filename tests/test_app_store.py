@@ -60,6 +60,15 @@ class AppStoreTests(unittest.TestCase):
         result = PolicyEngine().evaluate("200和300可以一起用吗", "200和300不能混用。")
         self.assertEqual("allow", result.action)
 
+    def test_store_amount_usage_question_is_not_bargaining(self):
+        result = PolicyEngine().evaluate(
+            "深圳壹方城200可以用吗", "深圳宝安壹方城店可用。",
+        )
+        self.assertEqual("allow", result.action)
+
+        bargain = PolicyEngine().evaluate("80元可以吗", "不支持议价。")
+        self.assertEqual("replace", bargain.action)
+
     def test_dangerous_bargain_draft_is_blocked(self):
         result = PolicyEngine().evaluate("你好", "全新可小刀。")
         self.assertEqual("review", result.action)
