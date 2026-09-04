@@ -178,13 +178,28 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.should_send_first_reply(message, {"kind": "stores"}))
 
-    def test_enabled_first_reply_attaches_to_first_normal_question(self):
-        for kind in ("coupon_catalog", "stores", "day_use", "price", "greeting"):
+    def test_enabled_first_reply_attaches_only_to_a_pure_greeting(self):
+        self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", "greeting"))
+        for kind in ("coupon_catalog", "stores", "day_use", "price"):
             with self.subTest(kind=kind):
-                self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
+                self.assertFalse(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
         self.assertFalse(XianyuLive.should_attach_first_reply(False, "商品首次回复", "stores"))
         self.assertFalse(XianyuLive.should_attach_first_reply(True, "", "stores"))
         self.assertFalse(XianyuLive.should_attach_first_reply(True, "商品首次回复", "refund_quality"))
+
+    def test_model_operational_guard_rejects_unverified_actions_and_status(self):
+        self.assertTrue(XianyuLive.model_reply_operational_issue(
+            "已为您转接人工，请稍候。", {}
+        ))
+        self.assertTrue(XianyuLive.model_reply_operational_issue(
+            "订单尚未付款，请先付款。", {}
+        ))
+        self.assertEqual("", XianyuLive.model_reply_operational_issue(
+            "订单尚未付款，请先付款。", {"status": "等待买家付款"}
+        ))
+        fallback = XianyuLive.operational_fallback_reply("我已经付款了")
+        self.assertIn("您反馈", fallback)
+        self.assertIn("无法直接核验", fallback)
 
     def test_manual_first_reply_is_not_replaced_by_commitment_filter(self):
         live = self.make_live()

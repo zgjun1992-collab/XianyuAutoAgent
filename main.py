@@ -16,6 +16,7 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from app_store import AppStore, PolicyEngine, DEFAULT_POLICIES, find_unauthorized_promises
+from privacy_guard import redact_sensitive_text
 
 
 class XianyuLive:
@@ -151,6 +152,38 @@ class XianyuLive:
         if re.search(r"门店|店铺|地址|哪里|哪家|商场|广场", text):
             return "请发送城市和具体店名，我会按当前商品的可用门店资料为您查询。"
         return "当前商品资料暂时无法准确回答这个问题，请补充具体想查询的商品、门店或使用条件。"
+
+    @staticmethod
+    def model_reply_operational_issue(reply, order_context=None):
+        """Reject model claims about actions or order state the process did not verify."""
+        value = str(reply or "")
+        order_status = str((order_context or {}).get("status") or "")
+        unverified_actions = (
+            r"订单号(?:已经|已)?(?:查询|查到|核实)",
+            r"(?:已经|已)(?:收到|查到|核实)(?:您的)?(?:退款|售后)申请",
+            r"(?:我|我们|这边)(?:已经|已)?(?:帮您|帮你)?(?:处理|提交|登记)(?:退款|售后)",
+            r"(?:已经|已)(?:为您|为你)?(?:转接|转交)(?:给)?人工",
+        )
+        for pattern in unverified_actions:
+            if re.search(pattern, value):
+                return "模型草稿声称执行了系统未完成的订单或人工操作"
+        if re.search(r"订单(?:尚未|还未|没有)付款|订单未付款", value):
+            if not any(word in order_status for word in ("待付款", "等待买家付款")):
+                return "模型草稿声称了未核验的未付款状态"
+        if re.search(r"订单(?:已经|已)付款|确认(?:已经|已)付款", value):
+            if not any(word in order_status for word in ("已付款", "待发货", "等待卖家发货", "已发货")):
+                return "模型草稿声称了未核验的已付款状态"
+        return ""
+
+    @staticmethod
+    def operational_fallback_reply(user_message):
+        """Acknowledge buyer-provided state without pretending it was queried."""
+        text = re.sub(r"\s+", "", str(user_message or ""))
+        if re.search(r"(?:已经|已)付款", text):
+            return "已了解您反馈订单已经付款。当前无法直接核验订单状态；请说明是要咨询发券、核销还是退款。"
+        if re.search(r"(?:已经|已)(?:申请|提交)", text):
+            return "已了解您反馈已经提交申请。当前无法直接核验申请状态；如需人工处理，请回复“人工”。"
+        return "当前无法直接核验订单或售后状态；请说明具体问题，如需人工处理请回复“人工”。"
 
     @staticmethod
     def media_marker(text):
@@ -630,6 +663,10 @@ class XianyuLive:
 
     def is_manual_mode(self, chat_id):
         """检查特定会话是否处于人工接管模式"""
+        state_getter = getattr(self.app_store, "get_conversation_state", None)
+        if state_getter and state_getter(chat_id) == "manual":
+            self.manual_mode_conversations.add(chat_id)
+            return True
         if chat_id not in self.manual_mode_conversations:
             return False
         
@@ -647,6 +684,9 @@ class XianyuLive:
         """进入人工接管模式"""
         self.manual_mode_conversations.add(chat_id)
         self.manual_mode_timestamps[chat_id] = time.time()
+        pause = getattr(self.app_store, "pause_conversation", None)
+        if pause:
+            pause(chat_id, "manual")
 
     @staticmethod
     def requires_persistent_manual_takeover(deterministic, user_message=""):
@@ -655,6 +695,7 @@ class XianyuLive:
         if kind in {
             "purchase_order_price", "refund_quality", "refund_dispute",
             "expiry_quality", "code_operation_review", "code_link_escalation",
+            "sensitive_aftersale", "refund_status_review", "delivery_mismatch_review",
         }:
             return True
         return bool(re.search(
@@ -712,13 +753,9 @@ class XianyuLive:
 
     @staticmethod
     def should_attach_first_reply(enabled, first_reply, deterministic_kind=""):
-        """Honor the product-card switch on the first normal buyer message."""
-        excluded = {
-            "media", "offline", "refund_quality", "refund_process",
-            "refund_dispute", "expiry_quality", "coupon_type",
-        }
+        """Send the product welcome only for a pure greeting, never before an answer."""
         return bool(enabled and str(first_reply or "").strip()
-                    and str(deterministic_kind or "") not in excluded)
+                    and str(deterministic_kind or "") == "greeting")
 
     def prepare_product_first_reply(self, product):
         """Preserve an explicitly saved welcome; sanitize automatic drafts."""
@@ -736,6 +773,9 @@ class XianyuLive:
         if chat_id in self.manual_mode_timestamps:
             del self.manual_mode_timestamps[chat_id]
         self._review_notified_scopes.discard(chat_id)
+        resume = getattr(self.app_store, "resume_conversation", None)
+        if resume:
+            resume(chat_id)
 
     def toggle_manual_mode(self, chat_id):
         """切换人工接管模式"""
@@ -1160,7 +1200,10 @@ class XianyuLive:
                 logger.info(f"代买单商品已关闭首次回复，纯问候保持静默 (会话: {chat_id})")
                 return
             
-            logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
+            logger.info(
+                f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, "
+                f"会话: {chat_id}, 消息: {redact_sensitive_text(send_message)}"
+            )
             
             
             prompt_setter = getattr(self.bot, "set_global_system_prompt", None)
@@ -1186,51 +1229,15 @@ class XianyuLive:
                 )
                 return
 
-            # 人工接管期间不能让买家消息石沉大海。每条有效买家消息都即时
-            # 回执“正在人工审核”，但不让AI擅自处理风险事项。
+            # 人工接管是持久且静默的：记录买家后续消息供人工查看，禁止
+            # 自动问候、重复回执或任何模型回复打断人工处理。
             if self.is_manual_mode(scope_id):
-                # A greeting is not a risky aftersales action.  Keep the
-                # takeover state for the real case, but never answer “你好”
-                # with a 72-hour manual-review notice.
-                if self.should_send_first_reply(send_message):
-                    first_reply = str((current_product or {}).get("first_reply_text") or "").strip()
-                    first_reply_enabled = bool(
-                        (current_product or {}).get("first_reply_enabled", True)
-                    )
-                    greeting_reply = (
-                        self.prepare_product_first_reply(current_product)
-                        if first_reply_enabled and first_reply
-                        else "您好，请问想咨询当前商品的使用规则、适用门店还是发货问题？"
-                    )
-                    if not (first_reply_enabled and first_reply):
-                        greeting_reply = self.sanitize_buyer_reply(greeting_reply)
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, greeting_reply,
-                        sanitize=not bool(first_reply_enabled and first_reply),
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, send_user_id, item_id, "user", send_message
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", greeting_reply
-                    )
-                    if first_reply_enabled and first_reply:
-                        self.app_store.mark_first_reply_sent(scope_id)
-                    logger.info(f"人工接管期间纯问候已使用正常问候回复 (会话: {chat_id})")
-                    return
-                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，发送人工审核回执")
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
-                notice = str(policies.get("manual_review_notice") or "").strip()
-                if not notice:
-                    notice = "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。"
-                await self.send_msg(websocket, chat_id, send_user_id, notice)
-                self.context_manager.add_message_by_chat(
-                    scope_id, self.myid, item_id, "assistant", notice
-                )
                 self.emit_event(
-                    "manual_review_notice", chat_id=chat_id, item_id=item_id,
-                    scope_id=scope_id, message="人工接管期间已向买家发送审核回执",
+                    "manual_message_queued", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message="人工接管期间收到买家新消息",
                 )
+                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，买家消息已静默留给人工")
                 return
             # 检查是否为带中括号的系统消息
             if self.is_bracket_system_message(send_message):
@@ -1368,6 +1375,19 @@ class XianyuLive:
                         "kind": "model_grounding_guard",
                     }
                     logger.warning(grounding_issue)
+                else:
+                    operational_issue = self.model_reply_operational_issue(
+                        bot_reply, self._order_routes.get(scope_id)
+                    )
+                    if operational_issue:
+                        bot_reply = self.operational_fallback_reply(send_message)
+                        deterministic = {
+                            "reply": bot_reply,
+                            "source": operational_issue,
+                            "decision": "allow",
+                            "kind": "model_operational_guard",
+                        }
+                        logger.warning(operational_issue)
 
             # 每个“买家 + 当前商品”会话窗口只发送一次商品首次回复，
             # 且首次回复与问题答案始终分两条发送，方便买家阅读。
@@ -1379,11 +1399,9 @@ class XianyuLive:
                 first_reply = str((product or {}).get("first_reply_text") or "").strip()
                 enabled = bool((product or {}).get("first_reply_enabled", True))
                 deterministic_kind = (deterministic or {}).get("kind")
-                # The product-card switch controls the welcome message: when
-                # enabled, send it on the buyer's first normal message even if
-                # that message already contains a concrete question.  The
-                # exclusions below remain reserved for media/offline/risky
-                # aftersales cases where a sales introduction is unsuitable.
+                # A product-card welcome is useful only for a pure greeting.
+                # Questions receive their answer directly, without a second
+                # unrelated product introduction before it.
                 if self.should_attach_first_reply(enabled, first_reply, deterministic_kind):
                     if first_reply not in bot_reply:
                         first_reply_to_send = self.prepare_product_first_reply(product)
@@ -1477,6 +1495,9 @@ class XianyuLive:
                 order_url=(self._order_routes.get(scope_id) or {}).get("order_url", ""),
             )
 
+            if deterministic and deterministic.get("kind") == "manual_handoff":
+                self.enter_manual_mode(scope_id)
+
             if requires_review:
                 persistent_takeover = self.requires_persistent_manual_takeover(
                     deterministic, send_message
@@ -1556,7 +1577,7 @@ class XianyuLive:
             
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
-            logger.debug(f"原始消息: {message_data}")
+            logger.debug(f"原始消息: {redact_sensitive_text(message_data)}")
             # 最后一层故障兜底：解析/接口/模型异常都不能静默吞消息。
             try:
                 if websocket and chat_id and send_user_id:
