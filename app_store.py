@@ -488,7 +488,7 @@ class AppStore:
                 except (json.JSONDecodeError, TypeError):
                     query_context = {}
             reset = False
-            if row:
+            if row and state != "manual":
                 try:
                     last = datetime.fromisoformat(row["last_activity"])
                     reset = (now - last).total_seconds() >= max(1, int(reset_hours)) * 3600
@@ -536,7 +536,8 @@ class AppStore:
         with self._connect() as conn:
             conn.execute(
                 """UPDATE conversation_state SET ai_reply_count=ai_reply_count+1,
-                   state='active',updated_at=? WHERE scope_id=?""",
+                   state=CASE WHEN state='manual' THEN state ELSE 'active' END,
+                   updated_at=? WHERE scope_id=?""",
                 (self._now(), scope_id),
             )
             row = conn.execute(

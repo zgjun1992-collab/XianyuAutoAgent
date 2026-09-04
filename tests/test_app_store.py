@@ -188,6 +188,23 @@ class AppStoreTests(unittest.TestCase):
         reopened.resume_conversation(scope_id)
         self.assertEqual("active", reopened.get_conversation_state(scope_id))
 
+    def test_manual_state_survives_reply_count_and_inactivity_window(self):
+        scope_id = "seller:chat:item1"
+        self.store.touch_conversation(scope_id, "seller", "chat", "buyer", "item1", 24)
+        self.store.pause_conversation(scope_id, "manual")
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE conversation_state SET last_activity=? WHERE scope_id=?",
+                ("2020-01-01T00:00:00", scope_id),
+            )
+        state = self.store.touch_conversation(
+            scope_id, "seller", "chat", "buyer", "item1", 1,
+        )
+        self.assertFalse(state["reset"])
+        self.assertEqual("manual", state["state"])
+        self.store.record_ai_reply(scope_id)
+        self.assertEqual("manual", self.store.get_conversation_state(scope_id))
+
     def test_structured_query_context_is_persisted_and_cleared_on_reset(self):
         scope_id = "seller:chat:item1"
         self.store.touch_conversation(scope_id, "seller", "chat", "buyer", "item1", 24)
