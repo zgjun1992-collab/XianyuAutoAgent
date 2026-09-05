@@ -252,7 +252,7 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertEqual("【合肥之心城店】：300元代金券可以使用。", available_sku["reply"])
 
-    def test_city_plus_typo_store_name_requires_confirmation_before_specs(self):
+    def test_city_plus_unique_homophone_store_name_can_auto_match(self):
         self.store.save_v2_product(
             "10001", "多规格代金券",
             "100元代金券：售价64元\n300元代金券：售价192元",
@@ -270,25 +270,10 @@ class V2StoreTests(unittest.TestCase):
             )
 
         result = self.store.resolve_deterministic("10001", "济南弘扬")
-        self.assertEqual("stores_clarify", result["kind"])
-        self.assertEqual("candidate_confirmation", result["store_status"])
+        self.assertEqual("stores", result["kind"])
         self.assertIn("【济南弘阳广场店】", result["reply"])
         self.assertNotIn("100元代金券", result["reply"])
         self.assertNotEqual("济南", result["store_query"])
-
-        context = {
-            "query": result["store_query"],
-            "matches": result["store_matches"],
-            "status": result["store_status"],
-            **result["store_context_update"],
-        }
-        confirmed = self.store.resolve_deterministic(
-            "10001", "是", store_context=context,
-        )
-        self.assertEqual("stores", confirmed["kind"])
-        self.assertIn("济南弘阳广场店", confirmed["reply"])
-        self.assertNotIn("100元代金券", confirmed["reply"])
-        self.assertNotIn("300元代金券", confirmed["reply"])
 
     def test_nested_city_county_and_landmark_uses_smallest_grounded_area(self):
         self.store.save_v2_product(
@@ -1926,10 +1911,9 @@ class V2StoreTests(unittest.TestCase):
         missing = self.store.resolve_deterministic("10001", "300元代金券有吗")
         self.assertEqual("sku_availability", missing["kind"])
         self.assertIn("没有300元代金券", missing["reply"])
-        self.assertIn("2张100元代金券", missing["reply"])
-        self.assertIn("共支付108元", missing["reply"])
-        self.assertIn("可抵扣200元", missing["reply"])
-        self.assertIn("剩余100元", missing["reply"])
+        self.assertIn("没有“300元”这一有货规格", missing["reply"])
+        self.assertIn("到店咨询", missing["reply"])
+        self.assertNotIn("2张100元代金券", missing["reply"])
         self.assertNotIn("SKU", missing["reply"].upper())
 
     def test_bare_still_available_question_is_stock_not_product_option(self):
@@ -2310,9 +2294,8 @@ class V2StoreTests(unittest.TestCase):
         self.store.save_v2_product("10001", "成人自助", "成人双人券：售价176元")
         result = self.store.resolve_deterministic("10001", "两大一小多少钱")
         self.assertIn("176元", result["reply"])
-        self.assertIn("没有售卖儿童票", result["reply"])
-        self.assertIn("暂时无法确认", result["reply"])
-        self.assertNotIn("到店咨询", result["reply"])
+        self.assertIn("没有“儿童票”这一有货规格", result["reply"])
+        self.assertIn("到店咨询", result["reply"])
         self.assertNotIn("三人", result["reply"])
 
     def test_student_senior_and_female_tickets_are_not_conflated(self):
@@ -2668,6 +2651,137 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("贵州凯里酸汤牛肉烤鱼（不辣）", result["reply"])
         self.assertIn("青花椒烤鱼（微辣）", result["reply"])
         self.assertNotIn("118", result["reply"])
+
+    def test_store_entity_is_extracted_before_offer_intent_cleanup(self):
+        self.store.import_store_list(
+            self.create_multi_region_store_sheet(), "多地区门店", ["10001"]
+        )
+        result = self.store.resolve_deterministic("10001", "今天深圳什么优惠")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("深圳", result["store_query"])
+        self.assertIn("龙岗万科里店", result["reply"])
+        self.assertIn("西丽益田假日里店", result["reply"])
+        self.assertNotIn("广州万达广场店", result["reply"])
+        self.assertNotIn("未查询到深圳什么优惠", result["reply"])
+
+    def test_unique_store_homophone_is_matched_only_inside_current_product(self):
+        self.store.import_store_list(
+            self.create_multi_region_store_sheet(), "多地区门店", ["10001"]
+        )
+        result = self.store.resolve_deterministic("10001", "瘦光万达能用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("寿光万达广场店", result["reply"])
+        self.assertTrue(result["reply"].startswith("可以使用"))
+
+    def test_composite_store_constraints_are_not_dropped(self):
+        self.store.import_store_list(
+            self.create_multi_region_store_sheet(), "多地区门店", ["10001"]
+        )
+        result = self.store.resolve_deterministic("10001", "寿光万达可以用么")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("寿光万达广场店", result["reply"])
+        self.assertNotIn("广州万达广场店", result["reply"])
+        self.assertIn("属于当前商品适用门店", result["reply"])
+
+    def test_real_two_hundred_option_beats_cross_sku_coupon_combination(self):
+        self.store.save_v2_product("10001", "周末代金券", "")
+        self.store.save_ai_summary("10001", "周末券", {
+            "skus": [{
+                "name": "周末200元选项", "face_value": "200", "sale_price": "159",
+                "applicable_time": "周末可用", "composition": "发2张100元券",
+                "max_stack": 2, "stock": 8, "status": "active",
+            }],
+            "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "周末多少代200有吗")
+        self.assertEqual("sku_availability", result["kind"])
+        self.assertIn("周末200元选项售价159元", result["reply"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("共可抵扣200元", result["reply"])
+        self.assertIn("叠加使用", result["reply"])
+
+    def test_explicit_zero_stock_sku_is_never_recommended(self):
+        self.store.save_v2_product("10001", "周末代金券", "")
+        self.store.save_ai_summary("10001", "周末券", {
+            "skus": [{
+                "name": "周末200元代金券", "face_value": "200", "sale_price": "159",
+                "applicable_time": "周末可用", "composition": "发2张100元券",
+                "stock": 0, "status": "sold_out",
+            }],
+            "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "周末200元代金券有吗")
+        self.assertEqual("sku_availability", result["kind"])
+        self.assertEqual("deny", result["decision"])
+        self.assertIn("没有“200元”这一有货规格", result["reply"])
+        self.assertIn("到店咨询", result["reply"])
+        self.assertNotIn("售价159元", result["reply"])
+
+    def test_audience_mix_uses_existing_tickets_without_requiring_price_word(self):
+        self.store.save_v2_product(
+            "10001", "家庭自助",
+            "成人双人券：售价176元\n儿童票：售价68元，限身高1.2米至1.4米儿童",
+        )
+        result = self.store.resolve_deterministic("10001", "2大1小")
+        self.assertEqual("audience_price", result["kind"])
+        self.assertIn("176元", result["reply"])
+        self.assertIn("68元", result["reply"])
+        self.assertIn("合计244元", result["reply"])
+
+    def test_exact_mixed_audience_package_wins_over_individual_tickets(self):
+        self.store.save_v2_product(
+            "10001", "家庭自助",
+            "两大一小家庭套餐：售价218元\n成人票：售价99元\n儿童票：售价68元",
+        )
+        result = self.store.resolve_deterministic("10001", "2大1小多少钱")
+        self.assertEqual("audience_price", result["kind"])
+        self.assertIn("两大一小家庭套餐", result["reply"])
+        self.assertIn("218元", result["reply"])
+        self.assertNotIn("266元", result["reply"])
+
+    def test_afternoon_tea_and_identity_are_both_hard_sku_filters(self):
+        self.store.save_v2_product(
+            "10001", "分时自助",
+            "下午茶女士票：售价88元\n晚市女士票：售价118元",
+        )
+        result = self.store.resolve_deterministic("10001", "1位女士下午茶多少钱")
+        self.assertEqual("audience_price", result["kind"])
+        self.assertIn("88元", result["reply"])
+        self.assertNotIn("118元", result["reply"])
+
+    def test_child_height_tier_never_defaults_to_the_cheapest_sku(self):
+        self.store.save_v2_product(
+            "10001", "儿童自助",
+            "1.2米以下儿童票：售价48元\n1.2米至1.4米儿童票：售价68元",
+        )
+        clarify = self.store.resolve_deterministic("10001", "儿童票多少钱")
+        self.assertIn("请问儿童身高", clarify["reply"])
+        matched = self.store.resolve_deterministic("10001", "1.3米儿童多少钱")
+        self.assertIn("68元", matched["reply"])
+        self.assertNotIn("48元", matched["reply"])
+
+    def test_current_use_and_instant_use_do_not_enter_manual_aftersale(self):
+        self.store.save_v2_product(
+            "10001", "自助券", "100元代金券：售价79元，付款后自动发券",
+        )
+        self.store.replace_time_rules("10001", [{
+            "label": "全天可用", "day_type": "any", "start_time": "00:00",
+            "end_time": "23:59", "allowed": True, "reply": "全天可用。",
+        }])
+        current = self.store.resolve_deterministic("10001", "现在就能用吗")
+        self.assertEqual("time", current["kind"])
+        self.assertEqual("allow", current["decision"])
+        self.assertNotIn("72小时", current["reply"])
+
+        self.store.save_v2_product(
+            "10001", "预约自助券", "100元代金券：售价79元，付款后自动发券，必须预约",
+        )
+        reserved = self.store.resolve_deterministic("10001", "买了马上能用吗")
+        self.assertEqual("time", reserved["kind"])
+        self.assertEqual("deny", reserved["decision"])
+        self.assertIn("先预约", reserved["reply"])
+        self.assertNotIn("72小时", reserved["reply"])
 
 
 if __name__ == "__main__":
