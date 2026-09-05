@@ -47,16 +47,25 @@ class XianyuLive:
         """Send a saved first-reply/keyword template in order; ordinary replies never enter here."""
         sent_text = []
         parts = self.parse_message_template(text)
+        if not parts:
+            raise ValueError("首次回复没有可发送的文字或图片")
+        assets = {}
+        # Validate the whole template before the first WebSocket write. A stale
+        # image placeholder must not leave a partially delivered first reply.
+        for part in parts:
+            if part["type"] != "image":
+                continue
+            asset = self.app_store.get_image_asset(part["asset_id"])
+            if not asset or str(asset.get("item_id")) != str(item_id) or not asset.get("file_path"):
+                raise ValueError(f"首次回复引用的图片 #{part['asset_id']} 不存在或不属于当前商品")
+            assets[part["asset_id"]] = asset
         for index, part in enumerate(parts):
             if part["type"] == "text":
                 value = self.sanitize_buyer_reply(part["content"]) if sanitize else part["content"]
                 await self.send_msg(ws, cid, toid, value, sanitize=False)
                 sent_text.append(value)
             else:
-                asset = self.app_store.get_image_asset(part["asset_id"])
-                if not asset or str(asset.get("item_id")) != str(item_id) or not asset.get("file_path"):
-                    raise ValueError(f"首次回复引用的图片 #{part['asset_id']} 不存在或不属于当前商品")
-                await self.send_image_asset(ws, cid, toid, scope_id, asset)
+                await self.send_image_asset(ws, cid, toid, scope_id, assets[part["asset_id"]])
             if index + 1 < len(parts):
                 await asyncio.sleep(0.35)
         return "\n\n".join(sent_text)
@@ -96,6 +105,7 @@ class XianyuLive:
         self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
         self.manual_mode_timeout = int(os.getenv("MANUAL_MODE_TIMEOUT", "3600"))  # 人工接管超时时间，默认1小时
         self.manual_mode_timestamps = {}  # 记录进入人工模式的时间
+        self._first_reply_locks = {}
         
         # 消息过期时间配置
         self.message_expire_time = int(os.getenv("MESSAGE_EXPIRE_TIME", "300000"))  # 消息过期时间，默认5分钟
@@ -807,9 +817,14 @@ class XianyuLive:
 
     @staticmethod
     def should_attach_first_reply(enabled, first_reply, deterministic_kind=""):
-        """Send the product welcome only for a pure greeting, never before an answer."""
-        return bool(enabled and str(first_reply or "").strip()
-                    and str(deterministic_kind or "") == "greeting")
+        """An enabled welcome is mandatory on the first buyer turn, regardless of intent."""
+        return bool(enabled and str(first_reply or "").strip())
+
+    @staticmethod
+    def is_product_offline(product):
+        return str((product or {}).get("item_status") or "").strip().lower() in {
+            "offline", "off_shelf", "offshelf", "deleted", "下架",
+        }
 
     def prepare_product_first_reply(self, product):
         """Preserve an explicitly saved welcome; sanitize automatic drafts."""
@@ -820,6 +835,45 @@ class XianyuLive:
         if bool(product.get("first_reply_manual")):
             return text
         return self.sanitize_buyer_reply(text)
+
+    async def send_required_first_reply(
+        self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
+    ):
+        """Send one durable product welcome before every other first-turn response."""
+        if (
+            self.is_product_offline(product)
+            or int((conversation or {}).get("first_reply_sent", 0))
+            or not self.should_attach_first_reply(
+                bool((product or {}).get("first_reply_enabled", True)),
+                (product or {}).get("first_reply_text"),
+            )
+        ):
+            return False
+
+        lock_map = getattr(self, "_first_reply_locks", None)
+        if lock_map is None:
+            lock_map = self._first_reply_locks = {}
+        lock = lock_map.setdefault(scope_id, asyncio.Lock())
+        async with lock:
+            durable_getter = getattr(self.app_store, "is_first_reply_sent", None)
+            if durable_getter and durable_getter(scope_id):
+                return False
+            reply = self.prepare_product_first_reply(product)
+            if not reply:
+                return False
+            await self.send_message_template(
+                websocket, chat_id, send_user_id, scope_id, item_id,
+                reply, sanitize=False,
+            )
+            self.context_manager.add_message_by_chat(
+                scope_id, self.myid, item_id, "assistant", reply
+            )
+            self.app_store.mark_first_reply_sent(scope_id)
+            self.emit_event(
+                "product_first_reply", chat_id=chat_id, item_id=item_id,
+                scope_id=scope_id, message="商品首次回复已在问题答案前发送",
+            )
+            return True
 
     def exit_manual_mode(self, chat_id):
         """退出人工接管模式"""
@@ -1209,34 +1263,41 @@ class XianyuLive:
                 self._recent_buyer_media.pop(scope_id, None)
                 self._media_notice_times.pop(scope_id, None)
                 self.emit_event("conversation_reset", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
-            if current_product and not bool(current_product.get("enabled", 1)):
-                first_reply = str(current_product.get("first_reply_text") or "").strip()
-                first_reply_enabled = bool(current_product.get("first_reply_enabled", True))
-                product_online = current_product.get("item_status") != "offline"
-                if (product_online and first_reply_enabled and first_reply
-                        and not int(conversation.get("first_reply_sent", 0))):
-                    reply = self.prepare_product_first_reply(current_product)
-                    try:
-                        await self.send_message_template(
-                            websocket, chat_id, send_user_id, scope_id, item_id,
-                            reply, sanitize=False,
-                        )
-                    except Exception as exc:
-                        # AI-off products must not fall through to the global
-                        # exception reply when their one welcome message fails.
-                        logger.error(f"商品首次回复发送失败，保持静默: {exc}")
-                        self.emit_event(
-                            "product_first_reply_error", chat_id=chat_id,
-                            item_id=item_id, scope_id=scope_id, message=str(exc),
-                        )
-                        return
-                    self.context_manager.add_message_by_chat(
-                        scope_id, send_user_id, item_id, "user", send_message
+
+            # Chat-shaped platform notices are not buyer consultations and must
+            # never consume the mandatory first-reply flag.
+            if self.is_bracket_system_message(send_message):
+                logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
+                return
+            if self.is_system_message(message):
+                logger.debug("系统消息，跳过处理")
+                return
+
+            product_offline = self.is_product_offline(current_product)
+            first_reply_sent_now = False
+            if current_product and not product_offline:
+                try:
+                    first_reply_sent_now = await self.send_required_first_reply(
+                        websocket, chat_id, send_user_id, scope_id, item_id,
+                        current_product, conversation,
                     )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", reply
+                    if first_reply_sent_now:
+                        await asyncio.sleep(0.25)
+                except Exception as exc:
+                    # A question answer must never overtake a required welcome.
+                    # Keep the durable flag unset so the next delivery can retry.
+                    logger.error(f"商品首次回复发送失败，暂不发送问题答案: {exc}")
+                    self.emit_event(
+                        "product_first_reply_error", chat_id=chat_id,
+                        item_id=item_id, scope_id=scope_id, message=str(exc),
                     )
-                    self.app_store.mark_first_reply_sent(scope_id)
+                    return
+
+            if current_product and not bool(current_product.get("enabled", 1)) and not product_offline:
+                self.context_manager.add_message_by_chat(
+                    scope_id, send_user_id, item_id, "user", send_message
+                )
+                if first_reply_sent_now:
                     self.emit_event(
                         "product_first_reply_only", chat_id=chat_id, item_id=item_id,
                         scope_id=scope_id, message="AI客服关闭，仅发送商品首次回复",
@@ -1249,7 +1310,7 @@ class XianyuLive:
                     scope_id=scope_id, message="当前商品已关闭AI客服",
                 )
                 return
-            if self.should_silence_disabled_purchase_order_greeting(
+            if not product_offline and self.should_silence_disabled_purchase_order_greeting(
                 current_product, send_message
             ):
                 logger.info(f"代买单商品已关闭首次回复，纯问候保持静默 (会话: {chat_id})")
@@ -1265,7 +1326,7 @@ class XianyuLive:
             if prompt_setter:
                 prompt_setter(policies.get("global_system_prompt", ""))
             max_rounds = int(policies.get("max_reply_rounds", 25))
-            if int(conversation.get("ai_reply_count", 0)) >= max_rounds:
+            if not product_offline and int(conversation.get("ai_reply_count", 0)) >= max_rounds:
                 self.enter_manual_mode(scope_id)
                 self.app_store.pause_conversation(scope_id)
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
@@ -1286,20 +1347,13 @@ class XianyuLive:
 
             # 人工接管是持久且静默的：记录买家后续消息供人工查看，禁止
             # 自动问候、重复回执或任何模型回复打断人工处理。
-            if self.is_manual_mode(scope_id):
+            if not product_offline and self.is_manual_mode(scope_id):
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
                 self.emit_event(
                     "manual_message_queued", chat_id=chat_id, item_id=item_id,
                     scope_id=scope_id, message="人工接管期间收到买家新消息",
                 )
                 logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，买家消息已静默留给人工")
-                return
-            # 检查是否为带中括号的系统消息
-            if self.is_bracket_system_message(send_message):
-                logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
-                return
-            if self.is_system_message(message):
-                logger.debug("系统消息，跳过处理")
                 return
             # 极速路径：先跑本地安全、门店、时间和套餐图片规则。
             # 命中后不读取商品页面、不调用模型，直接生成可审核/发送的答复。
@@ -1308,11 +1362,16 @@ class XianyuLive:
             image_asset = None
             actual_paid_amount = self.extract_actual_paid_amount(message)
             predecision = PolicyEngine(policies).evaluate(send_message, "")
+            # Product keyword rules are an exclusive local fast path. Resolve
+            # them before any semantic/model work, but never above offline.
+            image_resolver = getattr(self.app_store, "resolve_image_asset", None)
+            if image_resolver and not product_offline:
+                image_match = image_resolver(item_id, send_message, scope_id)
             resolver = getattr(self.app_store, "resolve_deterministic", None)
             query_context = dict(conversation.get("query_context") or {})
             query_context.update(self._query_contexts.get(scope_id) or {})
             query_context.update(self._store_contexts.get(scope_id) or {})
-            if resolver:
+            if resolver and not image_match:
                 try:
                     deterministic = resolver(
                         item_id, send_message, actual_paid_amount,
@@ -1330,7 +1389,7 @@ class XianyuLive:
             semantic_parser = getattr(self.bot, "analyze_message", None)
             semantic_resolver = getattr(self.app_store, "resolve_semantic_analysis", None)
             if (
-                predecision.action != "replace" and semantic_checker
+                not image_match and predecision.action != "replace" and semantic_checker
                 and semantic_parser and semantic_resolver
                 and semantic_checker(send_message, deterministic)
             ):
@@ -1409,15 +1468,9 @@ class XianyuLive:
                 self._store_contexts[scope_id] = next_store_context
             elif not deterministic or deterministic.get("kind") not in {"stores"}:
                 self._store_contexts.pop(scope_id, None)
-            image_resolver = getattr(self.app_store, "resolve_image_asset", None)
-            if image_resolver:
-                image_match = image_resolver(item_id, send_message, scope_id)
             if deterministic and deterministic.get("kind") == "offline":
                 bot_reply = deterministic["reply"]
                 logger.info("当前商品已下架，停止商品内容回复")
-            elif predecision.action == "replace":
-                bot_reply = predecision.suggested_reply
-                logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif image_match and image_match.get("status") in {"allow", "review"}:
                 matched_asset = image_match["asset"]
                 image_asset = matched_asset if matched_asset.get("file_path") else None
@@ -1438,6 +1491,9 @@ class XianyuLive:
                     "source": "套餐图片30分钟防重复规则",
                     "decision": "allow",
                 }
+            elif predecision.action == "replace":
+                bot_reply = predecision.suggested_reply
+                logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif deterministic:
                 bot_reply = deterministic["reply"]
                 logger.info(f"确定性规则命中: {deterministic.get('source', '')}")
@@ -1502,24 +1558,6 @@ class XianyuLive:
                         }
                         logger.warning(operational_issue)
 
-            # 每个“买家 + 当前商品”会话窗口只发送一次商品首次回复，
-            # 且首次回复与问题答案始终分两条发送，方便买家阅读。
-            first_reply_used = False
-            first_reply_to_send = ""
-            if not int(conversation.get("first_reply_sent", 0)):
-                product_getter = getattr(self.app_store, "get_v2_product", None)
-                product = product_getter(item_id) if product_getter else None
-                first_reply = str((product or {}).get("first_reply_text") or "").strip()
-                enabled = bool((product or {}).get("first_reply_enabled", True))
-                deterministic_kind = (deterministic or {}).get("kind")
-                # A product-card welcome is useful only for a pure greeting.
-                # Questions receive their answer directly, without a second
-                # unrelated product introduction before it.
-                if self.should_attach_first_reply(enabled, first_reply, deterministic_kind):
-                    if first_reply not in bot_reply:
-                        first_reply_to_send = self.prepare_product_first_reply(product)
-                    first_reply_used = True
-
             # If a newer buyer message arrived while the model was working, do
             # not audit or send this now-stale reply.
             if self._message_generations.get(scope_id) != generation:
@@ -1529,18 +1567,6 @@ class XianyuLive:
                 self.context_manager.add_message_by_chat(
                     scope_id, send_user_id, item_id, "user", send_message
                 )
-                first_reply_sent = False
-                if first_reply_to_send:
-                    await self.send_message_template(
-                        websocket, chat_id, send_user_id, scope_id, item_id,
-                        first_reply_to_send, sanitize=False,
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", first_reply_to_send
-                    )
-                    first_reply_sent = True
-                if first_reply_used and (first_reply_sent or not first_reply_to_send):
-                    self.app_store.mark_first_reply_sent(scope_id)
                 if deterministic.get("decision") == "silent":
                     logger.info(f"当前商品规则要求静默等待后续可处理问题 (会话: {chat_id})")
                     return
@@ -1642,20 +1668,6 @@ class XianyuLive:
                 return
 
             # 自动模式只有通过独立规则审查的草稿才会发送。
-            first_reply_sent = False
-            if first_reply_to_send:
-                try:
-                    await self.send_message_template(
-                        websocket, chat_id, send_user_id, scope_id, item_id,
-                        first_reply_to_send, sanitize=False,
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", first_reply_to_send
-                    )
-                    first_reply_sent = True
-                    await asyncio.sleep(0.25)
-                except Exception as exc:
-                    logger.error(f"首次回复发送失败，继续发送问题答案: {exc}")
             # 模拟人工输入延迟
             if self.simulate_human_typing:
                 # 基础延迟 0-1秒 + 每字 0.1-0.3秒
@@ -1697,9 +1709,7 @@ class XianyuLive:
                         "image_send_error", audit_id=audit_id,
                         image_asset_id=image_asset["id"], message=str(exc),
                     )
-            if first_reply_used and (first_reply_sent or not first_reply_to_send):
-                self.app_store.mark_first_reply_sent(scope_id)
-            
+
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
             logger.debug(f"原始消息: {redact_sensitive_text(message_data)}")

@@ -10,6 +10,7 @@ class _Store:
     def __init__(self):
         self.audit_updates = []
         self.reply_scopes = []
+        self.first_reply_scopes = set()
 
     @staticmethod
     def order_payment_notice(item_id):
@@ -24,6 +25,12 @@ class _Store:
 
     def record_ai_reply(self, scope_id):
         self.reply_scopes.append(scope_id)
+
+    def is_first_reply_sent(self, scope_id):
+        return scope_id in self.first_reply_scopes
+
+    def mark_first_reply_sent(self, scope_id):
+        self.first_reply_scopes.add(scope_id)
 
 
 class _Context:
@@ -54,6 +61,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.event_callback = None
         live._order_notice_scopes = set()
         live._buyer_routes = {"buyer-1": ("chat-1", "item-1")}
+        live._first_reply_locks = {}
         live.send_msg = AsyncMock()
         return live
 
@@ -189,14 +197,48 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.should_send_first_reply(message, {"kind": "stores"}))
 
-    def test_enabled_first_reply_attaches_only_to_a_pure_greeting(self):
+    def test_enabled_first_reply_is_mandatory_for_every_first_turn_intent(self):
         self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", "greeting"))
-        for kind in ("coupon_catalog", "stores", "day_use", "price"):
+        for kind in ("coupon_catalog", "stores", "day_use", "price", "refund_quality"):
             with self.subTest(kind=kind):
-                self.assertFalse(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
+                self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
         self.assertFalse(XianyuLive.should_attach_first_reply(False, "商品首次回复", "stores"))
         self.assertFalse(XianyuLive.should_attach_first_reply(True, "", "stores"))
-        self.assertFalse(XianyuLive.should_attach_first_reply(True, "商品首次回复", "refund_quality"))
+
+    async def test_required_first_reply_sends_once_before_any_answer_kind(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock(return_value="首次第1段\n\n首次第2段")
+        product = {
+            "item_status": "onsale", "first_reply_enabled": True,
+            "first_reply_text": "首次第1段{$分段符}首次第2段", "first_reply_manual": True,
+        }
+        first = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0},
+        )
+        second = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0},
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        live.send_message_template.assert_awaited_once()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+        self.assertEqual("assistant", live.context_manager.messages[0][3])
+
+    async def test_offline_product_never_sends_first_reply(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1",
+            {
+                "item_status": "offline", "first_reply_enabled": True,
+                "first_reply_text": "不应发送", "first_reply_manual": True,
+            },
+            {"first_reply_sent": 0},
+        )
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
 
     def test_model_operational_guard_rejects_unverified_actions_and_status(self):
         self.assertTrue(XianyuLive.model_reply_operational_issue(

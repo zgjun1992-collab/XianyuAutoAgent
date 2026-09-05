@@ -539,6 +539,14 @@ class AppStore:
                 (self._now(), scope_id),
             )
 
+    def is_first_reply_sent(self, scope_id: str) -> bool:
+        """Read the durable first-reply flag without changing activity time."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT first_reply_sent FROM conversation_state WHERE scope_id=?", (scope_id,)
+            ).fetchone()
+        return bool(row and int(row["first_reply_sent"] or 0))
+
     def record_ai_reply(self, scope_id: str) -> Dict:
         with self._connect() as conn:
             conn.execute(

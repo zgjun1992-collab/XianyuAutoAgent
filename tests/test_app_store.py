@@ -174,6 +174,7 @@ class AppStoreTests(unittest.TestCase):
         self.assertEqual(0, state["ai_reply_count"])
         self.store.record_ai_reply("seller:chat:item1")
         self.store.mark_first_reply_sent("seller:chat:item1")
+        self.assertTrue(self.store.is_first_reply_sent("seller:chat:item1"))
         state = self.store.touch_conversation("seller:chat:item1", "seller", "chat", "buyer", "item1", 24)
         self.assertEqual(1, state["ai_reply_count"])
         self.assertEqual(1, state["first_reply_sent"])
@@ -186,6 +187,7 @@ class AppStoreTests(unittest.TestCase):
         reset = next(item for item in self.store.list_conversations() if item["scope_id"].endswith("item1"))
         self.assertEqual(0, reset["ai_reply_count"])
         self.assertEqual(0, reset["first_reply_sent"])
+        self.assertFalse(self.store.is_first_reply_sent("seller:chat:item1"))
         self.assertEqual("active", reset["state"])
 
     def test_manual_conversation_state_is_persistent_and_resumable(self):

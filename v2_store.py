@@ -1539,6 +1539,64 @@ class V2Store(AppStore):
             return False
         return True
 
+    @staticmethod
+    def _current_day_type() -> str:
+        return "weekend" if datetime.now(CHINA_TZ).weekday() >= 5 else "weekday"
+
+    @classmethod
+    def _requested_day_type(cls, message: str, *, default_today: bool = False) -> str:
+        """Resolve an explicit day/date first; optionally fall back to today."""
+        explicit = cls._conditional_query_slots(message).get("day_type")
+        if explicit:
+            return explicit
+        target = cls._query_date(message)
+        if target:
+            return "weekend" if target.weekday() >= 5 else "weekday"
+        return cls._current_day_type() if default_today else ""
+
+    @classmethod
+    def _day_reply_prefix(cls, message: str, day_type: str) -> str:
+        label = "周末" if day_type == "weekend" else "工作日"
+        text = str(message or "")
+        if re.search(r"今天|今日", text) or not cls._requested_day_type(text):
+            return f"今天是{label}，"
+        return f"按您指定的日期（{label}），"
+
+    @classmethod
+    def _option_day_types(cls, option: Dict) -> List[str]:
+        values = list(option.get("day_types") or [])
+        if values:
+            return values
+        evidence = " ".join(str(option.get(key) or "") for key in ("name", "applicable_time"))
+        return cls._day_types(evidence)
+
+    @classmethod
+    def _has_explicit_day_options(cls, options: List[Dict]) -> bool:
+        return any(cls._option_day_types(option) for option in options)
+
+    @classmethod
+    def _filter_options_for_day(cls, options: List[Dict], day_type: str) -> List[Dict]:
+        """Keep the applicable real options and prefer a day-specific tier."""
+        normalized = [
+            {**option, "day_types": cls._option_day_types(option)} for option in options
+        ]
+        has_weekend = any("weekend" in option["day_types"] for option in normalized)
+        has_holiday = any("holiday" in option["day_types"] for option in normalized)
+        holiday_covers_weekend = day_type == "weekend" and has_holiday and not has_weekend
+        compatible = [
+            option for option in normalized
+            if cls._option_matches_time(
+                option, day_type=day_type,
+                holiday_covers_weekend=holiday_covers_weekend,
+            )
+        ]
+        specific = [
+            option for option in compatible
+            if day_type in option["day_types"]
+            or (holiday_covers_weekend and "holiday" in option["day_types"])
+        ]
+        return specific or compatible
+
     @classmethod
     def _query_date(cls, value: object) -> Optional[datetime]:
         text = str(value or "")
@@ -1721,6 +1779,8 @@ class V2Store(AppStore):
                     "decision": "allow", "kind": "audience_price"}
         slots = self._conditional_query_slots(text)
         options = [item for item in self.extract_sale_options(product) if item.get("sale_price")]
+        if not slots.get("day_type") and self._has_explicit_day_options(options):
+            slots["day_type"] = self._requested_day_type(text, default_today=True)
         has_weekend = any("weekend" in (item.get("day_types") or []) for item in options)
         has_holiday = any("holiday" in (item.get("day_types") or []) for item in options)
         holiday_covers = slots.get("day_type") == "weekend" and has_holiday and not has_weekend
@@ -1841,6 +1901,8 @@ class V2Store(AppStore):
                 previous = {}
 
         direct_slots = self._conditional_query_slots(text)
+        if not direct_slots.get("day_type"):
+            direct_slots["day_type"] = self._requested_day_type(text)
         if (
             availability_intent
             and any(word.lower() in text.lower() for word in STORE_LANDMARK_WORDS)
@@ -1926,6 +1988,10 @@ class V2Store(AppStore):
         if not any(slots.get(key) not in (None, "") for key in slot_keys):
             return None
         options = [option for option in self.extract_sale_options(product) if option.get("sale_price")]
+        if not slots.get("day_type") and self._has_explicit_day_options(options):
+            # A buyer asking the current price/availability without naming a
+            # date means today. Never fall back to the first or cheapest tier.
+            slots["day_type"] = self._requested_day_type(text, default_today=True)
         has_weekend_options = any("weekend" in (option.get("day_types") or []) for option in options)
         has_holiday_options = any("holiday" in (option.get("day_types") or []) for option in options)
         holiday_covers_weekend = bool(
@@ -2333,17 +2399,28 @@ class V2Store(AppStore):
         brand = self.extract_brand(product)
         options = self.extract_product_options(product)
         priced = [option for option in options if option.get("sale_price")]
+        implicit_day = ""
+        if str(message or "").strip() and self._has_explicit_day_options(priced):
+            implicit_day = self._requested_day_type(message, default_today=True)
+            priced = self._filter_options_for_day(priced, implicit_day)
+            if not priced:
+                prefix = self._day_reply_prefix(message, implicit_day)
+                return f"{prefix}当前商品没有该日期适用的在售规格。"
+        today_prefix = self._day_reply_prefix(message, implicit_day) if implicit_day else ""
+        request_text = re.sub(
+            r"(?:(?:\d{4})[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?", "", str(message or "")
+        )
         requested = []
         for pattern in (
             r"(\d+(?:\.\d+)?)\s*元\s*(?:代金券|券)",
             r"(?:面额|券面)\s*(\d+(?:\.\d+)?)",
             r"多少\s*代\s*(\d+(?:\.\d+)?)",
         ):
-            requested.extend(re.findall(pattern, str(message or "")))
-        if re.search(r"多少钱|价格|卖多少|怎么卖|多少元", str(message or "")):
+            requested.extend(re.findall(pattern, request_text))
+        if re.search(r"多少钱|价格|卖多少|怎么卖|多少元", request_text):
             requested.extend(re.findall(
                 r"(?<!\d)(\d+(?:\.\d+)?)",
-                str(message or ""),
+                request_text,
             ))
         requested = list(dict.fromkeys(self._format_number(value) for value in requested))
         if requested:
@@ -2365,23 +2442,32 @@ class V2Store(AppStore):
             if not matched:
                 target = max(Decimal(value) for value in requested)
                 plan = self.consumption_plan_reply(
-                    product, target, missing_denomination=True
+                    product, target, missing_denomination=True,
+                    available_options=priced if implicit_day else None,
                 )
                 if plan:
                     return plan
                 label = "、".join(f"{value}元代金券" for value in requested)
                 return f"当前商品没有{label}。"
             lines = [self.format_product_option(option, brand) for option in matched]
-            return "\n".join(lines)
+            return today_prefix + "\n".join(lines)
         if priced:
             lines = [self.format_product_option(option, brand) for option in priced]
-            return "当前价格如下：\n" + "\n".join(lines)
+            return today_prefix + "当前价格如下：\n" + "\n".join(lines)
         package_options = [
             option for option in self.extract_sale_options(product)
             if option.get("option_type") == "package" and option.get("sale_price")
         ]
         if package_options:
-            return "当前价格如下：\n" + "\n".join(
+            package_prefix = ""
+            if self._has_explicit_day_options(package_options):
+                day_type = self._requested_day_type(message, default_today=True)
+                package_options = self._filter_options_for_day(package_options, day_type)
+                if not package_options:
+                    prefix = self._day_reply_prefix(message, day_type)
+                    return f"{prefix}当前商品没有该日期适用的在售套餐。"
+                package_prefix = self._day_reply_prefix(message, day_type)
+            return package_prefix + "当前价格如下：\n" + "\n".join(
                 self._format_conditional_option(option, {}) for option in package_options
             )
         facts = (product.get("structured") or {}).get("facts") or {}
@@ -2542,16 +2628,25 @@ class V2Store(AppStore):
         requested = self._format_number(next(
             value for value in value_match.groups() if value is not None
         ))
-        option = next((
+        candidates = [
             item for item in self.extract_product_options(product)
             if self._format_number(item.get("face_value")) == requested
-        ), None)
+        ]
+        implicit_day = ""
+        if self._has_explicit_day_options(candidates):
+            implicit_day = self._requested_day_type(text, default_today=True)
+            candidates = self._filter_options_for_day(candidates, implicit_day)
+            if not candidates:
+                prefix = self._day_reply_prefix(text, implicit_day)
+                return f"{prefix}当前没有该日期适用的{requested}元代金券。"
+        option = candidates[0] if candidates else None
         if not option:
             plan = self.consumption_plan_reply(
                 product, Decimal(requested), missing_denomination=True,
             )
             return plan or f"当前商品没有{requested}元代金券，请选择商品页面已有的规格。"
-        return f"可以直接拍下，{self.format_product_option(option, self.extract_brand(product))}。"
+        prefix = self._day_reply_prefix(text, implicit_day) if implicit_day else ""
+        return f"{prefix}可以直接拍下，{self.format_product_option(option, self.extract_brand(product))}。"
 
     def named_sku_price_reply(self, product: Dict, message: str) -> str:
         """Resolve named ``xxx多少钱`` queries against SKU names first."""
@@ -2581,7 +2676,15 @@ class V2Store(AppStore):
                 matched.append(option)
         brand = self.extract_brand(product)
         if matched:
-            return "\n".join(self.format_product_option(option, brand) for option in matched)
+            prefix = ""
+            if self._has_explicit_day_options(matched):
+                day_type = self._requested_day_type(message, default_today=True)
+                matched = self._filter_options_for_day(matched, day_type)
+                if not matched:
+                    prefix = self._day_reply_prefix(message, day_type)
+                    return f"{prefix}当前没有该日期适用的“{subject}”规格。"
+                prefix = self._day_reply_prefix(message, day_type)
+            return prefix + "\n".join(self.format_product_option(option, brand) for option in matched)
         raw_text = str(product.get("raw_text") or "").replace("\\n", "\n")
         raw_match = re.search(
             rf"(?m)^\s*([^\n：:]{{0,30}}{re.escape(subject)}[^\n：:]{{0,30}})\s*[：:]\s*"
@@ -2682,8 +2785,19 @@ class V2Store(AppStore):
                 matched.append(option)
 
         if matched:
+            implicit_day = ""
+            if self._has_explicit_day_options(matched):
+                implicit_day = self._requested_day_type(text, default_today=True)
+                matched = self._filter_options_for_day(matched, implicit_day)
+                if not matched:
+                    requested = "、".join(
+                        f"{self._format_number(value)}元" for value in requested_values
+                    ) or subject
+                    prefix = self._day_reply_prefix(text, implicit_day)
+                    return f"{prefix}当前没有该日期适用的{requested}商品规格。"
             brand = self.extract_brand(product)
-            return "有的，当前商品包含：\n" + "\n".join(
+            prefix = self._day_reply_prefix(text, implicit_day) if implicit_day else ""
+            return prefix + "有的，当前商品包含：\n" + "\n".join(
                 self.format_product_option(option, brand) for option in matched
             )
         if not requested_values:
@@ -4574,17 +4688,15 @@ class V2Store(AppStore):
         )
 
     def _multi_sku_store_scope(self, item_id: str, product: Optional[Dict] = None) -> Dict:
-        """Build the read-only product-wide store scope for differing SKU rules."""
+        """Build store scope and compare actual branches, not store-list ids."""
         product = product or self.get_v2_product(item_id) or {}
         skus = self.list_product_skus(item_id, product)
         ready_skus = []
         unknown_skus = []
         all_list_ids = set()
-        effective_sets = set()
         for sku in skus:
             list_ids, mode, ready = self.effective_store_list_ids(item_id, sku["sku_key"])
             normalized_ids = tuple(sorted(int(value) for value in list_ids))
-            effective_sets.add(normalized_ids if ready else ("unconfigured", sku["sku_key"]))
             enriched = {
                 **sku,
                 "effective_list_ids": list(normalized_ids),
@@ -4596,12 +4708,34 @@ class V2Store(AppStore):
                 all_list_ids.update(normalized_ids)
             else:
                 unknown_skus.append(enriched)
+
+        rows_by_list = {list_id: [] for list_id in all_list_ids}
+        if all_list_ids:
+            ordered_ids = sorted(all_list_ids)
+            placeholders = ",".join("?" for _ in ordered_ids)
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM stores WHERE list_id IN ({placeholders})", ordered_ids
+                ).fetchall()
+            for row in rows:
+                value = dict(row)
+                rows_by_list.setdefault(int(value["list_id"]), []).append(value)
+        physical_sets = {
+            frozenset(
+                self._physical_store_key(row)
+                for list_id in sku.get("effective_list_ids") or []
+                for row in rows_by_list.get(int(list_id), [])
+            )
+            for sku in ready_skus
+        }
         return {
             "skus": skus,
             "ready_skus": ready_skus,
             "unknown_skus": unknown_skus,
             "list_ids": sorted(all_list_ids),
-            "stores_differ": len(effective_sets) > 1,
+            # Different list records may contain the same physical branches.
+            # Only verified branch differences activate the multi-SKU narrowing.
+            "stores_differ": len(physical_sets) > 1,
         }
 
     def _store_sku_matrix(self, item_id: str, stores: List[Dict], scope: Dict) -> List[Dict]:
@@ -5697,10 +5831,13 @@ class V2Store(AppStore):
         if area_only:
             if len(grouped) == 1:
                 names = next(iter(grouped.values()))
-                body = "、".join(dict.fromkeys(names))
+                unique_names = list(dict.fromkeys(names))
+                body = "\n".join(
+                    f"{index}. 【{name}】" for index, name in enumerate(unique_names, start=1)
+                )
             else:
                 body = "\n".join(lines)
-            return f"根据“{query_value}”查询到以下可用门店：\n\n{body}。"
+            return f"根据“{query_value}”查询到以下可用门店：\n\n{body}\n\n以上均为当前商品的适用门店。"
         displays = []
         for city, names in grouped.items():
             if len(grouped) == 1:
@@ -6467,6 +6604,19 @@ class V2Store(AppStore):
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
         product = self.get_v2_product(item_id) or {}
 
+        # Product status is the highest business gate. Once the listing is
+        # offline, every buyer consultation gets the same deterministic answer;
+        # no price/store/keyword/aftersale branch may leak through.
+        if str(product.get("item_status") or "").strip().lower() in {
+            "offline", "off_shelf", "offshelf", "deleted", "下架",
+        }:
+            return {
+                "reply": "您好，该商品目前已下架，暂时无法购买。",
+                "source": "当前商品已下架",
+                "decision": "allow",
+                "kind": "offline",
+            }
+
         if contains_sensitive_voucher_data(message):
             return {
                 "reply": (
@@ -6771,20 +6921,6 @@ class V2Store(AppStore):
                     "decision": "review" if "需要人工核实" in reply else "allow",
                     "kind": "consumption_plan",
                 }
-
-        aftersale_words = (
-            "退款", "退货", "退钱", "申请退", "可以退", "能退", "不想用", "不好用",
-            "券码", "卡券", "核销失败", "过期", "补发", "换码", "链接打不开",
-        )
-        if product and str(product.get("item_status") or "").lower() in {
-            "offline", "off_shelf", "offshelf", "deleted", "下架",
-        } and not any(word in message for word in aftersale_words):
-            return {
-                "reply": "您好，该商品目前已下架，暂时无法购买。",
-                "source": "当前商品已下架",
-                "decision": "allow",
-                "kind": "offline",
-            }
 
         pure_greeting = re.fullmatch(
             r"(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)(?:呀|啊|哦|呢|吗)?",
@@ -7393,9 +7529,7 @@ class V2Store(AppStore):
             message,
         ))
         if all_store_question:
-            skus = self.list_product_skus(item_id, product)
-            effective_sets = {tuple(sorted(sku.get("effective_list_ids") or [])) for sku in skus}
-            if len(effective_sets) > 1:
+            if self._multi_sku_store_scope(item_id, product).get("stores_differ"):
                 return {
                     "reply": "不同商品规格的适用门店可能不同。请发送要购买的规格名称、面额或人数，以及城市或门店名称，我按对应规格为您准确查询。",
                     "source": "当前商品不同规格绑定了不同门店表",
@@ -7451,9 +7585,9 @@ class V2Store(AppStore):
         pending_query = str((store_context or {}).get("pending_store_query") or "").strip()
         if pending_mode == "generic_landmark" and pending_query and is_meaningful_store_query(query):
             query = query + pending_query
-        skus = self.list_product_skus(item_id, product)
-        effective_sets = {tuple(sorted(sku.get("effective_list_ids") or [])) for sku in skus}
-        sku_stores_differ = len(effective_sets) > 1
+        sku_scope = self._multi_sku_store_scope(item_id, product)
+        skus = sku_scope.get("skus") or []
+        sku_stores_differ = bool(sku_scope.get("stores_differ"))
         matched_skus = self.match_message_skus(item_id, message, product)
         selected_sku = matched_skus[0] if len(matched_skus) == 1 else None
         if not selected_sku and store_context:
@@ -7466,11 +7600,17 @@ class V2Store(AppStore):
             )
             if multi_sku_store:
                 return multi_sku_store
+        scope_list_ids = list(sku_scope.get("list_ids") or [])
+        uniform_list_ids = (
+            scope_list_ids
+            if scope_list_ids and not sku_stores_differ and not selected_key else None
+        )
         raw_store_result = (
             self.search_store(
                 item_id,
                 query if pending_mode == "generic_landmark" else message,
                 sku_key=selected_key,
+                list_ids_override=uniform_list_ids,
             )
             if is_meaningful_store_query(
                 query if pending_mode == "generic_landmark" else message
@@ -7482,7 +7622,10 @@ class V2Store(AppStore):
         ):
             store_result = raw_store_result
         elif is_meaningful_store_query(query):
-            store_result = self.search_store(item_id, query, sku_key=selected_key)
+            store_result = self.search_store(
+                item_id, query, sku_key=selected_key,
+                list_ids_override=uniform_list_ids,
+            )
         else:
             store_result = {"status": "missing_query", "matches": []}
         query = str(store_result.get("resolved_query") or query).strip()
@@ -7527,21 +7670,6 @@ class V2Store(AppStore):
                 }
             if store_result["status"] == "available":
                 prefix = f"{self._sku_public_label(selected_sku)}：" if selected_sku else ""
-                if len(store_result.get("matches") or []) > 3:
-                    return {
-                        "reply": (
-                            f"根据“{query}”匹配到多家可用门店，请补充区县、商圈、"
-                            "商场名称或完整门店名，我再帮您准确查询。"
-                        ),
-                        "source": "门店查询超过3家需缩小范围",
-                        "decision": "allow", "kind": "stores_clarify",
-                        "store_matches": store_result["matches"], "store_query": query,
-                        "store_status": "too_many",
-                        "store_context_update": {
-                            "pending_store_query": query,
-                            "candidate_count": len(store_result["matches"]),
-                        },
-                    }
                 # When store applicability differs and the buyer did not name a
                 # specification, reverse-match the store instead of presenting
                 # a product-wide claim.
