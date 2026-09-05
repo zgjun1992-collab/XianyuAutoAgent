@@ -1371,27 +1371,21 @@ class XianyuLive:
             query_context = dict(conversation.get("query_context") or {})
             query_context.update(self._query_contexts.get(scope_id) or {})
             query_context.update(self._store_contexts.get(scope_id) or {})
-            if resolver and not image_match:
-                try:
-                    deterministic = resolver(
-                        item_id, send_message, actual_paid_amount,
-                        query_context or None,
-                        getattr(self, "_order_routes", {}).get(scope_id) or None,
-                    )
-                except TypeError:
-                    deterministic = resolver(item_id, send_message)
 
-            # The optional model pass can only interpret unresolved/compound
-            # wording. Every extracted question is sent back through the same
-            # deterministic resolver, so the model never decides store, SKU,
-            # price, date or aftersales facts.
+            # Interpret ordinary buyer language before business routing. This
+            # call returns structure only; existing local rules still own every
+            # fact, decision and buyer-visible reply.
             semantic_checker = getattr(self.bot, "should_analyze_message", None)
             semantic_parser = getattr(self.bot, "analyze_message", None)
             semantic_resolver = getattr(self.app_store, "resolve_semantic_analysis", None)
+            semantic_mode_getter = getattr(self.bot, "semantic_router_mode", None)
+            semantic_mode = semantic_mode_getter() if semantic_mode_getter else "on"
+            semantic_analysis = None
             if (
-                not image_match and predecision.action != "replace" and semantic_checker
+                not product_offline and not image_match
+                and predecision.action != "replace" and semantic_checker
                 and semantic_parser and semantic_resolver
-                and semantic_checker(send_message, deterministic)
+                and semantic_checker(send_message, None)
             ):
                 try:
                     product_getter = getattr(self.app_store, "get_v2_product", None)
@@ -1416,11 +1410,35 @@ class XianyuLive:
                         "pending_store_query": str(query_context.get("pending_store_query") or ""),
                     }
                     semantic_history = self.context_manager.get_context_by_chat(scope_id)
-                    analysis = await asyncio.to_thread(
+                    semantic_analysis = await asyncio.to_thread(
                         semantic_parser, send_message, semantic_history, semantic_context,
                     )
+                    if semantic_mode == "shadow" and semantic_analysis:
+                        logger.info("语义路由处于影子模式：已记录意图，不改变当前回复")
+                except Exception as exc:
+                    logger.warning(f"前置语义识别失败，继续使用原有规则：{exc}")
+
+            if resolver and not image_match:
+                try:
+                    deterministic = resolver(
+                        item_id, send_message, actual_paid_amount,
+                        query_context or None,
+                        getattr(self, "_order_routes", {}).get(scope_id) or None,
+                    )
+                except TypeError:
+                    deterministic = resolver(item_id, send_message)
+
+            # Apply the earlier structure only when the completed local result
+            # is eligible. Review/silent/system answers cannot be overridden.
+            if (
+                semantic_mode == "on" and semantic_analysis
+                and not image_match and predecision.action != "replace"
+                and semantic_checker and semantic_resolver
+                and semantic_checker(send_message, deterministic)
+            ):
+                try:
                     enhanced = semantic_resolver(
-                        item_id, send_message, analysis, actual_paid_amount,
+                        item_id, send_message, semantic_analysis, actual_paid_amount,
                         query_context or None,
                         getattr(self, "_order_routes", {}).get(scope_id) or None,
                         deterministic,

@@ -92,6 +92,45 @@ class FastReplyTests(unittest.TestCase):
             "必须退款", {"kind": "refund_dispute", "decision": "review"},
         ))
 
+    def test_semantic_router_preanalyzes_compact_business_text_and_has_safe_modes(self):
+        with patch.dict(os.environ, {
+            "AI_SEMANTIC_ASSIST_ENABLED": "true",
+            "AI_SEMANTIC_ROUTER_MODE": "on",
+        }):
+            self.assertTrue(XianyuReplyBot.should_analyze_message("2大1小", None))
+            self.assertTrue(XianyuReplyBot.should_analyze_message("周末晚市", None))
+            self.assertEqual("on", XianyuReplyBot.semantic_router_mode())
+        with patch.dict(os.environ, {
+            "AI_SEMANTIC_ASSIST_ENABLED": "true",
+            "AI_SEMANTIC_ROUTER_MODE": "shadow",
+        }):
+            self.assertTrue(XianyuReplyBot.should_analyze_message("2大1小", None))
+            self.assertEqual("shadow", XianyuReplyBot.semantic_router_mode())
+        with patch.dict(os.environ, {
+            "AI_SEMANTIC_ASSIST_ENABLED": "true",
+            "AI_SEMANTIC_ROUTER_MODE": "off",
+        }):
+            self.assertFalse(XianyuReplyBot.should_analyze_message("2大1小", None))
+
+    def test_semantic_payload_accepts_grounded_stock_and_store_split(self):
+        payload = {
+            "questions": [
+                {"intent": "purchase", "evidence": "这个有货吗", "slots": {},
+                 "uses_context": False, "confidence": 0.98},
+                {"intent": "store", "evidence": "上海能用吗",
+                 "slots": {"store_query": "上海"},
+                 "uses_context": False, "confidence": 0.99},
+            ],
+            "needs_clarification": False,
+        }
+        result = XianyuReplyBot._validate_semantic_payload(
+            payload, "这个有货吗 上海能用吗",
+        )
+        self.assertEqual(["purchase", "store"], [
+            question["intent"] for question in result["questions"]
+        ])
+        self.assertEqual("上海", result["questions"][1]["slots"]["store_query"])
+
     def test_semantic_payload_rejects_hallucinated_store_and_number(self):
         payload = {
             "questions": [{

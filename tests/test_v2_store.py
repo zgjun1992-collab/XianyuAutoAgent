@@ -551,6 +551,34 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("济南万象城店", result["reply"])
         self.assertIn("300元代金券", result["reply"])
         self.assertIn("售价192元", result["reply"])
+        self.assertIn("\n\n2. 购买", result["reply"])
+
+    def test_semantic_stock_and_store_questions_use_existing_local_answers(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券", "100元代金券：售价66元",
+        )
+        self.store.import_store_text(
+            "【上海市】\n【上海】上海万象城店", "上海门店", ["10001"],
+        )
+        message = "这个有货吗 上海能用吗"
+        analysis = {
+            "questions": [
+                {"intent": "purchase", "evidence": "这个有货吗",
+                 "slots": {}, "confidence": 0.98},
+                {"intent": "store", "evidence": "上海能用吗",
+                 "slots": {"store_query": "上海"}, "confidence": 0.99},
+            ],
+            "needs_clarification": False,
+        }
+        original = self.store.resolve_deterministic("10001", message)
+        result = self.store.resolve_semantic_analysis(
+            "10001", message, analysis, original_result=original,
+        )
+        self.assertEqual("semantic_multi_intent", result["kind"])
+        self.assertEqual(["purchase", "store"], result["resolved_intents"])
+        self.assertIn("有的，当前商品还在售，可以直接拍下。", result["reply"])
+        self.assertIn("上海万象城店", result["reply"])
+        self.assertIn("\n\n2. 适用门店", result["reply"])
 
     def test_semantic_single_question_never_replaces_existing_rule_result(self):
         analysis = {
@@ -610,6 +638,19 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("西城万象店", reply)
         self.assertNotIn("等店", reply)
         self.assertNotIn("搜索到以下可用门店", reply)
+
+    def test_exact_single_store_confirmation_uses_short_reply(self):
+        self.store.import_store_text(
+            "【浙江省】\n【杭州】杭州萧山万象汇店", "杭州门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "杭州萧山万象汇店能用吗",
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual(
+            "可以使用。根据“杭州萧山万象汇店”查询到可用门店：【杭州萧山万象汇店】",
+            result["reply"],
+        )
 
     def test_spoken_store_query_is_cleaned_and_always_gets_a_reply(self):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
@@ -2682,7 +2723,10 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertIn("寿光万达广场店", result["reply"])
         self.assertNotIn("广州万达广场店", result["reply"])
-        self.assertIn("属于当前商品适用门店", result["reply"])
+        self.assertEqual(
+            "可以使用。根据“寿光万达广场店”查询到可用门店：【寿光万达广场店】",
+            result["reply"],
+        )
 
     def test_real_two_hundred_option_beats_cross_sku_coupon_combination(self):
         self.store.save_v2_product("10001", "周末代金券", "")

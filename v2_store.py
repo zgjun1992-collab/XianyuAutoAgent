@@ -6282,10 +6282,16 @@ class V2Store(AppStore):
             ))
         ):
             display = str(matches[0].get("branch") or matches[0].get("brand") or "该门店").strip()
+            if matches[0].get("match_quality") == "phonetic":
+                # Preserve the existing explicit confirmation wording for
+                # homophone recovery; only exact/contained store replies shrink.
+                return (
+                    f"可以使用。根据“{query_value}”查询到可用门店：【{display}】。"
+                    f"您说的“{query_value}”对应【{display}】，"
+                    "该门店属于当前商品适用门店。"
+                )
             return (
-                f"可以使用。根据“{query_value}”查询到可用门店：【{display}】。"
-                f"您说的“{query_value}”对应【{display}】，"
-                "该门店属于当前商品适用门店。"
+                f"可以使用。根据“{query_value}”查询到可用门店：【{display}】"
             )
         if (
             len(matches) == 1 and not area_only
@@ -7054,7 +7060,7 @@ class V2Store(AppStore):
             replies.append((label, reply.rstrip(" \t\r\n")))
 
         result = {
-            "reply": "\n".join(
+            "reply": "\n\n".join(
                 f"{index}. {label}：{reply}"
                 for index, (label, reply) in enumerate(replies, start=1)
             ),
@@ -7126,6 +7132,10 @@ class V2Store(AppStore):
                 return "有什么使用限制"
             if intent == "purchase" and sku_amount:
                 return f"{sku_amount}元代金券可以直接拍吗"
+            if intent == "purchase" and re.search(r"有货|还有(?:吗|么|嘛|不)", evidence):
+                # Normalize only the routing phrase. The stock answer itself is
+                # still produced by the unchanged deterministic stock branch.
+                return "有货吗"
             if intent == "delivery":
                 return "怎么发货"
             return evidence
@@ -7168,7 +7178,7 @@ class V2Store(AppStore):
             return None
 
         result = {
-            "reply": "\n".join(
+            "reply": "\n\n".join(
                 f"{index}. {label}：{child['reply'].rstrip()}"
                 for index, (_, label, child) in enumerate(resolved, start=1)
             ),

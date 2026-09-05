@@ -128,12 +128,18 @@ class XianyuReplyBot:
         ))
         return family_count >= 2 or question_count >= 2 or linked_questions
 
+    @staticmethod
+    def semantic_router_mode() -> str:
+        """Return the guarded semantic-router rollout mode."""
+        mode = os.getenv("AI_SEMANTIC_ROUTER_MODE", "on").strip().lower()
+        return mode if mode in {"off", "shadow", "on"} else "on"
+
     @classmethod
     def should_analyze_message(cls, user_msg: str, deterministic: Optional[Dict] = None) -> bool:
-        """Use semantic assistance only for unresolved or likely partial messages."""
+        """Analyze ordinary text first, but apply it only to safe unresolved/compound routes."""
         if os.getenv("AI_SEMANTIC_ASSIST_ENABLED", "true").strip().lower() in {
             "0", "false", "off", "no",
-        }:
+        } or cls.semantic_router_mode() == "off":
             return False
         text = str(user_msg or "").strip()
         if len(cls._semantic_key(text)) < 2:
@@ -147,12 +153,9 @@ class XianyuReplyBot:
         ):
             return False
         if not deterministic:
-            return bool(re.search(
-                r"吗|嘛|么|呢|咋|怎么|如何|多少|哪(?:里|家|个)?|"
-                r"能不能|可不可以|有没有|门店|店铺|商场|规格|面额|代金券|"
-                r"售价|价格|付款|发货|发券|核销|使用|限制|退款|过期",
-                text,
-            ))
+            # The first pass is deliberately broad. It returns structure only;
+            # existing deterministic business rules still own every answer.
+            return True
         if deterministic.get("decision") in {"review", "clarify", "silent", "silent_review"}:
             return False
         if deterministic.get("kind") in {
@@ -280,7 +283,7 @@ class XianyuReplyBot:
                     {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
                 ],
                 temperature=0,
-                max_tokens=max(180, int(os.getenv("AI_SEMANTIC_MAX_TOKENS", "420"))),
+                max_tokens=max(180, int(os.getenv("AI_SEMANTIC_MAX_TOKENS", "520"))),
                 top_p=0.2,
                 timeout=max(5, float(os.getenv("AI_SEMANTIC_TIMEOUT", "10"))),
                 response_format={"type": "json_object"},
