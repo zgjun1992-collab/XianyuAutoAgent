@@ -136,7 +136,7 @@ class XianyuReplyBot:
 
     @classmethod
     def should_analyze_message(cls, user_msg: str, deterministic: Optional[Dict] = None) -> bool:
-        """Analyze ordinary text first, but apply it only to safe unresolved/compound routes."""
+        """Use semantic parsing only for unresolved or safely compound routes."""
         if os.getenv("AI_SEMANTIC_ASSIST_ENABLED", "true").strip().lower() in {
             "0", "false", "off", "no",
         } or cls.semantic_router_mode() == "off":
@@ -153,8 +153,8 @@ class XianyuReplyBot:
         ):
             return False
         if not deterministic:
-            # The first pass is deliberately broad. It returns structure only;
-            # existing deterministic business rules still own every answer.
+            # No high-confidence local rule resolved the text. The model may
+            # now provide structure, but local rules still own every answer.
             return True
         if deterministic.get("decision") in {"review", "clarify", "silent", "silent_review"}:
             return False

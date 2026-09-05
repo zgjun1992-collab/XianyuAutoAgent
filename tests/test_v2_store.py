@@ -659,7 +659,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("deny", result["decision"])
         self.assertEqual(
-            "暂未在可用门店中查询到沧州。\n\n该地区暂无可用门店，或请更换其他关键词查询。",
+            "当前适用门店资料中暂未查询到沧州。\n\n"
+            "建议您核对城市或完整门店名称，也可以更换其他地区查询。",
             result["reply"],
         )
 
@@ -729,6 +730,20 @@ class V2StoreTests(unittest.TestCase):
             extract_store_query("鱼酷武汉万象城支持吗", product_brand="鱼酷"),
         )
 
+    def test_repeated_title_prefix_provides_a_clean_chinese_brand_boundary(self):
+        product = {
+            "title": "【全国】鱼酷烤鱼2-3人套餐+鱼酷 活鱼烤鱼 烤鱼券 单条鱼",
+            "structured": {},
+        }
+        self.assertEqual("鱼酷", self.store.extract_brand(product))
+        self.assertEqual(
+            "任丘悦都汇店",
+            extract_store_query(
+                "鱼酷 任丘悦都汇店", product=product,
+                product_brand=self.store.extract_brand(product),
+            ),
+        )
+
     def test_store_negative_followup_uses_previous_unavailable_query(self):
         self.store.import_store_text(
             "【河南省】\n【郑州】郑州正弘城店", "郑州门店", ["10001"],
@@ -789,8 +804,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("deny", result["decision"])
         self.assertEqual(
-            "暂未在可用门店中查询到湖州。\n\n"
-            "该地区暂无可用门店，或请更换其他关键词查询。",
+            "当前适用门店资料中暂未查询到湖州。\n\n"
+            "建议您核对城市或完整门店名称，也可以更换其他地区查询。",
             result["reply"],
         )
         self.assertNotIn("杭州", result["reply"])
@@ -853,7 +868,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("西丽益田假日里店", fuzzy["reply"])
         missing = self.store.resolve_deterministic("10001", "焦作万达能用吗")
         self.assertEqual(
-            "可用门店中暂未查询到焦作万达店。\n\n该门店不可用，或请更换其他关键词查询。",
+            "当前适用门店资料中暂未查询到焦作万达店。\n\n"
+            "建议您核对完整门店名称，或更换其他门店查询。",
             missing["reply"],
         )
 
@@ -1377,6 +1393,17 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("same_day_use", result["kind"])
         self.assertIn("通常无法办理", result["reply"])
         self.assertIn("敬请理解", result["reply"])
+        self.assertNotIn("不退不补", result["reply"])
+
+    def test_same_day_confirmation_uses_polite_paragraphs(self):
+        self.store.save_v2_product(
+            "10001", "测试电子券", "请当天购买、当天使用，过期不退不补。",
+        )
+        result = self.store.resolve_deterministic("10001", "不是现在买了就要用吧")
+        self.assertEqual("same_day_use", result["kind"])
+        self.assertEqual(3, len(result["reply"].split("\n\n")))
+        self.assertIn("需要在购买当天使用", result["reply"])
+        self.assertIn("还请您理解", result["reply"])
         self.assertNotIn("不退不补", result["reply"])
 
     def test_store_query_discards_pronouns_and_accepts_city(self):
@@ -2604,8 +2631,8 @@ class V2StoreTests(unittest.TestCase):
             ),
             "消费235咋拍": (
                 "consumption_plan",
-                "235元消费的话，可以购买2张100元代金券，共支付108元，可抵扣200元。"
-                "剩余35元到店自行支付。当前同面额代金券每次最多使用2张。",
+                "235元消费的话，可以购买2张100元代金券，共支付108元，可抵扣200元。\n\n"
+                "剩余35元到店自行支付。\n\n当前同面额代金券每次最多使用2张。",
             ),
             "怎么发货": (
                 "delivery_usage",
@@ -2725,6 +2752,77 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("广州万达广场店", result["reply"])
         self.assertEqual(
             "可以使用。根据“寿光万达广场店”查询到可用门店：【寿光万达广场店】",
+            result["reply"],
+        )
+
+    def test_city_is_preserved_when_only_a_partial_landmark_is_typed(self):
+        self.store.import_store_text(
+            "【浙江省】\n【杭州】杭州城北万象城店\n"
+            "【江苏省】\n【南京】南京万象城店",
+            "万象城门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "杭州万象城能用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual(["杭州城北万象城店"], [
+            row["branch"] for row in result["store_matches"]
+        ])
+        self.assertNotIn("南京万象城店", result["reply"])
+
+    def test_empty_generic_branch_key_never_matches_an_unrelated_store(self):
+        self.store.import_store_text(
+            "【河北省】\n【秦皇岛】广场店", "门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "鱼酷 任丘悦都汇店")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual([], result.get("store_matches") or [])
+        self.assertNotIn("广场店可用", result["reply"])
+
+    def test_unverified_store_qualifier_requires_confirmation(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】印象城店", "武汉门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "青山印象城店")
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("candidate_confirmation", result["store_status"])
+        self.assertNotIn("可以使用", result["reply"])
+
+    def test_city_plural_query_does_not_reuse_previous_single_store(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】武昌万象城店、汉口万象城店",
+            "武汉门店", ["10001"],
+        )
+        previous = self.store.search_store("10001", "武昌万象城店")["matches"]
+        result = self.store.resolve_deterministic(
+            "10001", "武汉有那家店能用",
+            store_context={
+                "query": "武昌万象城店", "matches": previous,
+                "status": "available", "verified": True,
+            },
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("武昌万象城店", result["reply"])
+        self.assertIn("汉口万象城店", result["reply"])
+
+    def test_city_query_removes_colloquial_location_fillers(self):
+        self.store.import_store_text(
+            "【江苏省】\n【南京】新街口店、河西店", "南京门店", ["10001"],
+        )
+        self.assertEqual("南京", extract_store_query("南京这个点可以用吗"))
+        result = self.store.resolve_deterministic("10001", "南京这个点可以用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("新街口店", result["reply"])
+        self.assertIn("河西店", result["reply"])
+
+    def test_missing_voucher_plan_uses_one_fact_per_paragraph(self):
+        self.store.save_v2_product(
+            "10001", "100元代金券", "100元代金券：售价54.9元，最多叠加2张",
+        )
+        result = self.store.resolve_deterministic("10001", "有300元代金券吗")
+        self.assertEqual(
+            "当前商品没有300元代金券。\n\n"
+            "300元消费的话，可以购买2张100元代金券，共支付109.8元，可抵扣200元。\n\n"
+            "剩余100元到店自行支付。\n\n"
+            "当前同面额代金券每次最多使用2张。",
             result["reply"],
         )
 

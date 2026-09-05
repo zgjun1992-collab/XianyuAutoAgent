@@ -133,6 +133,10 @@ class XianyuLive:
         self._order_routes = {}
         self._store_contexts = {}
         self._query_contexts = {}
+        self._listing_status_cache = None
+        self.listing_status_ttl = max(
+            10.0, float(os.getenv("LISTING_STATUS_TTL", "60"))
+        )
 
     def emit_event(self, event_type, **payload):
         if self.event_callback:
@@ -826,6 +830,59 @@ class XianyuLive:
             "offline", "off_shelf", "offshelf", "deleted", "下架",
         }
 
+    @staticmethod
+    def _listing_card_identity(card):
+        """Return ``(item_id, is_onsale)`` from one marketplace list card."""
+        data = card.get("cardData") if isinstance(card, dict) else None
+        data = data if isinstance(data, dict) else (card if isinstance(card, dict) else {})
+        detail = data.get("detailParams") or {}
+        item_id = str(detail.get("itemId") or data.get("id") or "").strip()
+        raw_status = str(data.get("itemStatus", "")).strip().lower()
+        return item_id, raw_status in {"0", "onsale", "on_sale", "selling"}
+
+    async def refresh_current_listing_status(self, item_id, product):
+        """Refresh the listing gate before any first reply or business reply.
+
+        The complete seller list is cached briefly per live account.  A missing
+        product is considered offline only when pagination explicitly completed;
+        API failures preserve the last local state and are logged by the caller.
+        """
+        product = product or None
+        if not product or str(product.get("source_type") or "") != "goofish":
+            return product
+        now = time.monotonic()
+        cache = getattr(self, "_listing_status_cache", None)
+        ttl = float(getattr(self, "listing_status_ttl", 60.0))
+        if not cache or now - float(cache.get("checked_at") or 0) >= ttl:
+            cards = await asyncio.to_thread(self.xianyu.get_all_user_items, self.myid)
+            statuses = {}
+            for card in cards or []:
+                card_item_id, is_onsale = self._listing_card_identity(card)
+                if card_item_id:
+                    statuses[card_item_id] = is_onsale
+            cache = {
+                "checked_at": now,
+                "statuses": statuses,
+                "complete": bool(getattr(self.xianyu, "last_item_list_complete", False)),
+            }
+            self._listing_status_cache = cache
+
+        statuses = cache.get("statuses") or {}
+        remote_state = statuses.get(str(item_id))
+        if remote_state is None and not cache.get("complete"):
+            return product
+        normalized = "onsale" if remote_state else "offline"
+        if normalized == "offline" or normalized != str(product.get("item_status") or "").lower():
+            setter = getattr(self.app_store, "set_product_listing_status", None)
+            updated = setter(item_id, normalized) if setter else None
+            if updated:
+                return updated
+            product = dict(product)
+            product["item_status"] = normalized
+            if normalized == "offline":
+                product["enabled"] = 0
+        return product
+
     def prepare_product_first_reply(self, product):
         """Preserve an explicitly saved welcome; sanitize automatic drafts."""
         product = product or {}
@@ -1273,6 +1330,17 @@ class XianyuLive:
                 logger.debug("系统消息，跳过处理")
                 return
 
+            # Product state is a hard gate and must be fresh before the welcome.
+            # A stale two-day-old local sync must not let an offline listing send
+            # its old first reply, keyword rule or model answer.
+            if current_product:
+                try:
+                    current_product = await self.refresh_current_listing_status(
+                        item_id, current_product
+                    )
+                except Exception as exc:
+                    logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+
             product_offline = self.is_product_offline(current_product)
             first_reply_sent_now = False
             if current_product and not product_offline:
@@ -1372,9 +1440,22 @@ class XianyuLive:
             query_context.update(self._query_contexts.get(scope_id) or {})
             query_context.update(self._store_contexts.get(scope_id) or {})
 
-            # Interpret ordinary buyer language before business routing. This
-            # call returns structure only; existing local rules still own every
-            # fact, decision and buyer-visible reply.
+            # Resolve high-confidence business questions locally first.  The
+            # model is only an intent/slot parser for unresolved or genuinely
+            # compound messages; it never writes the final business answer.
+            if resolver and not image_match:
+                try:
+                    deterministic = resolver(
+                        item_id, send_message, actual_paid_amount,
+                        query_context or None,
+                        getattr(self, "_order_routes", {}).get(scope_id) or None,
+                    )
+                except TypeError:
+                    deterministic = resolver(item_id, send_message)
+
+            # For the small uncertain remainder, interpret buyer language into
+            # validated structure. Existing local rules still own every fact,
+            # decision, formatting rule and buyer-visible reply.
             semantic_checker = getattr(self.bot, "should_analyze_message", None)
             semantic_parser = getattr(self.bot, "analyze_message", None)
             semantic_resolver = getattr(self.app_store, "resolve_semantic_analysis", None)
@@ -1385,7 +1466,7 @@ class XianyuLive:
                 not product_offline and not image_match
                 and predecision.action != "replace" and semantic_checker
                 and semantic_parser and semantic_resolver
-                and semantic_checker(send_message, None)
+                and semantic_checker(send_message, deterministic)
             ):
                 try:
                     product_getter = getattr(self.app_store, "get_v2_product", None)
@@ -1418,17 +1499,7 @@ class XianyuLive:
                 except Exception as exc:
                     logger.warning(f"前置语义识别失败，继续使用原有规则：{exc}")
 
-            if resolver and not image_match:
-                try:
-                    deterministic = resolver(
-                        item_id, send_message, actual_paid_amount,
-                        query_context or None,
-                        getattr(self, "_order_routes", {}).get(scope_id) or None,
-                    )
-                except TypeError:
-                    deterministic = resolver(item_id, send_message)
-
-            # Apply the earlier structure only when the completed local result
+            # Apply model structure only when the completed local result
             # is eligible. Review/silent/system answers cannot be overridden.
             if (
                 semantic_mode == "on" and semantic_analysis
@@ -1470,10 +1541,28 @@ class XianyuLive:
                     if context_updater:
                         context_updater(scope_id, stored_context)
             if deterministic and "store_matches" in deterministic:
+                store_status = deterministic.get("store_status", "available")
+                store_matches = deterministic.get("store_matches", [])
+                trusted_qualities = {"exact", "contained", "area", "phonetic"}
+                verified_store_context = bool(
+                    store_status == "unavailable"
+                    or (
+                        store_status == "available" and store_matches
+                        and all(
+                            match.get("match_quality") in trusted_qualities
+                            and (
+                                match.get("match_quality") != "phonetic"
+                                or float(match.get("score") or 0) >= 0.94
+                            )
+                            for match in store_matches
+                        )
+                    )
+                )
                 next_store_context = {
                     "query": deterministic.get("store_query", ""),
-                    "matches": deterministic.get("store_matches", []),
-                    "status": deterministic.get("store_status", "available"),
+                    "matches": store_matches,
+                    "status": store_status,
+                    "verified": verified_store_context,
                     "store_sku_matrix": deterministic.get("store_sku_matrix", []),
                     "selected_sku_key": deterministic.get("query_context_update", {}).get(
                         "selected_sku_key", query_context.get("selected_sku_key", "")

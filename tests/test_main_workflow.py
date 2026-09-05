@@ -65,6 +65,58 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.send_msg = AsyncMock()
         return live
 
+    async def test_complete_live_listing_marks_absent_product_offline(self):
+        live = self.make_live()
+        live.listing_status_ttl = 60
+        live._listing_status_cache = None
+
+        class ListingApi:
+            last_item_list_complete = True
+
+            @staticmethod
+            def get_all_user_items(user_id):
+                return [{"cardData": {
+                    "id": "another-item", "itemStatus": 0,
+                    "detailParams": {"itemId": "another-item"},
+                }}]
+
+        statuses = []
+        live.xianyu = ListingApi()
+        live.app_store.set_product_listing_status = lambda item_id, status: (
+            statuses.append((item_id, status)) or {
+                "item_id": item_id, "source_type": "goofish",
+                "item_status": status, "enabled": int(status == "onsale"),
+            }
+        )
+        product = await live.refresh_current_listing_status("item-1", {
+            "item_id": "item-1", "source_type": "goofish",
+            "item_status": "onsale", "enabled": 1,
+        })
+        self.assertEqual("offline", product["item_status"])
+        self.assertEqual([("item-1", "offline")], statuses)
+
+    async def test_incomplete_live_listing_never_marks_absent_product_offline(self):
+        live = self.make_live()
+        live.listing_status_ttl = 60
+        live._listing_status_cache = None
+
+        class ListingApi:
+            last_item_list_complete = False
+
+            @staticmethod
+            def get_all_user_items(user_id):
+                return []
+
+        live.xianyu = ListingApi()
+        live.app_store.set_product_listing_status = lambda *args: self.fail(
+            "incomplete listing must not change local state"
+        )
+        source = {
+            "item_id": "item-1", "source_type": "goofish",
+            "item_status": "onsale", "enabled": 1,
+        }
+        self.assertIs(source, await live.refresh_current_listing_status("item-1", source))
+
     async def test_waiting_payment_uses_known_buyer_route_and_sends_once(self):
         live = self.make_live()
         event = {"1": "buyer-1@goofish", "3": {"redReminder": "等待买家付款"}}

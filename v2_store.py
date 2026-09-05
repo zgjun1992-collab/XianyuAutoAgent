@@ -758,6 +758,35 @@ class V2Store(AppStore):
                         (self._now(), row["item_id"]),
                     )
 
+    def set_product_listing_status(self, item_id: str, status: str) -> Optional[Dict]:
+        """Persist a freshly verified marketplace listing state.
+
+        This narrow status write is used by the live reply gate.  It never
+        touches knowledge, store bindings, first replies or SKU rules.
+        """
+        item_id = str(item_id or "").strip()
+        normalized = str(status or "").strip().lower()
+        if not item_id or normalized not in {"onsale", "offline"}:
+            raise ValueError("商品状态必须是 onsale 或 offline")
+        with self._connect() as conn:
+            if normalized == "offline":
+                cur = conn.execute(
+                    """UPDATE v2_products SET item_status='offline',enabled=0,
+                       sync_status='offline',last_synced_at=?,updated_at=? WHERE item_id=?""",
+                    (self._now(), self._now(), item_id),
+                )
+            else:
+                cur = conn.execute(
+                    """UPDATE v2_products SET item_status='onsale',
+                       enabled=CASE WHEN sync_status='offline' THEN 1 ELSE enabled END,
+                       sync_status=CASE WHEN manual_edited=1 THEN 'source_updated' ELSE 'synced' END,
+                       last_synced_at=?,updated_at=? WHERE item_id=?""",
+                    (self._now(), self._now(), item_id),
+                )
+            if not cur.rowcount:
+                return None
+        return self.get_v2_product(item_id)
+
     def save_ai_summary(self, item_id: str, summary: str, structured: Dict) -> Dict:
         current = self.get_v2_product(item_id)
         if not current:
@@ -2568,6 +2597,21 @@ class V2Store(AppStore):
         title = re.sub(
             r"^(?:自动发货|全国|现货|秒发)[\s·|丨+\-]*", "", title, flags=re.I
         ).strip()
+        # Marketplace titles often repeat the merchant before and after “+”,
+        # e.g. “鱼酷烤鱼2-3人套餐+鱼酷 活鱼烤鱼”.  The repeated Chinese prefix is
+        # a much safer brand boundary than consuming “烤鱼2-3人” into the brand.
+        title_parts = [part.strip() for part in re.split(r"[+丨|]", title) if part.strip()]
+        if len(title_parts) >= 2:
+            first = title_parts[0]
+            for part in title_parts[1:]:
+                common = []
+                for left, right in zip(first, part):
+                    if left != right or not ("\u4e00" <= left <= "\u9fff"):
+                        break
+                    common.append(left)
+                repeated = "".join(common).strip()
+                if 2 <= len(repeated) <= 8:
+                    return repeated
         match = re.match(
             r"(.{2,24}?)(?:\d+(?:[\/、]\d+)+|\d+(?:\.\d+)?(?:代|元)|代金券|电子券|团购券|套餐)",
             title,
@@ -3570,27 +3614,26 @@ class V2Store(AppStore):
         )
         remainder = target - covered
         contents = self._purchase_contents_label(option, quantity)
-        prefix = (
-            f"当前商品没有{self._format_number(target)}元代金券。"
-            if missing_denomination else ""
-        )
+        paragraphs = []
+        if missing_denomination:
+            paragraphs.append(f"当前商品没有{self._format_number(target)}元代金券。")
         price_phrase = (
             f"价格{self._format_number(total_price)}元"
             if coupon_count == 1 else f"共支付{self._format_number(total_price)}元"
         )
-        reply = prefix + (
+        paragraphs.append(
             f"{self._format_number(target)}元消费的话，可以购买{contents}，"
             f"{price_phrase}，可抵扣{self._format_number(covered)}元。"
         )
         if remainder > 0:
-            reply += f"剩余{self._format_number(remainder)}元到店自行支付。"
+            paragraphs.append(f"剩余{self._format_number(remainder)}元到店自行支付。")
             explicit_limit = bool(str(option.get("max_stack") or "").strip())
             if quantity >= maximum:
                 if explicit_limit:
-                    reply += f"当前同面额代金券每次最多使用{coupon_count}张。"
+                    paragraphs.append(f"当前同面额代金券每次最多使用{coupon_count}张。")
                 else:
-                    reply += "当前资料仅能确认以上使用方式，更多张能否同时使用暂未明确。"
-        return reply
+                    paragraphs.append("当前资料仅能确认以上使用方式，更多张能否同时使用暂未明确。")
+        return "\n\n".join(paragraphs)
 
     def _calculated_denomination_reply(self, product: Dict, requested_value: object) -> str:
         """Calculate a requested denomination from a real same-face SKU.
@@ -5785,7 +5828,20 @@ class V2Store(AppStore):
                         branch_hits.append(alias)
             if branch_hits:
                 best_alias = max(branch_hits, key=len)
+                # Without a grounded province/city/district, do not erase an
+                # extra buyer qualifier merely because the tail resembles a
+                # branch.  Example: “青山印象城店” must not silently become the
+                # unrelated bare “印象城店”. It will remain a fuzzy candidate
+                # that requires confirmation below.
+                if not row_area_hit:
+                    unexplained = query_key.replace(best_alias, "", 1)
+                    brand_key = normalize_match_text(row.get("brand"))
+                    if brand_key:
+                        unexplained = unexplained.replace(brand_key, "", 1)
+                    if len(unexplained) >= 2:
+                        continue
                 pieces = []
+                rendered_branch = branch if full_branch_hit else best_alias
                 for value, suffixes in (
                     (province, ("省", "市", "自治区", "特别行政区")),
                     (city, ("市",)),
@@ -5795,10 +5851,15 @@ class V2Store(AppStore):
                         continue
                     keys = [key for key, _ in variants(value, suffixes)]
                     if any(len(key) >= 2 and key in query_key for key in keys):
-                        current = normalize_match_text("".join(pieces) + branch)
+                        # Compare the area against the fragment that will
+                        # actually be returned.  The formal branch may contain
+                        # “杭州” while a buyer only typed “杭州万象城”; comparing
+                        # against the formal branch used to erase the city and
+                        # turn this into a cross-city “万象城” lookup.
+                        current = normalize_match_text("".join(pieces) + rendered_branch)
                         if not any(key and key in current for key in keys):
                             pieces.append(value)
-                pieces.append(branch if full_branch_hit else best_alias)
+                pieces.append(rendered_branch)
                 canonical = "".join(pieces)
                 row_candidates.append((len(best_alias), canonical))
 
@@ -6078,33 +6139,70 @@ class V2Store(AppStore):
                 address_key = ""
                 if re.search(r"(?:路|街|道|巷|号|大厦|中心)", search_term or query_norm):
                     address_key = self._store_fuzzy_key(item.get("address"))
+                # Generic labels such as “广场店” can normalize to an empty
+                # key.  Empty-string containment is always true in Python and
+                # previously let an unrelated “任丘悦都汇店” match that row.
+                branch_key = branch_key if len(branch_key) >= 2 else ""
+                local_branch_key = local_branch_key if len(local_branch_key) >= 2 else ""
+                combined_key = combined_key if len(combined_key) >= 2 else ""
+                address_key = address_key if len(address_key) >= 2 else ""
+
+                grounded_keys = [
+                    self._store_fuzzy_key(item.get(field))
+                    for field in ("brand", "province", "city", "district")
+                ]
+                unexplained = query_key
+                for grounded_key in sorted(
+                    (value for value in grounded_keys if len(value) >= 2),
+                    key=len, reverse=True,
+                ):
+                    unexplained = unexplained.replace(grounded_key, "", 1)
+                if branch_key:
+                    unexplained = unexplained.replace(branch_key, "", 1)
+                has_unverified_qualifier = bool(
+                    not (province_scope or city_scope or district_scope)
+                    and branch_key and branch_key in query_key
+                    and len(unexplained) >= 2
+                )
+
                 if not query_key:
                     score = 0.0
                     quality = "none"
-                elif query_key == branch_key or query_key == local_branch_key:
+                elif branch_key and (
+                    query_key == branch_key
+                    or (local_branch_key and query_key == local_branch_key)
+                ):
                     score = 1.1
                     quality = "exact"
                 elif (
-                    query_key in branch_key or branch_key in query_key
+                    (branch_key and query_key in branch_key)
+                    or (branch_key and branch_key in query_key and not has_unverified_qualifier)
                     or (
                         (province_scope or city_scope or district_scope)
+                        and local_branch_key
                         and (query_key in local_branch_key or local_branch_key in query_key)
                     )
                 ):
                     score = 1.02
                     quality = "contained"
-                elif query_key in combined_key or (address_key and query_key in address_key):
+                elif (
+                    (combined_key and query_key in combined_key)
+                    or (address_key and query_key in address_key)
+                ):
                     score = 1.0
                     quality = "contained"
                 else:
                     scores = [
-                        SequenceMatcher(None, query_key, branch_key).ratio(),
-                        SequenceMatcher(None, query_key, local_branch_key).ratio(),
-                        SequenceMatcher(None, query_key, combined_key).ratio(),
-                    ]
+                        SequenceMatcher(None, query_key, value).ratio()
+                        for value in (branch_key, local_branch_key, combined_key) if value
+                    ] or [0.0]
                     if address_key:
                         scores.append(SequenceMatcher(None, query_key, address_key).ratio())
                     score = max(scores)
+                    if has_unverified_qualifier:
+                        # Keep a plausible tail as a confirmation candidate,
+                        # never as a positive availability match.
+                        score = max(score, 0.8)
                     if (
                         (province_scope or city_scope or district_scope)
                         and self._within_one_edit(query_key, local_branch_key)
@@ -6326,13 +6424,16 @@ class V2Store(AppStore):
         }
         if area_only or area_key in known_areas:
             return (
-                f"暂未在可用门店中查询到{value}。\n\n"
-                "该地区暂无可用门店，或请更换其他关键词查询。"
+                f"当前适用门店资料中暂未查询到{value}。\n\n"
+                "建议您核对城市或完整门店名称，也可以更换其他地区查询。"
             )
         commercial_words = ("万达", "万象城", "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里")
         if any(word in value for word in commercial_words) and not value.endswith(("店", "商场", "广场", "购物中心")):
             value += "店"
-        return f"可用门店中暂未查询到{value}。\n\n该门店不可用，或请更换其他关键词查询。"
+        return (
+            f"当前适用门店资料中暂未查询到{value}。\n\n"
+            "建议您核对完整门店名称，或更换其他门店查询。"
+        )
 
     @classmethod
     def is_explicit_store_query(cls, message: str, query: str, result: Optional[Dict] = None) -> bool:
@@ -6379,6 +6480,8 @@ class V2Store(AppStore):
             r"商圈|商场|广场|购物中心|门店|分店|店)$",
             raw_query,
         ):
+            return True
+        if re.search(r"(?:门店|分店|店)$", compact_message):
             return True
         # A bare store name is accepted only for an exact/contained branch-name
         # match. A weak fuzzy result is not enough to invent store intent.
@@ -7223,7 +7326,7 @@ class V2Store(AppStore):
             "offline", "off_shelf", "offshelf", "deleted", "下架",
         }:
             return {
-                "reply": "您好，该商品目前已下架，暂时无法购买。",
+                "reply": "您好，该商品目前已下架，暂时无法购买，感谢您的关注。",
                 "source": "当前商品已下架",
                 "decision": "allow",
                 "kind": "offline",
@@ -7896,6 +7999,30 @@ class V2Store(AppStore):
                 "decision": "deny",
                 "kind": "same_day_use",
             }
+        same_day_confirmation = bool(re.search(
+            r"(?:现在|今天).{0,10}(?:买|购买|拍|下单).{0,10}(?:就|马上|当天).{0,5}(?:用|使用)|"
+            r"(?:买|购买|拍|下单)(?:了|后)?(?:是不是|是否|就)?(?:要|得|需要|必须)?"
+            r"(?:马上|当天|现在)?(?:用|使用)|"
+            r"(?:是不是|是否|必须|需要).{0,5}当天.{0,3}(?:用|使用)",
+            message,
+        ))
+        if same_day_confirmation:
+            effective_policy = policy_text()
+            same_day_required = bool(re.search(
+                r"当天[^。；\n]{0,10}(?:购买|使用)|(?:购买|使用)[^。；\n]{0,10}当天",
+                effective_policy,
+            ))
+            if same_day_required:
+                return {
+                    "reply": (
+                        "是的，这款券需要在购买当天使用。\n\n"
+                        "您可以确定到店时间后再下单，这样可以避免卡券提前过期。\n\n"
+                        "如果当天未使用，卡券过期后将无法退款或补发，还请您理解。"
+                    ),
+                    "source": "购买当天使用规则",
+                    "decision": "allow",
+                    "kind": "same_day_use",
+                }
         stockpile_question = any(word in message for word in (
             "囤货", "囤券", "囤一年", "长期囤", "先买着", "提前买", "先买以后用",
         ))
@@ -8167,20 +8294,25 @@ class V2Store(AppStore):
                 "kind": "stores_scope",
             }
 
-        referential_store = any(
+        explicit_area_list_query = bool(
+            any(self._admin_key(city) in self._admin_key(message) for city in KNOWN_CITY_NAMES)
+            and re.search(r"(?:有|都)?(?:哪家|那家|哪些|哪几家|几家|所有).{0,4}(?:门店|店)?", message)
+        )
+        referential_store = not explicit_area_list_query and any(
             word in message for word in ("这家店", "这个店", "该店", "那里", "刚才那家", "那家店")
         )
         # A buyer commonly sends the store name first and follows with only
         # “可以用吗/能用吗”.  When this conversation already has a store result,
         # treat these short confirmations as referring to that result.
-        short_store_confirmation = bool(store_context) and bool(
+        trusted_store_context = bool(store_context) and bool(store_context.get("verified", True))
+        short_store_confirmation = trusted_store_context and bool(
             re.fullmatch(
                 r"(?:这边|这里|那里|它|这个|该店)?(?:可以|能|可)(?:在这)?用(?:吗|嘛|不|么)*[？?。！!]*",
                 compact,
             )
         )
         referential_store = referential_store or short_store_confirmation
-        if referential_store and store_context:
+        if referential_store and trusted_store_context:
             matches = list(store_context.get("matches") or [])
             if matches:
                 if len(matches) == 1:
@@ -8561,6 +8693,8 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "哪些门店能使用", "哪些门店能用", "哪些店能使用", "哪些店能用",
         "哪里可以使用", "哪里可以用", "哪里能使用", "哪里能用",
         "有哪几家门店", "有哪几家店", "有哪几家", "有什么门店", "有什么店",
+        "有哪家门店", "有哪家店", "有那家门店", "有那家店",
+        "有那些门店", "有那些店", "有哪些门店", "有哪些店",
         "这个券", "这张券", "该券", "能不能使用", "能不能用", "可不可以使用", "可不可以用",
         "不能使用吗", "不能用吗", "不可以使用吗", "不可以用吗", "不可使用吗", "不可用吗",
         "可以使用嘛", "可以使用吗", "可以用嘛", "能用嘛", "可用嘛",
@@ -8575,11 +8709,14 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "多少钱", "多钱", "什么价格", "价格多少", "价钱", "售价", "什么价", "怎么卖",
         "今天什么优惠", "今日什么优惠", "现在什么优惠", "当前什么优惠",
         "有什么优惠", "有啥优惠", "什么优惠", "优惠活动", "活动", "优惠", "折扣",
+        "这个点", "那个点", "这个地方", "那个地方", "这个位置", "那个位置",
+        "这里", "这边", "当地", "那边",
     ):
         text = text.replace(phrase, " ")
     text = re.sub(r"[~～。！!，,、：:]+", " ", text)
     text = re.sub(r"(?:都)?(?:有哪些|有哪几家|哪些|哪里|哪儿|有什么)\s*$", " ", text)
     text = re.sub(r"\b(?:该|这个|那个|这里|那里|不|使用|您好|你好)\b", " ", text)
+    text = re.sub(r"(?:这个|那个|这里|这边|当地|那边)\s*$", " ", text)
     text = re.sub(r"(?:^|\s)有\s*$|有\s*$", " ", text)
     # Strip Latin brand/product tokens only when they are known to belong to
     # the current product.  This fixes glued queries such as

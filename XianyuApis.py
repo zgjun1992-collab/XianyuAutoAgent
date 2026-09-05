@@ -405,11 +405,16 @@ class XianyuApis:
         """Aggregate all cards and let the caller filter itemStatus=0 (on sale)."""
         cards = []
         page_state = {}
+        # Consumers may only treat an absent item as offline after the complete
+        # paginated listing has been read.  Keep this explicit so a transient
+        # page-limit/network condition can never take an active product down.
+        self.last_item_list_complete = False
         for page_number in range(1, max_pages + 1):
             result = self.get_user_items(user_id, page_number, page_size, page_state)
             data = result.get("data") or {}
             cards.extend(data.get("cardList") or [])
             if not data.get("nextPage"):
+                self.last_item_list_complete = True
                 break
             page_state.update({
                 "nextPageModel": data.get("nextPageModel"),
