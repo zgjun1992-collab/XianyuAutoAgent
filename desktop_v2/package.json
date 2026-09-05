@@ -36,7 +36,7 @@
     ],
     "extraResources": [
       {
-        "from": "../dist-v3-backend",
+        "from": "../dist-v3-release-backend",
         "to": "backend",
         "filter": [
           "**/*"

@@ -15,6 +15,7 @@ dist/
 dist-v2-backend/
 build-v2-backend/
 dist-v3-backend/
+dist-v3-release-backend/
 build-v3-backend/
 desktop_v2/node_modules/
 desktop_v2/dist/
