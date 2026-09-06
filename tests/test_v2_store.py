@@ -3039,5 +3039,95 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("72小时", reserved["reply"])
 
 
+    def test_multi_sku_catalog_labels_time_and_hides_zero_stock(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5, "status": "active"},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "周末可用", "stock": 3, "status": "active"},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "法定节假日可用", "stock": 0, "status": "sold_out"},
+            ], "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "代金券还有嘛")
+        self.assertIn(result["kind"], {"coupon_catalog", "sku_availability"})
+        self.assertIn("工作日可用", result["reply"])
+        self.assertIn("周末可用", result["reply"])
+        self.assertNotIn("79.5", result["reply"])
+
+    def test_weekend_expansion_lists_only_in_stock_weekend_skus(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+            ], "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "周末通用的还有吗")
+        self.assertEqual("sku_availability", result["kind"])
+        self.assertIn("周末可用", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
+
+    def test_catalog_display_feedback_repeats_time_labels(self):
+        self.store.save_v2_product(
+            "10001", "分时代金券",
+            "100元代金券：售价66.8元，工作日可用\n100元代金券：售价79.5元，周末可用",
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "没看到", store_context={"last_sku_catalog": True},
+        )
+        self.assertEqual("coupon_catalog", result["kind"])
+        self.assertIn("工作日可用", result["reply"])
+        self.assertIn("周末可用", result["reply"])
+
+    def test_price_change_operation_is_not_bargaining(self):
+        result = self.store.resolve_deterministic("10001", "改个价")
+        self.assertEqual("price_change_clarify", result["kind"])
+        self.assertIn("改成多少元", result["reply"])
+
+    def test_meal_period_statement_uses_real_matching_option(self):
+        self.store.save_v2_product(
+            "10001", "分时自助",
+            "午餐单人自助：售价88元\n晚餐单人自助：售价118元",
+        )
+        result = self.store.resolve_deterministic("10001", "中午就餐")
+        self.assertEqual("sku_availability", result["kind"])
+        self.assertIn("88元", result["reply"])
+        self.assertNotIn("118元", result["reply"])
+
+    def test_in_store_purchase_question_is_not_a_store_name(self):
+        result = self.store.resolve_deterministic("10001", "现在在门店，能买吗")
+        self.assertEqual("stock", result["kind"])
+        self.assertIn("当前商品仍在售", result["reply"])
+
+    def test_store_query_strips_instant_words_from_branch(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】宝安总店", "深圳门店", ["10001"],
+        )
+        self.assertEqual("宝安总店", extract_store_query("宝安总店现在马上能用吗"))
+        result = self.store.resolve_deterministic("10001", "宝安总店现在马上能用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("宝安总店", result["reply"])
+
+    def test_brand_and_city_store_query_is_split(self):
+        path = os.path.join(self.temp.name, "ikea-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "区/县", "地址"])
+        sheet.append(["宜家", "武汉商场店", "湖北", "武汉", "硚口区", "张毕湖路"])
+        sheet.append(["宜家", "深圳商场店", "广东", "深圳", "南山区", "北环大道"])
+        book.save(path)
+        self.store.import_store_list(path, "宜家门店", ["10001"])
+        result = self.store.resolve_deterministic("10001", "宜家武汉")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("武汉商场店", result["reply"])
+        self.assertNotIn("深圳商场店", result["reply"])
+
+
 if __name__ == "__main__":
     unittest.main()

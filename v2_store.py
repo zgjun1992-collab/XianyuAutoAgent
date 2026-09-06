@@ -1869,7 +1869,8 @@ class V2Store(AppStore):
         text = str(message or "")
         use_intent = bool(re.search(
             r"(?:能不能|可不可以|是否|能|可以|可|不能|不可以|不可).{0,3}(?:使用|用|核销)|"
-            r"(?:使用|用|核销).{0,3}(?:吗|嘛|么|不|不了)", text,
+            r"(?:使用|用|核销).{0,3}(?:吗|嘛|么|不|不了)|"
+            r"(?:通用|可用).{0,4}(?:还有|其他|别的)|(?:还有|其他|别的).{0,4}(?:通用|可用)", text,
         ))
         if not use_intent:
             return None
@@ -1976,6 +1977,18 @@ class V2Store(AppStore):
                 "reply": f"不可以，当前商品没有适用于{label}的规格。",
                 "source": f"当前商品规格的{label}适用范围", "decision": "allow",
                 "kind": "day_use",
+            }
+        expansion = bool(re.search(r"还有|其他|别的|另外|换一", text))
+        if expansion and compatible:
+            brand = self.extract_brand(product)
+            return {
+                "reply": f"有的，当前商品{label}可用的规格如下：\n" + "\n".join(
+                    self.format_product_option(option, brand, show_time=True)
+                    for option in compatible
+                ),
+                "source": f"当前商品真实SKU的{label}适用范围",
+                "decision": "allow", "kind": "sku_availability",
+                "query_context_update": {"last_sku_catalog": True},
             }
         if len(named) == 1:
             subject = self._sku_public_label(named[0])
@@ -2207,7 +2220,8 @@ class V2Store(AppStore):
             r"有吗|有没有|有无|有么|有嘛|有哪些|有什么|还有吗|有货吗|"
             r"能拍吗|可以拍吗|能买到吗|能不能买|卖不卖|"
             r"能不能(?:使用|用)|可不可以(?:使用|用)|是否可用|"
-            r"可以(?:使用|用)|能(?:使用|用)|可用",
+            r"可以(?:使用|用)|能(?:使用|用)|可用|"
+            r"(?:中午|午餐|午市|晚上|晚餐|晚市|下午茶).{0,4}(?:就餐|吃|用餐)",
             text,
         ))
         previous = dict((query_context or {}).get("price_filters") or {})
@@ -2725,15 +2739,25 @@ class V2Store(AppStore):
         brand = re.sub(r"(?:西餐厅|餐厅|品牌)$", "", brand).strip()
         return brand
 
-    @staticmethod
-    def format_product_option(option: Dict, brand: str = "") -> str:
+    @classmethod
+    def format_product_option(cls, option: Dict, brand: str = "", show_time: bool = False) -> str:
         name = option.get("name") or (
             f"{option.get('face_value')}元代金券" if option.get("face_value") else "商品规格"
         )
         if brand and normalize_text(brand) not in normalize_text(name):
             name = f"{brand}{name}"
-        # Time windows are shown once in the usage section, not per SKU.
         details = []
+        if show_time:
+            day_types = cls._option_day_types(option)
+            labels = [
+                label for key, label in (
+                    ("weekday", "工作日可用"), ("weekend", "周末可用"),
+                    ("holiday", "法定节假日可用"), ("any", "每日可用"),
+                ) if key in day_types
+            ]
+            time_label = "/".join(labels) or str(option.get("applicable_time") or "").strip()
+            if time_label:
+                name = f"{name}（{time_label}）"
         if option.get("sale_price"):
             details.append(f"售价{option['sale_price']}元")
         if option.get("composition"):
@@ -3211,8 +3235,10 @@ class V2Store(AppStore):
             price = self._format_number(product.get("price") or "")
             suffix = f"，当前售价{price}元" if price else ""
             return f"当前商品没有代金券选项，售卖的是{title}{suffix}。"
+        signatures = {tuple(sorted(self._option_day_types(option))) for option in options}
+        show_time = len(options) > 1 and len(signatures) > 1
         return "当前可选代金券如下：\n" + "\n".join(
-            self.format_product_option(option, brand) for option in options
+            self.format_product_option(option, brand, show_time=show_time) for option in options
         )
 
     @classmethod
@@ -6219,7 +6245,16 @@ class V2Store(AppStore):
                 str(row["branch"] or row["brand"] or "")
             )
         ]
-        resolved_query = self._best_location_query(rows, query)
+        original_scope = self._extract_store_scope(rows, query_norm)
+        original_area = any(original_scope[:3])
+        original_term = self._store_fuzzy_key(original_scope[3])
+        exact_brand_area_query = original_area and any(
+            original_term == self._store_fuzzy_key(row.get("brand"))
+            for row in rows if row.get("brand")
+        )
+        # “宜家武汉/武汉宜家” already contains two reliable entities. Fuzzy
+        # branch recovery must not rewrite it to an invented full branch name.
+        resolved_query = "" if exact_brand_area_query else self._best_location_query(rows, query)
         if resolved_query:
             query = resolved_query
             query_norm = normalize_text(query)
@@ -7537,6 +7572,33 @@ class V2Store(AppStore):
             if previous_payment_state in {"paid", "unpaid"}:
                 payment_state = previous_payment_state
 
+        if compact in {"没看到", "没有看到", "没显示", "没有显示", "哪里写了", "没标注", "没有标注"}:
+            if query_context.get("last_sku_catalog"):
+                return {
+                    "reply": self.coupon_catalog_reply(product),
+                    "source": "重新展示当前商品SKU及其适用时间",
+                    "decision": "allow", "kind": "coupon_catalog",
+                    "query_context_update": {"last_sku_catalog": True},
+                }
+
+        if re.fullmatch(r"(?:请)?(?:帮我)?(?:改个价|改价|修改价格|价格改一下)", compact):
+            return {
+                "reply": "请问需要改成多少元？请发送您要购买的规格和目标金额。",
+                "source": "改价操作缺少目标规格或金额",
+                "decision": "allow", "kind": "price_change_clarify",
+            }
+
+        if re.fullmatch(
+            r"(?:我)?现在(?:已经)?在(?:店里|门店|现场)(?:了)?(?:能|可以|可不可以|能不能)"
+            r"(?:买|购买|下单|拍)(?:券|这个|该商品)?(?:吗|嘛|么)?",
+            compact,
+        ):
+            return {
+                "reply": "可以，当前商品仍在售；请先按页面下单，并按商品规则在使用当天购买、当天使用。",
+                "source": "当前商品在售状态与购买规则",
+                "decision": "allow", "kind": "stock",
+            }
+
         refund_request = bool(re.search(
             r"退款|退货|退钱|退一下|申请退|可以退|能退|退吗|给我退|帮我退|"
             r"我要退|想退|退了吧|退掉|退\s*\d+(?:\.\d+)?%|取消退款|取消订单",
@@ -7886,6 +7948,7 @@ class V2Store(AppStore):
                 "source": "当前商品真实SKU列表",
                 "decision": "allow",
                 "kind": "coupon_catalog",
+                "query_context_update": {"last_sku_catalog": True},
             }
 
         value_confirmation = self.voucher_value_confirmation_reply(product, message)
@@ -8469,6 +8532,8 @@ class V2Store(AppStore):
                 "source": "当前商品真实规格列表",
                 "decision": "allow",
                 "kind": "sku_availability",
+                **({"query_context_update": {"last_sku_catalog": True}}
+                   if re.search(r"代金券|优惠券|券型|面额", message) else {}),
             }
 
         all_store_question = bool(re.search(
@@ -8909,6 +8974,7 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "多少钱", "多钱", "什么价格", "价格多少", "价钱", "售价", "什么价", "怎么卖",
         "今天什么优惠", "今日什么优惠", "现在什么优惠", "当前什么优惠",
         "有什么优惠", "有啥优惠", "什么优惠", "优惠活动", "活动", "优惠", "折扣",
+        "现在马上", "现在", "马上", "立即", "立刻",
         "这个点", "那个点", "这个地方", "那个地方", "这个位置", "那个位置",
         "这里", "这边", "当地", "那边",
     ):

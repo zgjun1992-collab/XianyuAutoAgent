@@ -897,7 +897,7 @@ class XianyuLive:
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
         message="",
     ):
-        """Send the product welcome only for a pure first-turn greeting."""
+        """Send an enabled product welcome once, before every first-turn answer."""
         if (
             self.is_product_offline(product)
             or int((conversation or {}).get("first_reply_sent", 0))
@@ -906,13 +906,6 @@ class XianyuLive:
                 (product or {}).get("first_reply_text"),
             )
         ):
-            return False
-
-        if message and not self.should_send_first_reply(message):
-            # A concrete first-turn question should receive its answer directly.
-            # Consume the welcome flag so a long introduction is not injected on
-            # the buyer's next message either.
-            self.app_store.mark_first_reply_sent(scope_id)
             return False
 
         lock_map = getattr(self, "_first_reply_locks", None)
