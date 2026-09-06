@@ -895,8 +895,9 @@ class XianyuLive:
 
     async def send_required_first_reply(
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
+        message="",
     ):
-        """Send one durable product welcome before every other first-turn response."""
+        """Send the product welcome only for a pure first-turn greeting."""
         if (
             self.is_product_offline(product)
             or int((conversation or {}).get("first_reply_sent", 0))
@@ -905,6 +906,13 @@ class XianyuLive:
                 (product or {}).get("first_reply_text"),
             )
         ):
+            return False
+
+        if message and not self.should_send_first_reply(message):
+            # A concrete first-turn question should receive its answer directly.
+            # Consume the welcome flag so a long introduction is not injected on
+            # the buyer's next message either.
+            self.app_store.mark_first_reply_sent(scope_id)
             return False
 
         lock_map = getattr(self, "_first_reply_locks", None)
@@ -1347,7 +1355,7 @@ class XianyuLive:
                 try:
                     first_reply_sent_now = await self.send_required_first_reply(
                         websocket, chat_id, send_user_id, scope_id, item_id,
-                        current_product, conversation,
+                        current_product, conversation, send_message,
                     )
                     if first_reply_sent_now:
                         await asyncio.sleep(0.25)

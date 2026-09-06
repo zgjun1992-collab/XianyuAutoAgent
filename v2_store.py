@@ -1882,9 +1882,58 @@ class V2Store(AppStore):
         else:
             return None
 
-        knowledge = "\n".join((
-            str(product.get("raw_text") or ""), str(product.get("ai_summary") or ""),
-        ))
+        options = self.extract_sale_options(product)
+        requested_amount = self._requested_price_amount(text)
+        if not requested_amount:
+            face_match = re.search(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*(?:的)?\s*(?:代金券|优惠券|券)",
+                text,
+            )
+            if face_match:
+                requested_amount = self._format_number(face_match.group(1))
+        amount_scoped = False
+        if requested_amount:
+            amount_options = [
+                option for option in options
+                if self._format_number(option.get("face_value")) == requested_amount
+                or bool(re.search(
+                    rf"(?<![\d.]){re.escape(requested_amount)}(?:\.0+)?\s*(?:元|块|面额|选项)",
+                    str(option.get("name") or ""),
+                ))
+            ]
+            if not amount_options:
+                return {
+                    "reply": f"当前商品没有{requested_amount}元这一已确认的在售规格。",
+                    "source": "当前商品真实SKU列表", "decision": "allow",
+                    "kind": "day_use",
+                }
+            options = amount_options
+            amount_scoped = True
+
+        named = self.match_message_skus(str(product.get("item_id") or ""), text, product)
+        if len(named) == 1:
+            named_options = [
+                option for option in options
+                if self.sku_key_for_option(option) == named[0]["sku_key"]
+            ]
+            if named_options:
+                options = named_options
+
+        # A denial belonging to one SKU must never disable every other SKU.
+        # Once the buyer names a face value/specification, inspect only that
+        # option's own name/time fields. Product-wide prose remains the fallback
+        # for genuinely generic questions such as “周末能用吗”.
+        scoped = amount_scoped or len(named) == 1
+        knowledge = (
+            "\n".join(
+                " ".join(str(option.get(key) or "") for key in ("name", "applicable_time"))
+                for option in options
+            )
+            if scoped else
+            "\n".join((
+                str(product.get("raw_text") or ""), str(product.get("ai_summary") or ""),
+            ))
+        )
         explicit_denial = {
             "weekend": (
                 r"(?:周末|周六|周日|星期[六日天]|礼拜[六日天])[^。；\n]{0,12}(?:不可用|不能用|不适用)|"
@@ -1905,12 +1954,7 @@ class V2Store(AppStore):
                 "kind": "day_use",
             }
 
-        options = self.extract_sale_options(product)
-        named = self.match_message_skus(str(product.get("item_id") or ""), text, product)
-        if len(named) == 1:
-            options = [option for option in options
-                       if self.sku_key_for_option(option) == named[0]["sku_key"]]
-        elif len(options) > 1:
+        if not scoped and len(options) > 1:
             signatures = {tuple(sorted(option.get("day_types") or [])) for option in options}
             if len(signatures) > 1:
                 return {
@@ -1933,7 +1977,12 @@ class V2Store(AppStore):
                 "source": f"当前商品规格的{label}适用范围", "decision": "allow",
                 "kind": "day_use",
             }
-        subject = self._sku_public_label(named[0]) if len(named) == 1 else "该券"
+        if len(named) == 1:
+            subject = self._sku_public_label(named[0])
+        elif requested_amount:
+            subject = f"{requested_amount}元代金券"
+        else:
+            subject = "该券"
         return {
             "reply": f"可以，{subject}{label}在适用门店营业时间内可以使用；商品明确标注的特殊不可用日期除外。",
             "source": "无特别限制时默认适用门店营业时间内可用",
@@ -2322,6 +2371,62 @@ class V2Store(AppStore):
             if option.get("option_type") == "voucher" and option.get("face_value")
         ]
         package_matches = [option for option in matched if option.get("option_type") == "package"]
+
+        # Prefer an exact people-count package. If none exists, a clearly
+        # identified unrestricted single-person option can safely be multiplied
+        # by the requested party size. Identity fares and explicit one-item
+        # purchase limits are deliberately excluded.
+        people_count = slots.get("people_count")
+        if (
+            people_count and int(people_count) > 1 and not matched
+            and effective_intent == "price"
+        ):
+            time_compatible = [
+                option for option in options
+                if self._option_matches_time(
+                    option, slots.get("day_type", ""), slots.get("meal_period", ""),
+                    holiday_covers_weekend,
+                )
+            ]
+            if slots.get("day_type"):
+                specific = [
+                    option for option in time_compatible
+                    if slots["day_type"] in (option.get("day_types") or [])
+                    or (holiday_covers_weekend and "holiday" in (option.get("day_types") or []))
+                ]
+                if specific:
+                    time_compatible = specific
+            if slots.get("meal_period"):
+                specific = [
+                    option for option in time_compatible
+                    if slots["meal_period"] in (option.get("meal_periods") or [])
+                ]
+                if specific:
+                    time_compatible = specific
+            single_options = []
+            for option in time_compatible:
+                evidence = " ".join(str(option.get(key) or "") for key in ("name", "applicable_time"))
+                if (
+                    option.get("option_type") == "package"
+                    and (option.get("people_counts") or []) == [1]
+                    and not (option.get("audience_types") or [])
+                    and not re.search(r"(?:每单|每人|限购|仅限购买|最多购买)\s*1\s*(?:份|张|套|个)", evidence)
+                ):
+                    single_options.append(option)
+            if len(single_options) == 1:
+                option = single_options[0]
+                total = Decimal(str(option.get("sale_price"))) * int(people_count)
+                name = str(option.get("name") or "单人商品").strip()
+                return {
+                    "reply": (
+                        f"{people_count}人需要购买{people_count}份{name}，"
+                        f"单价{self._format_number(option.get('sale_price'))}元，"
+                        f"共{self._format_number(total)}元。"
+                    ),
+                    "source": "当前日期可用的单人商品规格与人数换算",
+                    "decision": "allow", "kind": "price",
+                    "query_context_update": context_update,
+                }
 
         # “一条鱼/单条/整条” is an ordinary package description, not a literal
         # option name. Narrow to fish packages when possible.
@@ -2793,12 +2898,19 @@ class V2Store(AppStore):
                 return ""
             requested = self._format_number(lookup.group(1))
             options = self.extract_product_options(product)
+            day_prefix = ""
+            if self._has_explicit_day_options(options):
+                day_type = self._requested_day_type(message, default_today=True)
+                options = self._filter_options_for_day(options, day_type)
+                day_prefix = self._day_reply_prefix(message, day_type)
+                if not options:
+                    return f"{day_prefix}当前商品没有该日期适用的在售代金券。"
             by_face = next((
                 option for option in options
                 if self._format_number(option.get("face_value")) == requested
             ), None)
             if by_face:
-                return (
+                return day_prefix + (
                     f"{requested}元代金券当前售价"
                     f"{self._format_number(by_face.get('sale_price'))}元，"
                     f"共可抵扣{requested}元。"
@@ -2809,16 +2921,23 @@ class V2Store(AppStore):
             ), None)
             if by_price:
                 face = self._format_number(by_price.get("face_value"))
-                return f"当前售价{requested}元对应{face}元代金券，共可抵扣{face}元。"
+                return day_prefix + f"当前售价{requested}元对应{face}元代金券，共可抵扣{face}元。"
             faces = sorted({
                 self._format_number(option.get("face_value")) for option in options
                 if option.get("face_value")
             }, key=Decimal)
             suffix = f"当前已确认面额为{'、'.join(value + '元' for value in faces)}。" if faces else ""
-            return f"当前商品没有{requested}元这一已确认的代金券规格。{suffix}"
+            return day_prefix + f"当前商品没有{requested}元这一已确认的代金券规格。{suffix}"
         paid = self._format_number(match.group(1))
         face = self._format_number(match.group(2))
         options = self.extract_product_options(product)
+        day_prefix = ""
+        if self._has_explicit_day_options(options):
+            day_type = self._requested_day_type(message, default_today=True)
+            options = self._filter_options_for_day(options, day_type)
+            day_prefix = self._day_reply_prefix(message, day_type)
+            if not options:
+                return f"{day_prefix}当前商品没有该日期适用的在售代金券。"
         exact = next((
             option for option in options
             if self._format_number(option.get("sale_price")) == paid
@@ -2826,7 +2945,7 @@ class V2Store(AppStore):
         ), None)
         if exact:
             contents = self._purchase_contents_label(exact)
-            return (
+            return day_prefix + (
                 f"是的，售价{paid}元，购买后发放{contents}，"
                 f"共可抵扣{face}元。"
             )
@@ -2850,7 +2969,7 @@ class V2Store(AppStore):
             if unit_paid * quantity != asked_paid:
                 continue
             contents = self._purchase_contents_label(option, quantity)
-            return (
+            return day_prefix + (
                 f"是的，售价{paid}元，购买后发放{contents}，"
                 f"共可抵扣{face}元。"
             )
@@ -2862,7 +2981,7 @@ class V2Store(AppStore):
         if same_face:
             actual_price = self._format_number(same_face.get("sale_price"))
             contents = self._purchase_contents_label(same_face)
-            return (
+            return day_prefix + (
                 f"不是，{face}元代金券当前售价{actual_price}元，"
                 f"购买后发放{contents}。"
             )
@@ -2874,7 +2993,7 @@ class V2Store(AppStore):
         if same_price:
             actual_face = self._format_number(same_price.get("face_value"))
             contents = self._purchase_contents_label(same_price)
-            return (
+            return day_prefix + (
                 f"当前售价{paid}元对应{actual_face}元代金券，"
                 f"购买后发放{contents}。"
             )
@@ -5334,12 +5453,40 @@ class V2Store(AppStore):
     ) -> Optional[Dict]:
         """Resolve a strict yes/ordinal reply against locally stored candidates."""
         context = store_context if isinstance(store_context, dict) else {}
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
+        all_candidates = list(
+            context.get("pending_store_candidates") or context.get("matches") or []
+        )
+
+        # A short area answer such as “武汉的” narrows the stores returned by
+        # the immediately preceding query. Do not discard that candidate set and
+        # start a fresh literal search for the meaningless suffix “的”.
+        area_text = re.sub(r"(?:的|那边|这边|地区|门店|店)$", "", compact)
+        area_key = self._area_key(area_text)
+        if area_key and len(all_candidates) > 1:
+            area_matches = [
+                row for row in all_candidates
+                if area_key in {
+                    self._area_key(row.get("province")),
+                    self._area_key(row.get("city")),
+                    self._area_key(row.get("district")),
+                }
+            ]
+            if area_matches:
+                query = area_text
+                return {
+                    "reply": self.format_store_matches(area_matches, query, message),
+                    "source": "当前会话最近一次门店候选按地区缩小范围",
+                    "decision": "allow", "kind": "stores",
+                    "store_matches": area_matches, "store_query": query,
+                    "store_status": "available",
+                }
+
         if context.get("status") != "candidate_confirmation":
             return None
         candidates = list(context.get("pending_store_candidates") or context.get("matches") or [])[:3]
         if not candidates:
             return None
-        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
         selected_index = None
         if len(candidates) == 1 and re.fullmatch(r"(?:是|是的|对|对的|嗯|好的|可以|没错|就是)", compact):
             selected_index = 0
@@ -7650,15 +7797,50 @@ class V2Store(AppStore):
                 "kind": "greeting",
             }
 
+        previous_price = dict((query_context or {}).get("price_filters") or {})
+        if previous_price.get("target_amount") and re.search(
+            r"(?:不是|不对|不一样|变价|价格有误|价格错了).{0,8}\d+(?:\.\d+)?|"
+            r"\d+(?:\.\d+)?.{0,8}(?:不是|不对|不一样|变价)",
+            message,
+        ):
+            options = self.extract_product_options(product)
+            day_type = str(previous_price.get("day_type") or "")
+            if day_type:
+                options = self._filter_options_for_day(options, day_type)
+            face = self._format_number(previous_price.get("target_amount"))
+            matching = [
+                option for option in options
+                if self._format_number(option.get("face_value")) == face
+            ]
+            if len(matching) == 1:
+                price = self._format_number(matching[0].get("sale_price"))
+                label = {
+                    "weekday": "工作日", "weekend": "周末", "holiday": "节假日",
+                }.get(day_type, "当前日期")
+                return {
+                    "reply": f"您说得对，按{label}档位，{face}元代金券当前售价{price}元。",
+                    "source": "当前会话已确认的日期档位与真实SKU价格",
+                    "decision": "allow", "kind": "price",
+                    "query_context_update": {"price_filters": previous_price},
+                }
+
         if compact in {
             "还有吗", "还有么", "还有嘛", "还有不", "还有货吗", "有货吗", "能拍吗", "可以拍吗",
             "现在能买吗", "现在能拍吗", "当前能买吗", "当前能拍吗",
+            "是不是卖完了", "是卖完了吗", "卖完了吗", "卖完了么", "售罄了吗", "没货了吗",
         }:
             offline = str(product.get("item_status") or "").lower() in {
                 "offline", "off_shelf", "offshelf", "deleted", "下架",
             }
+            sellout_question = compact in {
+                "是不是卖完了", "是卖完了吗", "卖完了吗", "卖完了么", "售罄了吗", "没货了吗",
+            }
             return {
-                "reply": "当前商品已下架，暂时无法购买。" if offline else "有的，当前商品还在售，可以直接拍下。",
+                "reply": (
+                    "当前商品已下架，暂时无法购买。" if offline
+                    else "没有卖完，当前商品还在售，可以直接拍下。" if sellout_question
+                    else "有的，当前商品还在售，可以直接拍下。"
+                ),
                 "source": "当前商品在售状态",
                 "decision": "allow",
                 "kind": "stock",
@@ -7708,11 +7890,29 @@ class V2Store(AppStore):
 
         value_confirmation = self.voucher_value_confirmation_reply(product, message)
         if value_confirmation:
+            value_match = re.search(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+                r"(?:(?:拍下|下单|购买)(?:后)?(?:就|可|可以)?\s*)?(?:直接\s*)?"
+                r"(?:可?抵(?:用|扣)?|代)\s*(\d+(?:\.\d+)?)",
+                message,
+            )
+            context_update = None
+            if value_match:
+                options = self.extract_product_options(product)
+                day_type = self._requested_day_type(
+                    message, default_today=self._has_explicit_day_options(options),
+                )
+                context_update = {"price_filters": {
+                    "target_amount": self._format_number(value_match.group(2)),
+                    "day_type": day_type, "intent": "price",
+                    "updated_at": datetime.now(CHINA_TZ).isoformat(timespec="seconds"),
+                }}
             return {
                 "reply": value_confirmation,
                 "source": "当前商品真实售价、面额与发券组成",
                 "decision": "allow",
                 "kind": "voucher_value",
+                **({"query_context_update": context_update} if context_update else {}),
             }
 
         discount = self.discount_reply(product, message)

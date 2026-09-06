@@ -278,6 +278,21 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
         self.assertEqual("assistant", live.context_manager.messages[0][3])
 
+    async def test_concrete_first_question_skips_and_consumes_long_welcome(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        product = {
+            "item_status": "onsale", "first_reply_enabled": True,
+            "first_reply_text": "很长的商品介绍", "first_reply_manual": True,
+        }
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "你好，请问双人多少钱",
+        )
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+
     async def test_offline_product_never_sends_first_reply(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()
