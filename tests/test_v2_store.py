@@ -3129,5 +3129,40 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("深圳商场店", result["reply"])
 
 
+    def test_holiday_query_uses_holiday_sku_not_product_wide_weekday_denial(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "仅限工作日可用。")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "仅限工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "法定节假日可用", "stock": 3},
+            ], "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "节假日能用吗")
+        self.assertEqual("day_use", result["kind"])
+        self.assertIn("可以", result["reply"])
+        self.assertIn("法定节假日可用", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
+
+    def test_cannot_purchase_amount_is_an_issue_not_positive_availability(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "法定节假日可用", "stock": 3},
+            ], "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "拍不了100")
+        self.assertEqual("purchase_issue", result["kind"])
+        self.assertIn("无法下单", result["reply"])
+        self.assertIn("工作日可用", result["reply"])
+        self.assertIn("法定节假日可用", result["reply"])
+        self.assertNotEqual("当前售价66.8元/张，可拍。", result["reply"])
+
+
 if __name__ == "__main__":
     unittest.main()

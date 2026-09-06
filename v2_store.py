@@ -1912,7 +1912,11 @@ class V2Store(AppStore):
             amount_scoped = True
 
         named = self.match_message_skus(str(product.get("item_id") or ""), text, product)
-        if len(named) == 1:
+        named_label = self._sku_public_label(named[0]) if len(named) == 1 else ""
+        explicit_named = bool(
+            named_label and normalize_text(named_label) in normalize_text(text)
+        )
+        if explicit_named:
             named_options = [
                 option for option in options
                 if self.sku_key_for_option(option) == named[0]["sku_key"]
@@ -1924,7 +1928,12 @@ class V2Store(AppStore):
         # Once the buyer names a face value/specification, inspect only that
         # option's own name/time fields. Product-wide prose remains the fallback
         # for genuinely generic questions such as “周末能用吗”.
-        scoped = amount_scoped or len(named) == 1
+        scoped = amount_scoped or explicit_named
+        day_signatures = {
+            tuple(sorted(self._option_day_types(option))) for option in options
+            if self._option_day_types(option)
+        }
+        has_distinct_day_skus = len(day_signatures) > 1
         knowledge = (
             "\n".join(
                 " ".join(str(option.get(key) or "") for key in ("name", "applicable_time"))
@@ -1948,21 +1957,15 @@ class V2Store(AppStore):
                 r"(?:节假日|法定假日|法定节假日)[^。；\n]{0,12}(?:不可用|不能用|不适用)"
             ),
         }[day_type]
-        if re.search(explicit_denial, knowledge):
+        if re.search(explicit_denial, knowledge) and not (
+            not scoped and has_distinct_day_skus
+        ):
             return {
                 "reply": f"不可以，当前商品规则明确标注{label}不可用。",
                 "source": f"当前商品明确的{label}限制", "decision": "allow",
                 "kind": "day_use",
             }
 
-        if not scoped and len(options) > 1:
-            signatures = {tuple(sorted(option.get("day_types") or [])) for option in options}
-            if len(signatures) > 1:
-                return {
-                    "reply": f"当前商品不同规格的适用日期不同，请告诉我准备购买的规格，我按对应规格帮您确认{label}是否可用。",
-                    "source": "不同商品规格具有不同日期规则", "decision": "allow",
-                    "kind": "day_use_clarify",
-                }
         # The source commonly writes “平日节假日通用”.  In merchant usage,
         # the holiday/weekend option covers non-working days; absence of a
         # literal “周末” token must not turn that statement into a denial.
@@ -1978,6 +1981,19 @@ class V2Store(AppStore):
                 "source": f"当前商品规格的{label}适用范围", "decision": "allow",
                 "kind": "day_use",
             }
+        if (
+            not scoped and has_distinct_day_skus and compatible
+            and not re.search(r"还有|其他|别的|另外|换一", text)
+        ):
+            brand = self.extract_brand(product)
+            return {
+                "reply": f"可以，{label}请选择以下适用规格：\n" + "\n".join(
+                    self.format_product_option(option, brand, show_time=True)
+                    for option in compatible
+                ),
+                "source": f"当前商品真实SKU的{label}适用范围",
+                "decision": "allow", "kind": "day_use",
+            }
         expansion = bool(re.search(r"还有|其他|别的|另外|换一", text))
         if expansion and compatible:
             brand = self.extract_brand(product)
@@ -1990,7 +2006,7 @@ class V2Store(AppStore):
                 "decision": "allow", "kind": "sku_availability",
                 "query_context_update": {"last_sku_catalog": True},
             }
-        if len(named) == 1:
+        if explicit_named:
             subject = self._sku_public_label(named[0])
         elif requested_amount:
             subject = f"{requested_amount}元代金券"
@@ -7586,6 +7602,43 @@ class V2Store(AppStore):
                 "reply": "请问需要改成多少元？请发送您要购买的规格和目标金额。",
                 "source": "改价操作缺少目标规格或金额",
                 "decision": "allow", "kind": "price_change_clarify",
+            }
+
+        purchase_failure = re.fullmatch(
+            r"(?:这个|该商品)?(?:拍不了|不能拍|无法拍|下不了单|不能下单|无法下单|点不了)"
+            r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?(?:的)?(?:代金券|券|规格|选项)?",
+            compact,
+        ) or re.fullmatch(
+            r"(\d+(?:\.\d+)?)\s*(?:元|块)?(?:的)?(?:代金券|券|规格|选项)?"
+            r"(?:拍不了|不能拍|无法拍|下不了单|不能下单|无法下单|点不了)",
+            compact,
+        )
+        if purchase_failure:
+            amount = self._format_number(purchase_failure.group(1))
+            candidates = [
+                option for option in self.extract_product_options(product)
+                if self._format_number(option.get("face_value")) == amount
+            ]
+            if not candidates:
+                reply = f"当前没有可购买的{amount}元代金券规格。"
+                source = "当前商品没有对应的有货SKU"
+            else:
+                brand = self.extract_brand(product)
+                show_time = len({
+                    tuple(sorted(self._option_day_types(option))) for option in candidates
+                }) > 1
+                reply = (
+                    f"系统资料显示{amount}元规格仍在售，请确认选择了对应的日期档位：\n"
+                    + "\n".join(
+                        self.format_product_option(option, brand, show_time=show_time)
+                        for option in candidates
+                    )
+                    + "\n如果页面仍然无法下单，请发送页面提示文字。"
+                )
+                source = "当前商品真实有货SKU与买家下单失败反馈"
+            return {
+                "reply": reply, "source": source,
+                "decision": "allow", "kind": "purchase_issue",
             }
 
         if re.fullmatch(
