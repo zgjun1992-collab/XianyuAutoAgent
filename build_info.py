@@ -1,5 +1,5 @@
 """Release identity shared by the V3.5 Python backend and package checks."""
 
 APP_EDITION = "V3.5"
-APP_VERSION = "0.9.15"
-BUILD_COMMIT = "cc34b5a"
+APP_VERSION = "0.9.16"
+BUILD_COMMIT = "095f202"

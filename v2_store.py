@@ -1870,7 +1870,11 @@ class V2Store(AppStore):
                             f"{choices}\n请在使用当天购买、当天使用。"
                         ),
                         "source": "北京时间、当前商品日期规则与真实SKU列表",
-                        "decision": "allow", "kind": "date_use"}
+                        "decision": "allow", "kind": "date_use",
+                        "query_context_update": {
+                            "pending_day_type": day_type,
+                            "pending_day_label": prefix,
+                        }}
             return {"reply": f"{prefix}可以使用哦，请在使用当天购买、当天使用。",
                     "source": "北京时间与当前商品日期规则", "decision": "allow", "kind": "date_use"}
         return {"reply": f"{holiday_name}期间可以使用哦，请在使用当天购买、当天使用。",
@@ -3051,11 +3055,39 @@ class V2Store(AppStore):
             )
         return ""
 
-    def discount_reply(self, product: Dict, message: str) -> str:
-        if not re.search(r"多少折|几折|折扣(?:多少|是几|呢|吗)?", str(message or "")):
+    def discount_reply(self, item_id: str, product: Dict, message: str) -> str:
+        text = str(message or "")
+        if not re.search(
+            r"多少折|几折|折扣(?:多少|是几|呢|吗)?|\d+(?:\.\d+)?\s*折(?:吗|么|嘛|不|呢)?",
+            text,
+        ):
             return ""
         options = self.extract_product_options(product)
+        day_type = self._requested_day_type(
+            text, default_today=self._has_explicit_day_options(options),
+        )
+        if day_type:
+            options = self._filter_options_for_day(options, day_type)
+
+        store_query = extract_store_query(
+            text, product=product, product_brand=self.extract_brand(product),
+        )
+        if is_meaningful_store_query(store_query) and self.is_explicit_store_query(
+            text, store_query,
+        ):
+            supported = self.reverse_store_sku_matches(item_id, store_query, product)
+            supported_keys = {str(sku.get("sku_key") or "") for sku in supported}
+            if supported_keys:
+                options = [
+                    option for option in options
+                    if self.sku_key_for_option(option) in supported_keys
+                ]
+            elif self._multi_sku_store_scope(item_id, product).get("stores_differ"):
+                return ""
+
         lines = []
+        requested_match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*折", text)
+        requested = Decimal(requested_match.group(1)) if requested_match else None
         for option in options:
             try:
                 price = Decimal(str(option.get("sale_price") or "0"))
@@ -3067,11 +3099,45 @@ class V2Store(AppStore):
             discount = (price / face * Decimal("10")).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
-            lines.append(
+            line = (
                 f"{self._format_number(face)}元代金券售价{self._format_number(price)}元，"
                 f"约{self._format_number(discount)}折"
             )
-        return "；".join(lines) + "。" if lines else ""
+            if requested is not None:
+                line = ("是的，" if abs(discount - requested) <= Decimal("0.01") else "不是，") + line
+            lines.append(line)
+        prefix = self._day_reply_prefix(text, day_type) if day_type else ""
+        return prefix + "；".join(lines) + "。" if lines else ""
+
+    def purchase_entry_reply(self, product: Dict, message: str) -> str:
+        """Guide purchase from the current listing using only sellable SKUs."""
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
+        if compact not in {
+            "哪里买", "在哪里买", "在哪买", "哪里购买", "在哪购买",
+            "购买入口在哪", "购买入口在哪里", "从哪里下单", "在哪下单",
+        }:
+            return ""
+        if str(product.get("item_status") or "").lower() in {
+            "offline", "off_shelf", "offshelf", "deleted", "下架",
+        }:
+            return "当前商品目前已下架，暂时无法购买。"
+        options = self.extract_product_options(product)
+        if options and self._has_explicit_day_options(options):
+            day_type = self._requested_day_type(message, default_today=True)
+            options = self._filter_options_for_day(options, day_type)
+            if not options:
+                return "当前商品暂时没有符合今天使用条件的可购买规格。"
+            brand = self.extract_brand(product)
+            choices = "、".join(
+                self.format_product_option(option, brand, show_time=True)
+                for option in options
+            )
+            return f"直接在当前商品页面下单即可。{self._day_reply_prefix(message, day_type)}请选择{choices}。"
+        if not options and re.search(r"代金券|优惠券|券", " ".join((
+            str(product.get("title") or ""), str(product.get("raw_text") or ""),
+        ))):
+            return "当前商品暂时没有可购买的在售规格。"
+        return "直接在当前商品页面选择需要的规格下单即可。"
 
     def direct_coupon_purchase_reply(self, product: Dict, message: str) -> str:
         """Confirm a specifically named denomination without expanding the catalog."""
@@ -5286,6 +5352,8 @@ class V2Store(AppStore):
         product = product or self.get_v2_product(item_id) or {}
         output = []
         for sku in self.list_product_skus(item_id, product):
+            if not sku.get("sellable", True):
+                continue
             result = self.search_store(item_id, query, sku_key=sku["sku_key"])
             if result.get("status") == "available":
                 output.append({**sku, "matches": result.get("matches") or []})
@@ -5889,7 +5957,7 @@ class V2Store(AppStore):
     def _store_fuzzy_key(value: object) -> str:
         value = normalize_text(value)
         for token in (
-            "购物中心", "商业广场", "门店", "分店", "旗舰店", "街道",
+            "购物中心", "购物广场", "商业广场", "百货商场", "百货", "门店", "分店", "旗舰店", "街道",
             "商场", "广场", "省", "市", "区", "县", "镇", "乡", "村", "店",
         ):
             value = value.replace(token, "")
@@ -8117,7 +8185,7 @@ class V2Store(AppStore):
                 **({"query_context_update": context_update} if context_update else {}),
             }
 
-        discount = self.discount_reply(product, message)
+        discount = self.discount_reply(item_id, product, message)
         if discount:
             return {
                 "reply": discount,
@@ -8508,6 +8576,15 @@ class V2Store(AppStore):
                 "decision": "allow",
                 "kind": "tomorrow_use",
             }
+        purchase_entry = self.purchase_entry_reply(product, message)
+        if purchase_entry:
+            return {
+                "reply": purchase_entry,
+                "source": "当前商品页面与真实在售规格",
+                "decision": "deny" if "无法购买" in purchase_entry or "没有" in purchase_entry else "allow",
+                "kind": "purchase_flow",
+            }
+
         if any(word in message for word in (
             "有效期", "什么时候过期", "改天能用", "以后能用", "隔天能用", "长期有效",
         )):
@@ -8740,6 +8817,17 @@ class V2Store(AppStore):
         query = extract_store_query(
             message, product=product, product_brand=self.extract_brand(product)
         )
+        inherited_day = str((store_context or {}).get("pending_day_type") or "")
+        sku_message = message
+        if (
+            inherited_day in {"weekday", "weekend", "holiday"}
+            and not self._requested_day_type(message)
+            and is_meaningful_store_query(query)
+        ):
+            day_word = {
+                "weekday": "工作日", "weekend": "周末", "holiday": "节假日",
+            }[inherited_day]
+            sku_message = f"{day_word}{message}"
         pending_mode = str((store_context or {}).get("pending_store_query_mode") or "")
         pending_query = str((store_context or {}).get("pending_store_query") or "").strip()
         if pending_mode == "generic_landmark" and pending_query and is_meaningful_store_query(query):
@@ -8747,7 +8835,7 @@ class V2Store(AppStore):
         sku_scope = self._multi_sku_store_scope(item_id, product)
         skus = sku_scope.get("skus") or []
         sku_stores_differ = bool(sku_scope.get("stores_differ"))
-        matched_skus = self.match_message_skus(item_id, message, product)
+        matched_skus = self.match_message_skus(item_id, sku_message, product)
         selected_sku = matched_skus[0] if len(matched_skus) == 1 else None
         if not selected_sku and store_context:
             prior_key = str(store_context.get("selected_sku_key") or "")
@@ -8755,7 +8843,7 @@ class V2Store(AppStore):
         selected_key = selected_sku["sku_key"] if selected_sku else ""
         if sku_stores_differ:
             multi_sku_store = self.resolve_multi_sku_store_query(
-                item_id, product, message, store_context,
+                item_id, product, sku_message, store_context,
             )
             if multi_sku_store:
                 return multi_sku_store

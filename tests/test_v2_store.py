@@ -3232,6 +3232,79 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", branch["kind"])
         self.assertIn("荆州万达店", branch["reply"])
 
+    def test_store_short_name_matches_full_department_store_name(self):
+        path = os.path.join(self.temp.name, "department-store.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市"])
+        sheet.append(["半秋山", "汉口大洋百货店", "湖北", "武汉"])
+        book.save(path)
+        self.store.import_store_list(path, "半秋山门店", ["10001"])
+        result = self.store.resolve_deterministic("10001", "半秋山汉口大洋店")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("汉口大洋百货店", result["reply"])
+
+    def test_discount_confirmation_uses_today_sellable_sku_only(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "88",
+                 "applicable_time": "周末可用", "stock": 0},
+            ], "facts": {}, "time_rules": [],
+        })
+        with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+            result = self.store.resolve_deterministic("10001", "今天是7.95折吗")
+        self.assertEqual("discount", result["kind"])
+        self.assertIn("是的", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertIn("7.95折", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
+        self.assertNotIn("88元", result["reply"])
+
+    def test_date_context_is_inherited_by_following_store_name(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "工作日100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "周末100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+            ], "facts": {}, "time_rules": [],
+        })
+        self.store.import_store_text(
+            "【广东省】\n【深圳】世界之窗广场店", "深圳门店", ["10001"],
+        )
+        first = self.store.resolve_deterministic("10001", "今天可以用吗")
+        context = first.get("query_context_update") or {}
+        self.assertEqual("weekend", context.get("pending_day_type"))
+        second = self.store.resolve_deterministic(
+            "10001", "深圳世界之窗广场店", store_context=context,
+        )
+        self.assertEqual("stores", second["kind"])
+        self.assertIn("世界之窗广场店", second["reply"])
+        self.assertEqual("周末100元代金券", second["query_context_update"]["selected_sku_name"])
+
+    def test_where_to_buy_uses_current_listing_and_today_option(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+            ], "facts": {}, "time_rules": [],
+        })
+        with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+            result = self.store.resolve_deterministic("10001", "哪里买")
+        self.assertEqual("purchase_flow", result["kind"])
+        self.assertIn("当前商品页面", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
+
 
 if __name__ == "__main__":
     unittest.main()
