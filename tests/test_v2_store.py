@@ -3164,5 +3164,38 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotEqual("当前售价66.8元/张，可拍。", result["reply"])
 
 
+    def test_structured_store_entities_do_not_glue_area_brand_and_branch(self):
+        path = os.path.join(self.temp.name, "structured-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "区/县", "地址"])
+        sheet.append(["半秋山", "荆州万达店", "湖北", "荆州", "沙市区", "北京中路"])
+        sheet.append(["半秋山", "武汉天地店", "湖北", "武汉", "江岸区", "卢沟桥路"])
+        sheet.append(["宜家", "武汉商场店", "湖北", "武汉", "硚口区", "张毕湖路"])
+        sheet.append(["宜家", "深圳商场店", "广东", "深圳", "南山区", "北环大道"])
+        book.save(path)
+        self.store.import_store_list(path, "结构化门店", ["10001"])
+
+        self.assertEqual("荆州", extract_store_query("荆州的"))
+        for message in ("荆州的", "荆州市的", "湖北省荆州市", "荆州有哪些店"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("stores", result["kind"])
+                self.assertIn("荆州万达店", result["reply"])
+                self.assertNotIn("荆州的", result["reply"])
+                self.assertNotIn("武汉天地店", result["reply"])
+
+        for message in ("宜家武汉", "武汉宜家", "武汉的宜家", "宜家在武汉"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("stores", result["kind"])
+                self.assertIn("武汉商场店", result["reply"])
+                self.assertNotIn("深圳商场店", result["reply"])
+
+        branch = self.store.resolve_deterministic("10001", "湖北荆州半秋山万达店能用吗")
+        self.assertEqual("stores", branch["kind"])
+        self.assertIn("荆州万达店", branch["reply"])
+
+
 if __name__ == "__main__":
     unittest.main()

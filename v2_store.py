@@ -6225,6 +6225,59 @@ class V2Store(AppStore):
         remainder = "".join(chars)
         return province, city, district, remainder
 
+    @classmethod
+    def _parse_store_query_entities(cls, rows: List[Dict], query: str) -> Dict:
+        """Split a store query into administrative, brand and branch entities.
+
+        This is deliberately data-grounded: brands and branches must exist in
+        the current product's store rows. Connectors are removed only after an
+        entity has been recognized, so real store names are never globally
+        rewritten.
+        """
+        query_norm = normalize_text(query)
+        province, city, district, remainder = cls._extract_store_scope(rows, query_norm)
+        remainder = re.sub(r"^(?:的|在|位于)+|(?:的|那边|这边|地区)$", "", remainder)
+        remainder_key = cls._store_fuzzy_key(remainder)
+        full_key = cls._store_fuzzy_key(query_norm)
+
+        brands = sorted(
+            {
+                (cls._store_fuzzy_key(row.get("brand")), str(row.get("brand") or "").strip())
+                for row in rows if row.get("brand")
+            },
+            key=lambda item: len(item[0]), reverse=True,
+        )
+        brand_key = brand = ""
+        for candidate_key, candidate in brands:
+            if len(candidate_key) >= 2 and candidate_key in full_key:
+                brand_key, brand = candidate_key, candidate
+                break
+        if brand_key:
+            remainder_key = remainder_key.replace(brand_key, "", 1)
+            remainder_key = re.sub(r"^(?:的|在|位于)+|(?:的|那边|这边|地区)$", "", remainder_key)
+
+        branches = sorted(
+            {
+                (cls._store_fuzzy_key(row.get("branch")), str(row.get("branch") or "").strip())
+                for row in rows if row.get("branch")
+            },
+            key=lambda item: len(item[0]), reverse=True,
+        )
+        branch_key = branch = ""
+        for candidate_key, candidate in branches:
+            if len(candidate_key) >= 2 and (
+                remainder_key == candidate_key or full_key == candidate_key
+            ):
+                branch_key, branch = candidate_key, candidate
+                break
+
+        return {
+            "province": province, "city": city, "district": district,
+            "brand": brand, "brand_key": brand_key,
+            "branch": branch, "branch_key": branch_key,
+            "search_term": "" if branch else remainder_key,
+        }
+
     def search_store(self, item_id: str, query: str, limit: Optional[int] = None,
                      sku_key: str = "", list_ids_override: Optional[List[int]] = None) -> Dict:
         query_norm = normalize_text(query)
@@ -6261,13 +6314,14 @@ class V2Store(AppStore):
                 str(row["branch"] or row["brand"] or "")
             )
         ]
-        original_scope = self._extract_store_scope(rows, query_norm)
+        entities = self._parse_store_query_entities(rows, query_norm)
+        original_scope = (
+            entities["province"], entities["city"], entities["district"],
+            entities["search_term"],
+        )
         original_area = any(original_scope[:3])
         original_term = self._store_fuzzy_key(original_scope[3])
-        exact_brand_area_query = original_area and any(
-            original_term == self._store_fuzzy_key(row.get("brand"))
-            for row in rows if row.get("brand")
-        )
+        exact_brand_area_query = original_area and bool(entities["brand"])
         # “宜家武汉/武汉宜家” already contains two reliable entities. Fuzzy
         # branch recovery must not rewrite it to an invented full branch name.
         resolved_query = "" if exact_brand_area_query else self._best_location_query(rows, query)
@@ -6285,6 +6339,21 @@ class V2Store(AppStore):
             rows = [row for row in rows if self._admin_key(row.get("city")) == city_scope]
         if district_scope:
             rows = [row for row in rows if self._admin_key(row.get("district")) == district_scope]
+        if entities["brand"]:
+            rows = [
+                row for row in rows
+                if self._store_fuzzy_key(row.get("brand")) == entities["brand_key"]
+            ]
+            search_term = search_term.replace(entities["brand_key"], "", 1)
+            search_term = re.sub(
+                r"^(?:的|在|位于)+|(?:的|那边|这边|地区)$", "", search_term
+            )
+        if entities["branch"]:
+            rows = [
+                row for row in rows
+                if self._store_fuzzy_key(row.get("branch")) == entities["branch_key"]
+            ]
+            search_term = ""
 
         # Buyers often repeat the brand after a city (for example
         # “深圳同仁四季有吗”).  A brand is not a concrete branch name; after the
@@ -9072,6 +9141,9 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         " ", text,
     )
     text = re.sub(r"\s+", " ", text).strip()
+    # A final “的” is a grammatical scope marker in queries such as
+    # “荆州的/武汉市的”, never part of the city or branch search key.
+    text = re.sub(r"的$", "", text).strip()
     return text
 
 
