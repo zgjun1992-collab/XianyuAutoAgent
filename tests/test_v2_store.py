@@ -3305,6 +3305,54 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("79.5元", result["reply"])
         self.assertNotIn("66.8元", result["reply"])
 
+    def test_spoken_face_value_price_uses_today_stock_and_deduplicates(self):
+        self.store.save_v2_product(
+            "10001", "半秋山100元代金券",
+            "100元代金券：售价66.8元，工作日可用\n"
+            "100元代金券：售价79.5元，周末可用",
+        )
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 0},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 3},
+                {"name": "半秋山100元券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 3},
+            ], "facts": {}, "time_rules": [],
+        })
+        with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+            result = self.store.resolve_deterministic("10001", "100 的券，多少钱")
+        self.assertEqual("price", result["kind"])
+        self.assertEqual(1, result["reply"].count("79.5元"))
+        self.assertNotIn("66.8元", result["reply"])
+        self.assertNotIn("没有“100 的券”", result["reply"])
+
+    def test_zero_stock_structured_sku_is_not_revived_by_raw_text(self):
+        self.store.save_v2_product(
+            "10001", "半秋山100元代金券",
+            "100元代金券：售价66.8元，工作日可用",
+        )
+        self.store.save_ai_summary("10001", "库存", {
+            "skus": [{
+                "name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                "applicable_time": "工作日可用", "stock": "0",
+            }], "facts": {}, "time_rules": [],
+        })
+        product = self.store.get_v2_product("10001")
+        self.assertEqual([], self.store.extract_product_options(product))
+
+    def test_buyer_store_statement_is_locally_verified_not_model_fallback(self):
+        self.store.import_store_text(
+            "【上海市】\n【上海】上海世博园店\n【上海】龙华会店",
+            "上海门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "龙华会店也可以")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("龙华会店", result["reply"])
+        self.assertNotIn("全国", result["reply"])
+        self.assertNotIn("上海除外", result["reply"])
+
 
 if __name__ == "__main__":
     unittest.main()

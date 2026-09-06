@@ -1125,13 +1125,21 @@ class V2Store(AppStore):
                 same_sku = next((
                     item for item in output
                     if item.get("face_value", "") == option.get("face_value", "")
+                    and item.get("sale_price", "") == option.get("sale_price", "")
                     and (
                         not item.get("applicable_time")
                         or not option.get("applicable_time")
                         or item.get("applicable_time") == option.get("applicable_time")
+                        or set(cls._option_day_types(item)) == set(cls._option_day_types(option))
                     )
                 ), None)
                 if same_sku:
+                    # Explicit structured stock/sale state outranks prose that
+                    # has no inventory field, even on a manually edited item.
+                    if option.get("availability_explicit"):
+                        same_sku["availability"] = option.get("availability") or "available"
+                        same_sku["stock"] = option.get("stock") or ""
+                        same_sku["availability_explicit"] = True
                     for field in ("applicable_time", "max_stack"):
                         if not same_sku.get(field) and option.get(field):
                             same_sku[field] = option[field]
@@ -1162,6 +1170,25 @@ class V2Store(AppStore):
             # This blocks accidental constructions such as “11元代金券，售价0元”.
             if face > 0 and price > 0:
                 valid.append(option)
+        # Different ingestion sources can describe the same business SKU with
+        # different prose. Collapse by buyer-visible facts before any reply.
+        deduplicated = []
+        business_keys = set()
+        for option in valid:
+            key = (
+                cls._format_number(option.get("face_value")),
+                cls._format_number(option.get("sale_price")),
+                normalize_text(option.get("composition") or ""),
+                tuple(sorted(cls._option_day_types(option))),
+                tuple(sorted(cls._meal_periods(
+                    " ".join(str(option.get(field) or "") for field in ("name", "applicable_time"))
+                ))),
+            )
+            if key in business_keys:
+                continue
+            business_keys.add(key)
+            deduplicated.append(option)
+        valid = deduplicated
         # Some Goofish listings expose quantity selectors as separate SKUs
         # (100券、100券×2、100券×3). They are one sellable denomination, not
         # three products. Keep the unit SKU and retain the largest stack count.
@@ -2866,6 +2893,7 @@ class V2Store(AppStore):
         requested = []
         for pattern in (
             r"(\d+(?:\.\d+)?)\s*元\s*(?:代金券|券)",
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?\s*的?\s*(?:代金券|优惠券|券)",
             r"(?:面额|券面)\s*(\d+(?:\.\d+)?)",
             r"多少\s*代\s*(\d+(?:\.\d+)?)",
         ):
@@ -2881,17 +2909,6 @@ class V2Store(AppStore):
                 option for option in priced
                 if self._format_number(option.get("face_value")) in requested
             ]
-            # Keep a targeted raw-text fallback for compact buyer questions such
-            # as “200多少钱”. It also covers a denomination composed of multiple
-            # smaller coupons (200面额发两张100券).
-            if not matched:
-                for value in requested:
-                    matched.extend(
-                        option for option in self._raw_product_options(
-                            product.get("raw_text") or "", product.get("title") or ""
-                        )
-                        if self._format_number(option.get("face_value") or "") == value
-                    )
             if not matched:
                 target = max(Decimal(value) for value in requested)
                 plan = self.consumption_plan_reply(
@@ -3276,7 +3293,10 @@ class V2Store(AppStore):
             return ""
         # Numeric denomination questions are handled by price_reply, including
         # its closest-lower coupon recommendation.
-        if re.fullmatch(r"\d+(?:\.\d+)?\s*(?:元)?(?:代金券|券)?", subject):
+        if re.fullmatch(
+            r"\d+(?:\.\d+)?\s*(?:元)?\s*(?:的)?\s*(?:代金券|优惠券|券)?",
+            subject,
+        ):
             return self.price_reply(product, message)
 
         options = [
@@ -9190,6 +9210,7 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "这个券", "这张券", "该券", "能不能使用", "能不能用", "可不可以使用", "可不可以用",
         "不能使用吗", "不能用吗", "不可以使用吗", "不可以用吗", "不可使用吗", "不可用吗",
         "可以使用嘛", "可以使用吗", "可以用嘛", "能用嘛", "可用嘛",
+        "也可以使用", "也可以用", "也能用", "也可用", "也可以",
         "可以用吗", "可以吗", "能用吗", "可用吗", "支持吗", "行吗",
         "可以用", "可以", "能用", "可用", "支持", "适用",
         "适用吗", "能不能用", "可以使用吗", "是否可用", "哪些门店", "哪个门店", "门店",
