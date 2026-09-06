@@ -125,6 +125,7 @@ class XianyuLive:
         self._message_generations = {}
         self._message_buffers = {}
         self._recent_buyer_media = {}
+        self._recent_buyer_locations = {}
         self._media_notice_times = {}
         self._seen_messages = set()
         self._review_notified_scopes = set()
@@ -289,6 +290,52 @@ class XianyuLive:
                     return marker
                 if isinstance(value, (dict, list)):
                     stack.append(value)
+        return ""
+
+    @staticmethod
+    def inbound_location_card(payload):
+        """Extract a buyer-shared store name from a platform location card."""
+        if not isinstance(payload, (dict, list)):
+            return ""
+        values = []
+        stack = [payload]
+        visited = 0
+        location_hint = False
+        while stack and visited < 160:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, list):
+                stack.extend(current[:40])
+                continue
+            if not isinstance(current, dict):
+                continue
+            for key, value in current.items():
+                key_norm = re.sub(r"[^a-z]", "", str(key).lower())
+                if key_norm in {"contenttype", "messagetype", "msgtype", "cardtype", "type"}:
+                    location_hint = location_hint or bool(re.search(
+                        r"location|poi|map|place|地址|位置|地图", str(value), re.I
+                    ))
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+                elif isinstance(value, str) and key_norm in {
+                    "title", "name", "poiname", "placename", "locationname",
+                    "address", "poiaddress", "locationaddress", "remindercontent",
+                }:
+                    text = value.strip()
+                    if text:
+                        values.append(text)
+                        location_hint = location_hint or bool(re.search(
+                            r"店|商场|广场|mall|城|中心|地址|路|街|大道", text, re.I
+                        ))
+        if not location_hint:
+            return ""
+        for value in values:
+            inner = re.search(r"[（(]([^（）()\n]{2,36}(?:店|商场|广场|MALL|Mall|mall))[）)]", value)
+            if inner:
+                return inner.group(1).strip()
+            match = re.search(r"([^\n，,。]{2,40}(?:店|商场|广场|MALL|Mall|mall))", value)
+            if match:
+                return match.group(1).strip("()（）[]【】 ")
         return ""
 
     @staticmethod
@@ -1206,6 +1253,7 @@ class XianyuLive:
             send_user_name = reminder["reminderTitle"]
             send_user_id = reminder["senderUserId"]
             send_message = str(reminder.get("reminderContent") or "").strip()
+            location_card = self.inbound_location_card(reminder)
             payload_marker = self.inbound_media_marker(reminder)
             if payload_marker and not self.media_marker(send_message):
                 send_message = (
@@ -1229,6 +1277,16 @@ class XianyuLive:
 
             if send_user_id != self.myid:
                 self._buyer_routes[str(send_user_id)] = (str(chat_id), str(item_id))
+                if location_card:
+                    locations = getattr(self, "_recent_buyer_locations", None)
+                    if locations is None:
+                        self._recent_buyer_locations = locations = {}
+                    locations[scope_id] = (time.monotonic(), location_card)
+                    # A shared POI card supplies context rather than a complete
+                    # question. Wait for the buyer's following “可以用吗”.
+                    if not re.search(r"(?:可以|能|可)(?:使用|用)|支持吗|适用吗", send_message):
+                        logger.info(f"已记录买家发送的门店位置卡：{location_card}")
+                        return
 
             if self.is_recall_message(send_message):
                 self._message_generations[scope_id] = self._message_generations.get(scope_id, 0) + 1
@@ -1257,6 +1315,13 @@ class XianyuLive:
             if send_user_id != self.myid:
                 marker = self.media_marker(send_message)
                 now_monotonic = time.monotonic()
+                recent_location = getattr(self, "_recent_buyer_locations", {}).get(scope_id)
+                if (
+                    not location_card and recent_location
+                    and now_monotonic - recent_location[0] <= 1800
+                    and self.is_media_dependent_text(send_message)
+                ):
+                    send_message = f"{recent_location[1]}{send_message}"
                 if marker:
                     self._recent_buyer_media[scope_id] = (now_monotonic, marker)
                 else:
@@ -1319,6 +1384,7 @@ class XianyuLive:
                 self._store_contexts.pop(scope_id, None)
                 self._query_contexts.pop(scope_id, None)
                 self._recent_buyer_media.pop(scope_id, None)
+                getattr(self, "_recent_buyer_locations", {}).pop(scope_id, None)
                 self._media_notice_times.pop(scope_id, None)
                 self.emit_event("conversation_reset", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
 

@@ -1859,6 +1859,18 @@ class V2Store(AppStore):
                 return {"reply": f"{target.month}月{target.day}日没有可用的商品选项哦。",
                         "source": "当前商品日期适用范围", "decision": "allow", "kind": "date_use"}
             prefix = "明天" if re.search(r"明天|明日", text) else f"{target.month}月{target.day}日"
+            if explicit and compatible:
+                brand = self.extract_brand(product)
+                choices = "\n".join(
+                    self.format_product_option(option, brand, show_time=True)
+                    for option in compatible
+                )
+                return {"reply": (
+                            f"{prefix}可以使用，请选择以下当日适用的在售规格：\n"
+                            f"{choices}\n请在使用当天购买、当天使用。"
+                        ),
+                        "source": "北京时间、当前商品日期规则与真实SKU列表",
+                        "decision": "allow", "kind": "date_use"}
             return {"reply": f"{prefix}可以使用哦，请在使用当天购买、当天使用。",
                     "source": "北京时间与当前商品日期规则", "decision": "allow", "kind": "date_use"}
         return {"reply": f"{holiday_name}期间可以使用哦，请在使用当天购买、当天使用。",
@@ -3239,7 +3251,7 @@ class V2Store(AppStore):
             )
         return f"当前商品没有“{subject}”这一规格。"
 
-    def coupon_catalog_reply(self, product: Dict) -> str:
+    def coupon_catalog_reply(self, product: Dict, message: str = "") -> str:
         """List only real coupon SKUs; package products must not invent coupons."""
         brand = self.extract_brand(product)
         options = [
@@ -3253,7 +3265,12 @@ class V2Store(AppStore):
             return f"当前商品没有代金券选项，售卖的是{title}{suffix}。"
         signatures = {tuple(sorted(self._option_day_types(option))) for option in options}
         show_time = len(options) > 1 and len(signatures) > 1
-        return "当前可选代金券如下：\n" + "\n".join(
+        prefix = "当前可选代金券如下：\n"
+        if show_time:
+            day_type = self._requested_day_type(message, default_today=True)
+            options = self._filter_options_for_day(options, day_type)
+            prefix = self._day_reply_prefix(message, day_type) + "可选代金券如下：\n"
+        return prefix + "\n".join(
             self.format_product_option(option, brand, show_time=show_time) for option in options
         )
 
@@ -3300,7 +3317,7 @@ class V2Store(AppStore):
         options = self.extract_product_options(product)
         # A bare category question means “which coupon SKUs are available”.
         if subject_key in {"代金券", "券", "券型", "面额", "优惠券"}:
-            return self.coupon_catalog_reply(product)
+            return self.coupon_catalog_reply(product, message)
 
         requested_values = list(dict.fromkeys(re.findall(
             r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?(?:代金券|券)?",
@@ -8063,10 +8080,10 @@ class V2Store(AppStore):
 
         if any(word in message for word in (
             "多少代多少", "有哪些代金券", "有什么代金券", "代金券有哪些", "代金券有什么", "有哪些面额",
-            "有什么面额", "卖哪些券", "有哪些券型", "有什么券型",
+            "有什么面额", "卖哪些券", "有哪些券型", "有什么券型", "有什么券", "有哪些券", "还有什么券",
         )) or compact in {"代金券", "有代金券吗", "有没有代金券", "是代金券吗", "代金券有吗"}:
             return {
-                "reply": self.coupon_catalog_reply(product),
+                "reply": self.coupon_catalog_reply(product, message),
                 "source": "当前商品真实SKU列表",
                 "decision": "allow",
                 "kind": "coupon_catalog",

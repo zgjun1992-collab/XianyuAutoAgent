@@ -196,6 +196,20 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual("", XianyuLive.inbound_media_marker(payload))
 
+    def test_location_card_extracts_store_without_using_address_as_query(self):
+        payload = {
+            "contentType": "location",
+            "cardData": {
+                "poiName": "半秋山(汉阳摩尔城店)",
+                "address": "王家湾龙阳大道特6号摩尔城4楼",
+            },
+        }
+        self.assertEqual("汉阳摩尔城店", XianyuLive.inbound_location_card(payload))
+
+    def test_normal_product_card_is_not_treated_as_location(self):
+        payload = {"contentType": 1, "title": "半秋山100元代金券", "price": "79.5"}
+        self.assertEqual("", XianyuLive.inbound_location_card(payload))
+
     def test_model_number_grounding_blocks_only_unverified_facts(self):
         self.assertEqual(
             "",

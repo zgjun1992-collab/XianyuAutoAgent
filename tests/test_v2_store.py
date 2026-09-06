@@ -3053,8 +3053,8 @@ class V2StoreTests(unittest.TestCase):
         })
         result = self.store.resolve_deterministic("10001", "代金券还有嘛")
         self.assertIn(result["kind"], {"coupon_catalog", "sku_availability"})
-        self.assertIn("工作日可用", result["reply"])
         self.assertIn("周末可用", result["reply"])
+        self.assertNotIn("工作日可用", result["reply"])
         self.assertNotIn("79.5", result["reply"])
 
     def test_weekend_expansion_lists_only_in_stock_weekend_skus(self):
@@ -3082,8 +3082,44 @@ class V2StoreTests(unittest.TestCase):
             "10001", "没看到", store_context={"last_sku_catalog": True},
         )
         self.assertEqual("coupon_catalog", result["kind"])
-        self.assertIn("工作日可用", result["reply"])
         self.assertIn("周末可用", result["reply"])
+        self.assertNotIn("工作日可用", result["reply"])
+
+    def test_generic_coupon_catalog_recommends_only_todays_sellable_sku(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "88",
+                 "applicable_time": "周末可用", "stock": 0},
+            ], "facts": {}, "time_rules": [],
+        })
+        with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+            result = self.store.resolve_deterministic("10001", "有什么券")
+        self.assertEqual("coupon_catalog", result["kind"])
+        self.assertIn("今天是周末", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
+        self.assertNotIn("88元", result["reply"])
+
+    def test_date_question_names_matching_in_stock_sku_and_price(self):
+        self.store.save_v2_product("10001", "半秋山100元代金券", "")
+        self.store.save_ai_summary("10001", "分时券", {
+            "skus": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "66.8",
+                 "applicable_time": "工作日可用", "stock": 5},
+                {"name": "100元代金券", "face_value": "100", "sale_price": "79.5",
+                 "applicable_time": "周末可用", "stock": 2},
+            ], "facts": {}, "time_rules": [],
+        })
+        result = self.store.resolve_deterministic("10001", "9月6日星期天可以用吗")
+        self.assertEqual("date_use", result["kind"])
+        self.assertIn("周末可用", result["reply"])
+        self.assertIn("79.5元", result["reply"])
+        self.assertNotIn("66.8元", result["reply"])
 
     def test_price_change_operation_is_not_bargaining(self):
         result = self.store.resolve_deterministic("10001", "改个价")
