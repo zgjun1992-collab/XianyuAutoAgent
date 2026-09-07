@@ -6986,6 +6986,8 @@ class V2Store(AppStore):
             if brand_only:
                 search_term = ""
 
+        search_term = self._clean_store_search_term(search_term)
+
         # A province/city-only question must return every branch in that scope.
         if (province_scope or city_scope or district_scope) and not search_term:
             for item in rows:
@@ -7045,11 +7047,20 @@ class V2Store(AppStore):
             seen.add(key)
             unique.append(item)
         matches = unique[: max(1, int(limit))] if limit else unique
-        output_query = query if resolved_query else input_query
-        scoped_query = "".join(filter(None, (
+        scoped_location = "".join(filter(None, (
             district_scope or city_scope or province_scope,
             search_term,
-        ))) or output_query
+        )))
+        output_query = query if resolved_query else (
+            scoped_location
+            if matches and is_meaningful_store_query(scoped_location)
+            else input_query
+        )
+        scoped_query = (
+            scoped_location
+            if (matches or resolved_query) and is_meaningful_store_query(scoped_location)
+            else output_query
+        )
         generic_key = self._store_fuzzy_key(search_term or query_norm)
         generic_without_area = (
             not (province_scope or city_scope or district_scope)
@@ -7289,6 +7300,11 @@ class V2Store(AppStore):
         # match. A weak fuzzy result is not enough to invent store intent.
         if result and result.get("status") == "available":
             for match in result.get("matches") or []:
+                if (
+                    int(match.get("match_score") or 0) >= 85
+                    and not match.get("unresolved_terms")
+                ):
+                    return True
                 branch_key = cls._store_fuzzy_key(match.get("branch") or match.get("brand"))
                 row_areas = {
                     cls._area_key(match.get("province")),

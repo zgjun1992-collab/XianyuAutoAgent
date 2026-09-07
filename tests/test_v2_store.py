@@ -956,6 +956,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("allow", result["decision"])
         self.assertIn("武汉首店", result["reply"])
+        self.assertEqual("梦时代", result["store_query"])
 
     def test_store_relation_query_requires_exact_store_or_address(self):
         self.store.import_store_text(
