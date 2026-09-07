@@ -3596,11 +3596,11 @@ class V2StoreTests(unittest.TestCase):
             "仅支持同面额代金券叠加，不同面额代金券不能叠加。",
         )
         result = self.store.resolve_deterministic("10001", "200")
-        self.assertEqual("redemption_plan", result["kind"])
+        self.assertEqual("sku_price", result["kind"])
         self.assertEqual("allow", result["decision"])
         self.assertIn("2张100元代金券", result["reply"])
         self.assertIn("111.8元", result["reply"])
-        self.assertIn("可抵扣200元", result["reply"])
+        self.assertIn("共可抵扣200元", result["reply"])
 
     def test_condition_only_people_day_and_meal_defaults_to_sku_price(self):
         self.store.save_v2_product(
@@ -3661,6 +3661,38 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("合计抵扣200元", result["reply"])
         self.assertIn("最多使用2张100元券", result["reply"])
         self.assertNotIn("200元代金券可以叠加", result["reply"])
+
+    def test_usage_subject_reads_product_rule_instead_of_store_index(self):
+        self.store.save_v2_product(
+            "10001", "火锅代金券",
+            "100元代金券：售价76元。当前代金券不可用于锅底和酒水。",
+        )
+        result = self.store.resolve_deterministic("10001", "锅底能用吗")
+        self.assertEqual("usage_scope", result["kind"])
+        self.assertIn("不可用于锅底和酒水", result["reply"])
+        self.assertNotIn("适用门店资料", result["reply"])
+
+    def test_weight_decimal_is_not_a_date_and_holiday_exclusion_is_respected(self):
+        self.store.save_v2_product(
+            "10001", "鱼酷烤鱼",
+            "鱼酷2.6斤回鱼单鱼套餐：售价118元。"
+            "除中秋节（9.25-9.27）、国庆节（10.1-10.7）外，营业时间内可用。",
+        )
+        self.assertIsNone(self.store._query_date("鱼酷2.6斤回鱼单鱼套餐"))
+        result = self.store.resolve_deterministic("10001", "中秋可以用吗")
+        self.assertEqual("date_use", result["kind"])
+        self.assertIn("不能使用", result["reply"])
+
+    def test_bare_exact_denomination_uses_real_sku_price_not_limit_number(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券",
+            "200元代金券：售价124.9元，发200元券1张。"
+            "200元代金券最多使用2张。",
+        )
+        result = self.store.resolve_deterministic("10001", "200")
+        self.assertEqual("sku_price", result["kind"])
+        self.assertIn("售价124.9元", result["reply"])
+        self.assertNotIn("售价2元", result["reply"])
 
     def test_mixed_audience_result_is_split_into_paragraphs(self):
         self.store.save_v2_product(

@@ -22,6 +22,7 @@ from privacy_guard import redact_sensitive_text
 class XianyuLive:
     TEMPLATE_SEGMENT_TOKEN = "{$分段符}"
     TEMPLATE_IMAGE_PATTERN = re.compile(r"\{\$图片:(\d+)\}")
+    AFTERSALE_FOLLOWUP_NOTICE = "您的售后问题已记录并提交人工核实，通常会在72小时内处理，请耐心等待。"
 
     @classmethod
     def parse_message_template(cls, text):
@@ -819,6 +820,91 @@ class XianyuLive:
         ))
 
     @staticmethod
+    def is_aftersale_entry_message(message="", order_context=None):
+        """Enter aftersales only for a system-confirmed order or an actual post-purchase fault."""
+        text = re.sub(r"\s+", "", str(message or ""))
+        order_status = str((order_context or {}).get("status") or "")
+        if re.search(r"退款|退货|售后|纠纷", order_status):
+            return True
+        if not text:
+            return False
+
+        hypothetical = bool(re.search(
+            r"还没买|尚未购买|未购买|买之前|购买前|如果|假如|万一|"
+            r"退款政策|退款规则|能退吗|可以退吗|可不可以退|能不能退",
+            text,
+        ))
+        confirmed_purchase = bool(re.search(
+            r"已付款|付款了|付过款|已经买|已购买|买了|拍下了|下单了|"
+            r"收到(?:的|了)?|发给我|发来的|已申请|申请了",
+            text,
+        ))
+        intrinsic_fault = bool(re.search(
+            r"券码(?:无效|失效|错误|不能用|用不了)|卡券(?:无效|失效|不能用|用不了)|"
+            r"核销(?:失败|不了|不成功)|无法核销|不能核销|"
+            r"发错(?:券|码|商品)|少发|漏发|没收到(?:券|码)|未收到(?:券|码)|"
+            r"收到(?:的|了)?.{0,8}(?:过期|失效)|发来(?:的)?.{0,8}(?:过期|失效)",
+            text,
+        ))
+        completed_problem = bool(re.search(
+            r"(?:卡券|券码|这个券|这张券).{0,8}(?:已经|过期了|失效了)|"
+            r"(?:退款|退货|售后)(?:申请)?(?:已提交|提交了|申请了|处理中|不到账|金额不对)",
+            text,
+        ))
+        refund_after_purchase = confirmed_purchase and bool(re.search(
+            r"退款|退货|退钱|申请退|不能用|用不了|核销|过期|失效|发错|少发|没收到",
+            text,
+        ))
+        if hypothetical and not (confirmed_purchase or intrinsic_fault or completed_problem):
+            return False
+        return intrinsic_fault or completed_problem or refund_after_purchase
+
+    async def send_aftersale_state_reply(
+        self, websocket, chat_id, send_user_id, send_user_name, scope_id,
+        item_id, user_message, policies, url_info="", *, first=False,
+    ):
+        """Send the live configured policy once, then a fixed human-processing receipt."""
+        if first:
+            reply = str(
+                policies.get("aftersale_policy_summary")
+                or policies.get("aftersale_policy_raw")
+                or DEFAULT_POLICIES.get("aftersale_policy_summary")
+                or ""
+            ).strip()
+        else:
+            reply = self.AFTERSALE_FOLLOWUP_NOTICE
+
+        self.context_manager.add_message_by_chat(
+            scope_id, send_user_id, item_id, "user", user_message
+        )
+        creator = getattr(self.app_store, "create_audit", None)
+        audit_id = None
+        if creator:
+            order_route = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            audit_id = creator(
+                scope_id=scope_id, chat_id=chat_id, user_id=send_user_id,
+                user_name=send_user_name, item_id=item_id,
+                user_message=user_message, draft_reply=reply, final_reply=reply,
+                action="review", reasons=["售后会话已提交人工处理"], status="pending",
+                order_id=order_route.get("order_id", ""), conversation_url=url_info,
+                order_url=order_route.get("order_url", ""),
+            )
+        if reply:
+            await self.send_msg(websocket, chat_id, send_user_id, reply, sanitize=False)
+            self.context_manager.add_message_by_chat(
+                scope_id, self.myid, item_id, "assistant", reply
+            )
+        if first:
+            pause = getattr(self.app_store, "pause_conversation", None)
+            if pause:
+                pause(scope_id, "aftersale")
+        self.emit_event(
+            "aftersale_started" if first else "aftersale_followup",
+            audit_id=audit_id, chat_id=chat_id, item_id=item_id, scope_id=scope_id,
+        )
+        return reply
+
+    @staticmethod
     def should_silence_disabled_purchase_order_greeting(product, message=""):
         """A disabled welcome message must not become a fake manual-review notice."""
         product = product or {}
@@ -944,7 +1030,7 @@ class XianyuLive:
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
         message="",
     ):
-        """Send the product introduction only for a pure first-turn greeting."""
+        """Send the configured product introduction once before a normal first answer."""
         if (
             self.is_product_offline(product)
             or int((conversation or {}).get("first_reply_sent", 0))
@@ -962,19 +1048,6 @@ class XianyuLive:
         async with lock:
             durable_getter = getattr(self.app_store, "is_first_reply_sent", None)
             if durable_getter and durable_getter(scope_id):
-                return False
-            if (
-                bool((product or {}).get("enabled", 1))
-                and not self.should_send_first_reply(message)
-            ):
-                # A concrete first question must receive its direct answer
-                # without a long catalog in front of it. Consume the welcome
-                # flag so it cannot appear unexpectedly later in the chat.
-                self.app_store.mark_first_reply_sent(scope_id)
-                self.emit_event(
-                    "product_first_reply_skipped", chat_id=chat_id, item_id=item_id,
-                    scope_id=scope_id, message="买家首条消息为具体问题，已直接回答",
-                )
                 return False
             reply = self.prepare_product_first_reply(product)
             if not reply:
@@ -1164,6 +1237,10 @@ class XianyuLive:
                     "order_url": url_info,
                 })
             logger.info(f"退款订单状态：{status}")
+            if scope_id:
+                pause = getattr(self.app_store, "pause_conversation", None)
+                if pause:
+                    pause(scope_id, "aftersale_pending")
             self.emit_event("refund_order", message=status, item_id=item_id, order_id=order_id)
             return True
         if status != "等待买家付款":
@@ -1420,6 +1497,34 @@ class XianyuLive:
                     )
                 except Exception as exc:
                     logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+
+            # Aftersales owns the conversation before the normal product welcome.
+            # The first entry sends the policy currently saved in the backend;
+            # later buyer messages receive only the human-processing receipt.
+            conversation_state = str(
+                conversation.get("state")
+                or (getattr(self.app_store, "get_conversation_state", lambda _scope: "")(scope_id))
+                or ""
+            )
+            if conversation_state == "aftersale":
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=False,
+                )
+                return
+            if conversation_state == "aftersale_pending":
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=True,
+                )
+                return
+            order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            if self.is_aftersale_entry_message(send_message, order_context):
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=True,
+                )
+                return
 
             product_offline = self.is_product_offline(current_product)
             first_reply_sent_now = False

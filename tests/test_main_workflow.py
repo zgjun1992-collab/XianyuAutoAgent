@@ -289,7 +289,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
         self.assertEqual("assistant", live.context_manager.messages[0][3])
 
-    async def test_concrete_first_question_skips_and_consumes_welcome(self):
+    async def test_concrete_first_question_still_sends_welcome_once(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()
         product = {
@@ -300,9 +300,39 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
             {"first_reply_sent": 0}, "你好，请问双人多少钱",
         )
-        self.assertFalse(sent)
-        live.send_message_template.assert_not_awaited()
+        self.assertTrue(sent)
+        live.send_message_template.assert_awaited_once()
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+
+    def test_aftersale_entry_requires_actual_post_purchase_evidence(self):
+        for message in ("券码核销失败", "我已经付款了但是不能用", "发来的券已经过期"):
+            with self.subTest(message=message):
+                self.assertTrue(XianyuLive.is_aftersale_entry_message(message))
+        for message in ("可以退款吗", "退款政策是什么", "如果不能用怎么办", "锅底能用吗"):
+            with self.subTest(message=message):
+                self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
+        self.assertTrue(XianyuLive.is_aftersale_entry_message(
+            "进度怎么样", {"status": "退款申请处理中"}
+        ))
+
+    async def test_aftersale_first_reply_uses_live_backend_policy_then_fixed_receipt(self):
+        live = self.make_live()
+        live.app_store.pause_conversation = lambda scope, state: setattr(
+            live.app_store, "paused", (scope, state)
+        )
+        policy = "后台刚刚修改的退款政策"
+        first = await live.send_aftersale_state_reply(
+            object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
+            "券码核销失败", {"aftersale_policy_summary": policy}, first=True,
+        )
+        followup = await live.send_aftersale_state_reply(
+            object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
+            "怎么处理", {"aftersale_policy_summary": "另一个政策"}, first=False,
+        )
+        self.assertEqual(policy, first)
+        self.assertEqual(XianyuLive.AFTERSALE_FOLLOWUP_NOTICE, followup)
+        self.assertEqual(("scope-1", "aftersale"), live.app_store.paused)
+        self.assertEqual(policy, live.send_msg.await_args_list[0].args[3])
 
     async def test_offline_product_never_sends_first_reply(self):
         live = self.make_live()
