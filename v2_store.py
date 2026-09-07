@@ -6751,10 +6751,16 @@ class V2Store(AppStore):
                 combined_key = self._store_fuzzy_key("".join(str(item.get(key) or "") for key in (
                     "district", "branch",
                 )))
-                # Only an explicitly address-shaped query may match the address
-                # column. This prevents “300有吗” from hitting a 300号 address.
+                # Textual shopping-centre and landmark names may live only in
+                # the address column (for example branch “武汉首店”, address
+                # “武商梦时代”). Pure amount queries still never reach this
+                # path, so they cannot hit a door number such as 300号.
                 address_key = ""
-                if re.search(r"(?:路|街|道|巷|号|大厦|中心)", search_term or query_norm):
+                address_query = search_term or query_norm
+                if (
+                    re.search(r"(?:路|街|道|巷|号|大厦|中心)", address_query)
+                    or re.search(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", address_query)
+                ):
                     address_key = self._store_fuzzy_key(item.get("address"))
                 # Generic labels such as “广场店” can normalize to an empty
                 # key.  Empty-string containment is always true in Python and
@@ -6802,12 +6808,12 @@ class V2Store(AppStore):
                 ):
                     score = 1.02
                     quality = "contained"
-                elif (
-                    (combined_key and query_key in combined_key)
-                    or (address_key and query_key in address_key)
-                ):
+                elif combined_key and query_key in combined_key:
                     score = 1.0
                     quality = "contained"
+                elif address_key and query_key in address_key:
+                    score = 1.0
+                    quality = "address"
                 else:
                     scores = [
                         SequenceMatcher(None, query_key, value).ratio()
@@ -6847,7 +6853,7 @@ class V2Store(AppStore):
                             quality = "phonetic"
                 item["score"] = round(score, 3)
                 item["match_quality"] = quality
-                if quality in {"exact", "contained"}:
+                if quality in {"exact", "contained", "address"}:
                     direct.append(item)
                 elif quality == "phonetic":
                     phonetic.append(item)
@@ -9501,8 +9507,13 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
     # Remove that exact, product-grounded literal only; never guess arbitrary
     # Chinese words as brands because they may be part of a real mall/branch.
     product_brand = str(product_brand or "").strip()
-    if len(product_brand) >= 2:
-        text = re.sub(re.escape(product_brand), " ", text, flags=re.I)
+    brand_aliases = {product_brand} if len(product_brand) >= 2 else set()
+    brand_aliases.update(
+        part for part in re.split(r"[·•・|丨/\\\s]+", product_brand)
+        if len(part) >= 2
+    )
+    for brand_alias in sorted(brand_aliases, key=len, reverse=True):
+        text = re.sub(re.escape(brand_alias), " ", text, flags=re.I)
     # Prices, quantities, time/audience conditions and coupon words are not
     # part of a province/city/county/town/street/mall/branch search key.
     text = re.sub(

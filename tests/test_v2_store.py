@@ -906,6 +906,33 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("龙岗万科里店", specific["reply"])
         self.assertNotIn("西丽益田假日里店", specific["reply"])
 
+    def test_store_query_matches_landmark_in_address_and_short_brand_alias(self):
+        self.store.save_v2_product(
+            "10001", "胡恰·景德江西菜代金券", "100元代金券：售价72元。",
+        )
+        path = os.path.join(self.temp.name, "hucha-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "区/县", "地址"])
+        sheet.append([
+            "胡恰·景德江西菜", "武汉首店", "湖北", "武汉", "武昌区",
+            "中南路街道武珞路598号武商梦时代7层B区711号",
+        ])
+        book.save(path)
+        self.store.import_store_list(path, "胡恰门店", ["10001"])
+
+        product = self.store.get_v2_product("10001")
+        query = extract_store_query(
+            "胡恰武汉梦时代", product=product,
+            product_brand=self.store.extract_brand(product),
+        )
+        self.assertEqual("武汉梦时代", query)
+        result = self.store.resolve_deterministic("10001", "胡恰武汉梦时代")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("武汉首店", result["reply"])
+        self.assertEqual("address", result["store_matches"][0]["match_quality"])
+
     def test_city_with_which_stores_wording_lists_only_that_city(self):
         self.store.import_store_text(
             "【广东省】\n【深圳】南昌品牌深圳店\n【江西省】\n【南昌】万寿宫店、北京东路店",
