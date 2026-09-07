@@ -806,6 +806,66 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("2026年9月25日至9月27日", summary)
         self.assertIn("除上述明确不可用日期外，适用门店营业时间内可用", summary)
 
+    def test_ai_summary_preserves_every_manual_rule_when_model_output_is_sparse(self):
+        source = (
+            "⚠️仅适用于部分胡恰门店，拍前请咨询。\n\n"
+            "【商品信息】\n"
+            "①200元代金券：138元（单次消费最多可用3张）\n"
+            "②100元代金券：72元（单次消费最多可用3张）\n\n"
+            "相同面额代金券最多叠加3张，不同面额代金券不能互相叠加\n"
+            "----------------\n\n"
+            "【使用规则】\n"
+            "1. 除中秋节（9.25-9.27）、国庆节（10.1-10.7）外，营业时间内可用。\n"
+            "2. 全场通用。\n"
+            "3. 仅限堂食。\n"
+            "4. 无需预约，高峰期可能需要等位。\n"
+            "5. 团购用户不可同时享受商家其他优惠，不可与其它代金券叠加使用。\n"
+            "6. 本单发票由商家提供，详情请咨询商家。"
+        )
+        self.store.save_v2_product("10001", "胡恰代金券", source)
+        product = self.store.save_ai_summary("10001", "被过度压缩的AI草稿", {
+            "facts": {
+                "使用时间": "适用门店营业时间内可用",
+                "叠加规则": "仅支持同面额代金券叠加，每次最多使用3张",
+            },
+            "products": [
+                {"name": "100元代金券", "face_value": "100", "sale_price": "72", "max_stack": "3"},
+                {"name": "200元代金券", "face_value": "200", "sale_price": "138", "max_stack": "3"},
+            ],
+            "time_rules": [],
+        })
+        summary = product["ai_summary"]
+        for expected in (
+            "仅适用于部分胡恰门店", "拍前请咨询", "中秋节", "9.25-9.27",
+            "国庆节", "10.1-10.7", "全场通用", "仅限堂食", "无需预约",
+            "高峰期可能需要等位", "商家其他优惠", "其它代金券叠加使用",
+            "发票由商家提供", "详情请咨询商家",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, summary)
+
+    def test_ai_summary_renders_all_structured_rule_fields(self):
+        self.store.save_v2_product("10001", "规则完整性测试", "100元代金券：售价72元。")
+        product = self.store.save_ai_summary("10001", "简略草稿", {
+            "facts": {
+                "适用门店范围": "仅适用于部分门店，拍前请咨询",
+                "不可用日期": "中秋节和国庆节不可用",
+                "堂食限制": "仅限堂食",
+                "预约要求": "无需预约，高峰期可能需要等位",
+                "优惠同享": "不可同时享受商家其他优惠",
+                "发票规则": "发票由商家提供",
+                "下单前提醒": "详情请咨询商家",
+            },
+            "products": [{"name": "100元代金券", "face_value": "100", "sale_price": "72"}],
+        })
+        summary = product["ai_summary"]
+        self.assertIn("【适用范围】", summary)
+        self.assertIn("【使用规则】", summary)
+        self.assertIn("【退款与发票】", summary)
+        self.assertIn("【提醒】", summary)
+        for value in product["structured"]["facts"].values():
+            self.assertIn(value, summary)
+
     def test_standalone_unknown_city_is_a_store_query_without_cross_city_fuzzy_match(self):
         self.store.import_store_text(
             "【浙江省】\n【杭州】武林广场店、西湖银泰店",
@@ -1741,6 +1801,32 @@ class V2StoreTests(unittest.TestCase):
             result = self.store.resolve_deterministic("10001", "两张100多少钱")
         self.assertIn("159元", result["reply"])
         self.assertNotIn("133.6元", result["reply"])
+
+    def test_quantity_over_stack_limit_does_not_claim_combined_redemption(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡代金券",
+            "100元代金券：售价55.8元，最多使用2张\n"
+            "300元代金券：售价204.8元，最多使用1张",
+        )
+        result = self.store.resolve_deterministic("10001", "你好，买2张300券")
+        self.assertEqual("price", result["kind"])
+        self.assertIn("购买2张300元代金券共409.6元", result["reply"])
+        self.assertIn("每张可抵扣300元", result["reply"])
+        self.assertIn("每次最多使用1张", result["reply"])
+        self.assertIn("2张不能在同一次消费中全部使用", result["reply"])
+        self.assertNotIn("可抵扣600元", result["reply"])
+
+    def test_composed_sku_limit_counts_delivered_coupon_quantity(self):
+        self.store.save_v2_product(
+            "10001", "组合代金券",
+            "200元代金券：售价108元，发2张100元券，最多使用2张",
+        )
+        result = self.store.resolve_deterministic("10001", "买2张200券")
+        self.assertEqual("price", result["kind"])
+        self.assertIn("共216元", result["reply"])
+        self.assertIn("每份该规格可抵扣200元", result["reply"])
+        self.assertIn("本次购买所得的4张不能在同一次消费中全部使用", result["reply"])
+        self.assertNotIn("可抵扣400元", result["reply"])
 
     def test_fish_single_item_phrasings_match_the_real_package(self):
         self.store.save_v2_product(

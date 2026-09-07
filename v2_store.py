@@ -834,6 +834,97 @@ class V2Store(AppStore):
                 return value
         return ""
 
+    @classmethod
+    def _fact_value_text(cls, value: object) -> str:
+        """Render every structured fact value instead of dropping nested data."""
+        if isinstance(value, list):
+            return "、".join(
+                text for text in (cls._fact_value_text(item) for item in value) if text
+            )
+        if isinstance(value, dict):
+            return "；".join(
+                f"{key}：{text}"
+                for key, child in value.items()
+                if (text := cls._fact_value_text(child))
+            )
+        return str(value or "").strip()
+
+    @classmethod
+    def _fact_section_lines(cls, facts: Dict, aliases: Iterable[str]):
+        lines = []
+        used = set()
+        seen = set()
+        if not isinstance(facts, dict):
+            return lines, used
+        for alias in aliases:
+            if alias not in facts:
+                continue
+            used.add(alias)
+            value = cls._fact_value_text(facts.get(alias))
+            key = normalize_match_text(value)
+            if not value or not key or key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"{alias}：{value.rstrip('。；; ')}。")
+        return lines, used
+
+    @classmethod
+    def _uncovered_source_rules(cls, raw_text: str, rendered_text: str) -> List[str]:
+        """Keep authoritative source clauses that structured extraction missed."""
+        source = str(raw_text or "").strip()
+        if not source:
+            return []
+        try:
+            payload = json.loads(source)
+            if isinstance(payload, dict) and str(payload.get("description") or "").strip():
+                source = str(payload["description"]).strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+        rendered_key = normalize_match_text(rendered_text)
+        found = []
+        seen = set()
+        critical_markers = (
+            "适用", "不可", "不能", "不支持", "禁止", "仅限", "无需", "预约", "等位",
+            "优惠", "发票", "咨询", "退款", "过期", "核销", "营业", "节假日", "中秋",
+            "国庆", "春节", "元旦", "劳动节", "门店", "全场", "堂食", "外带", "外卖",
+            "包间", "酒水", "锅底", "服务费", "人群", "人数", "拍前", "下单前",
+        )
+        stack_context_markers = (
+            "适用", "仅限", "无需", "预约", "等位", "优惠", "发票", "咨询", "退款",
+            "过期", "核销", "营业", "节假日", "中秋", "国庆", "春节", "元旦", "劳动节",
+            "门店", "全场", "堂食", "外带", "外卖", "包间", "酒水", "锅底", "服务费",
+            "人群", "人数", "拍前", "下单前",
+        )
+        for piece in re.split(r"(?<=[。！？!?；;])|[\r\n]+", source):
+            line = piece.strip()
+            line = re.sub(r"^(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d+[.、)）])\s*", "", line)
+            line = re.sub(r"^(?:⚠️?|[•·*-])\s*", "", line)
+            line = re.sub(r"^【[^】]+】\s*", "", line).strip()
+            if not line or re.fullmatch(r"[-—_=\s]+", line):
+                continue
+            line_key = normalize_match_text(line)
+            if not line_key or line_key in seen or line_key in rendered_key:
+                continue
+
+            # Product rows and pure stacking rows are already rendered from the
+            # authoritative SKU records. Keep them only when they also carry an
+            # independent restriction such as a store, date or dine-in rule.
+            is_product_row = bool(re.search(
+                r"(?:代金券|套餐|单人餐|双人餐|多人餐|自助餐).{0,30}(?:售价|价格|￥|¥|\d+(?:\.\d+)?\s*元)",
+                line,
+            ))
+            has_independent_rule = any(marker in line for marker in critical_markers)
+            if is_product_row and not has_independent_rule:
+                continue
+            is_stack_only = bool(re.search(r"叠加|最多(?:使用|可用)?\s*\d+\s*张", line))
+            if is_stack_only and not any(marker in line for marker in stack_context_markers):
+                continue
+
+            seen.add(line_key)
+            found.append(line.rstrip("。；; ") + "。")
+        return found
+
     @staticmethod
     def _format_number(value: object) -> str:
         text = str(value or "").strip().replace("￥", "").replace("¥", "")
@@ -2570,13 +2661,29 @@ class V2Store(AppStore):
                 price = Decimal(str(option.get("sale_price"))) * quantity
                 face = Decimal(str(option.get("face_value"))) * quantity
                 contents = self._purchase_contents_label(option, quantity)
-                reply = (
-                    f"购买{contents}共{self._format_number(price)}元，"
-                    f"可抵扣{self._format_number(face)}元。"
-                )
                 explicit_limit = str(option.get("max_stack") or "").strip()
-                if explicit_limit and quantity > int(Decimal(explicit_limit)):
-                    reply += f"当前同面额代金券每次最多使用{int(Decimal(explicit_limit))}张，不能一次全部使用。"
+                delivered_per_unit = sum(
+                    int(count) for _, count in re.findall(
+                        r"(\d+(?:\.\d+)?)元券(\d+)张",
+                        str(option.get("composition") or ""),
+                    )
+                ) or 1
+                delivered_total = delivered_per_unit * quantity
+                maximum = int(Decimal(explicit_limit)) if explicit_limit else 0
+                if maximum and delivered_total > maximum:
+                    unit_face = self._option_total_value(option)
+                    unit_word = "每张" if delivered_per_unit == 1 else "每份该规格"
+                    reply = (
+                        f"购买{contents}共{self._format_number(price)}元。"
+                        f"{unit_word}可抵扣{self._format_number(unit_face)}元；"
+                        f"当前同面额代金券每次最多使用{maximum}张，"
+                        f"本次购买所得的{delivered_total}张不能在同一次消费中全部使用。"
+                    )
+                else:
+                    reply = (
+                        f"购买{contents}共{self._format_number(price)}元，"
+                        f"可抵扣{self._format_number(face)}元。"
+                    )
                 return {
                     "reply": reply, "source": "当前商品真实代金券与购买数量",
                     "decision": "allow", "kind": "price",
@@ -4269,13 +4376,34 @@ class V2Store(AppStore):
         use_time = cls._first_fact(
             facts, ("使用时间", "可用时间", "营业时间", "使用日期", "time")
         )
-        combined = raw_text + "\n" + use_time
+        unavailable = cls._first_fact(
+            facts,
+            ("不可用日期", "禁用日期", "不适用日期", "不可使用日期", "blackout_dates"),
+        )
+        combined = raw_text + "\n" + use_time + "\n" + unavailable
+        for clause in re.split(r"[。；;\r\n]+", raw_text):
+            clause = re.sub(
+                r"^(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d+[.、)）])\s*", "", clause.strip()
+            )
+            if re.search(r"^除.+外[，,]?.*(?:可用|使用)", clause):
+                return clause.rstrip("。；; ").replace("营业时间可用", "适用门店营业时间内可用")
         has_unavailable = bool(re.search(
             r"(?:\d{4}年)?\d{1,2}月\d{1,2}日?.{0,24}(?:不可用|不能用|不适用)|"
             r"(?:中秋|国庆|春节|元旦|劳动节|节假日).{0,20}(?:不可用|不能用|不适用)",
             combined,
         ))
         cleaned = use_time.rstrip("。；; ")
+        if unavailable and normalize_match_text(unavailable) not in normalize_match_text(cleaned):
+            if cleaned and not re.search(r"(?:其余|其他|除.+外).{0,12}(?:营业时间|可用)", cleaned):
+                return (
+                    unavailable.rstrip("。；; ")
+                    + "；除上述明确不可用日期外，适用门店营业时间内可用"
+                )
+            if not cleaned:
+                return (
+                    unavailable.rstrip("。；; ")
+                    + "；除上述明确不可用日期外，适用门店营业时间内可用"
+                )
         if cleaned:
             if has_unavailable and not re.search(r"(?:其余|其他|除.+外).{0,12}(?:营业时间|可用)", cleaned):
                 clauses = [part.strip() for part in re.split(r"[；;。\n]+", cleaned) if part.strip()]
@@ -4443,9 +4571,48 @@ class V2Store(AppStore):
         validity = self._first_fact(facts, ("有效期", "券有效期", "validity", "valid_until"))
         if validity:
             sections.append("【有效期】\n" + validity.rstrip("。；; ") + "。")
-        use_rule = self._first_fact(facts, ("使用规则", "使用条件", "核销规则", "限制", "usage", "conditions"))
-        if use_rule:
-            sections.append("【使用规则】\n" + use_rule.rstrip("。；; ") + "。")
+
+        handled = {
+            "使用时间", "可用时间", "营业时间", "使用日期", "time",
+            "不可用日期", "禁用日期", "不适用日期", "不可使用日期", "blackout_dates",
+            "有效期", "券有效期", "validity", "valid_until",
+            "叠加规则", "代金券叠加", "使用张数", "最多使用", "stacking", "stack_rule",
+        }
+        fact_groups = (
+            ("【适用范围】", (
+                "适用门店范围", "适用门店", "门店范围", "适用范围", "适用人群", "人数限制",
+            )),
+            ("【使用规则】", (
+                "使用规则", "使用条件", "核销规则", "限制", "usage", "conditions",
+                "预约要求", "堂食限制", "外带限制", "外卖限制", "包间限制", "酒水限制",
+                "锅底限制", "服务费限制", "优惠同享", "不同面额混用", "单次或每桌限用数量",
+            )),
+            ("【发券与核销】", ("发码平台", "发码方式", "领取方式", "核销方式")),
+            ("【退款与发票】", ("退款规则", "发票规则")),
+            ("【提醒】", ("下单前提醒",)),
+        )
+        for title, aliases in fact_groups:
+            group_lines, used = self._fact_section_lines(facts, aliases)
+            handled.update(used)
+            if group_lines:
+                sections.append(title + "\n" + "\n".join(group_lines))
+
+        remaining_lines = []
+        if isinstance(facts, dict):
+            for key, value in facts.items():
+                if key in handled:
+                    continue
+                text = self._fact_value_text(value)
+                if text:
+                    remaining_lines.append(f"{key}：{text.rstrip('。；; ')}。")
+        if remaining_lines:
+            sections.append("【其他信息】\n" + "\n".join(remaining_lines))
+
+        source_rules = self._uncovered_source_rules(
+            str(product.get("raw_text") or ""), "\n".join(sections)
+        )
+        if source_rules:
+            sections.append("【原文规则保留】\n" + "\n".join(source_rules))
         return "\n\n".join(sections)
 
     def build_first_reply_text(self, product: Dict) -> str:
