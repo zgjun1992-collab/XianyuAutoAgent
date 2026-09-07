@@ -1982,6 +1982,34 @@ class V2Store(AppStore):
         )
         return bool(direct)
 
+    @classmethod
+    def _product_rule_knowledge(cls, product: Dict) -> str:
+        """Collect rule evidence from raw text, summaries, structured facts and SKU fields."""
+        values = [
+            str(product.get("raw_text") or ""),
+            str(product.get("ai_summary") or ""),
+        ]
+
+        def collect(node):
+            if isinstance(node, dict):
+                for value in node.values():
+                    collect(value)
+            elif isinstance(node, (list, tuple)):
+                for value in node:
+                    collect(value)
+            elif isinstance(node, str) and node.strip():
+                values.append(node.strip())
+
+        collect(product.get("structured") or {})
+        output = []
+        seen = set()
+        for value in values:
+            key = normalize_match_text(value)
+            if value.strip() and key not in seen:
+                seen.add(key)
+                output.append(value.strip())
+        return "\n".join(output)
+
     def date_availability_reply(self, product: Dict, message: str) -> Optional[Dict]:
         text = str(message or "")
         use_intent = bool(re.search(r"(?:可以|能|可)(?:使用|用)|能不能用|是否可用|用得了", text))
@@ -1989,7 +2017,7 @@ class V2Store(AppStore):
         holiday_name = next((name for name in ("中秋", "国庆", "春节", "元旦", "劳动节") if name in text), "")
         if not use_intent or (not target and not holiday_name):
             return None
-        knowledge = "\n".join((str(product.get("raw_text") or ""), str(product.get("ai_summary") or "")))
+        knowledge = self._product_rule_knowledge(product)
         holiday_unavailable = False
         if holiday_name:
             for clause in re.split(r"[。；\n]+", knowledge):
@@ -2003,6 +2031,8 @@ class V2Store(AppStore):
                 ):
                     holiday_unavailable = True
                     break
+            if re.search(r"(?:法定)?节假日[^。；\n]{0,12}(?:不可用|不能用|不适用)", knowledge):
+                holiday_unavailable = True
         if holiday_unavailable:
             return {"reply": f"{holiday_name}在商品标注的不可用日期范围内，不能使用哦。",
                     "source": "当前商品明确不可用节日", "decision": "allow", "kind": "date_use"}
@@ -2042,6 +2072,28 @@ class V2Store(AppStore):
                         }}
             return {"reply": f"{prefix}可以使用哦，请在使用当天购买、当天使用。",
                     "source": "北京时间与当前商品日期规则", "decision": "allow", "kind": "date_use"}
+        holiday_options = [
+            item for item in self.extract_sale_options(product)
+            if item.get("sale_price") and item.get("day_types")
+        ]
+        compatible_holiday = [
+            item for item in holiday_options
+            if self._option_matches_time(item, day_type="holiday")
+        ]
+        if holiday_options and not compatible_holiday:
+            return {"reply": f"{holiday_name}没有可用的商品规格哦。",
+                    "source": "当前商品SKU节日适用范围", "decision": "allow", "kind": "date_use"}
+        if compatible_holiday:
+            brand = self.extract_brand(product)
+            choices = "\n".join(
+                self.format_product_option(option, brand, show_time=True)
+                for option in compatible_holiday
+            )
+            return {"reply": (
+                        f"{holiday_name}期间可以使用，请选择以下节假日适用的在售规格：\n"
+                        f"{choices}\n请在使用当天购买、当天使用。"
+                    ),
+                    "source": "当前商品SKU节日适用范围", "decision": "allow", "kind": "date_use"}
         return {"reply": f"{holiday_name}期间可以使用哦，请在使用当天购买、当天使用。",
                 "source": "当前商品节日适用范围", "decision": "allow", "kind": "date_use"}
 
@@ -4283,12 +4335,18 @@ class V2Store(AppStore):
     def benefit_combination_reply(self, product: Dict, message: str) -> str:
         """Handle coupon/package/platform combinations before generic stacking."""
         text = str(message or "").strip()
+        package_words = r"套餐|团购|单品|菜品|餐品|店内套餐"
+        package_coupon_question = bool(
+            re.search(package_words, text)
+            and re.search(r"代金券|抵扣券|现金券|优惠券|券", text)
+            and re.search(r"可以|能|可用|使用|抵扣|叠加|一起|同时|混用", text)
+        )
         combine_intent = bool(re.search(
             r"一起用|同时用|一块用|一并使用|搭配使用|同时核销|一起抵扣|"
             r"叠加|叠券|叠优惠|混用|合并用|组合用|累计使用|还能用|还能叠|"
             r"能叠|可叠|再用|再叠|再减",
             text,
-        ))
+        )) or package_coupon_question
         if not combine_intent:
             return ""
         # “和朋友一起用” talks about people, not combining benefits.
@@ -4319,9 +4377,8 @@ class V2Store(AppStore):
             )
 
         options = self.extract_product_options(product)
-        package_words = r"套餐|团购|单品|菜品|餐品|店内套餐"
         if re.search(package_words, text) and (options or re.search(r"代金券|券", text)):
-            knowledge = str(product.get("raw_text") or "")
+            knowledge = self._product_rule_knowledge(product)
             explicitly_allowed = bool(re.search(
                 r"(?:代金券|券)[^。；\n]{0,12}(?:可以|可|支持)[^。；\n]{0,8}(?:套餐|团购)|"
                 r"(?:套餐|团购)[^。；\n]{0,12}(?:可以|可|支持)[^。；\n]{0,8}(?:代金券|券)",
@@ -7408,6 +7465,14 @@ class V2Store(AppStore):
             or any(area and area in message_key for area in known_areas if len(area) >= 2)
             or bool(re.search(r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|商圈|商场|广场|购物中心|门店|分店|店)", raw_query))
         )
+        temporal_subject = bool(re.search(
+            r"今天|今日|明天|明日|后天|周末|工作日|平日|节假日|法定假日|"
+            r"中秋(?:节|期间)?|国庆(?:节|期间)?|春节|元旦|劳动节|"
+            r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?",
+            message_key,
+        ))
+        if temporal_subject and not has_location:
+            return False
         if usage_subject and not has_location:
             return False
         # These sentences express store intent but contain no actual location.
@@ -7914,11 +7979,21 @@ class V2Store(AppStore):
 
     @classmethod
     def usage_subject_reply(cls, product: Dict, message: str) -> Optional[Dict]:
-        """Answer what a coupon can cover from product rules, never from the store index."""
-        subject = next((value for value in (
-            "锅底", "酒水", "饮料", "菜品", "餐品", "套餐", "包间",
-            "堂食", "打包",
-        ) if value in str(message or "")), "")
+        """Separate coupon coverage from SKU existence and evaluate explicit rule scope."""
+        text = str(message or "")
+        alias_groups = (
+            ("锅底", ("锅底", "锅底费", "汤底", "汤底费", "底料")),
+            ("酒水", ("酒水", "酒类", "酒品", "啤酒", "白酒", "红酒")),
+            ("饮料", ("饮料", "饮品", "软饮")),
+            ("菜品", ("菜品", "餐品", "单品")),
+            ("套餐", ("套餐", "团购套餐")),
+            ("包间", ("包间", "包厢", "包房")),
+            ("堂食", ("堂食",)),
+            ("打包", ("打包", "外带")),
+        )
+        matched_group = next((group for group in alias_groups if any(alias in text for alias in group[1])), None)
+        subject = matched_group[0] if matched_group else ""
+        aliases = matched_group[1] if matched_group else ()
         if not subject or not re.search(r"可以|能|可用|使用|支持|不可以|不能", str(message or "")):
             return None
         message_key = normalize_text(message)
@@ -7931,25 +8006,68 @@ class V2Store(AppStore):
             or re.search(r"(?:省|市|区|县|镇|乡|村|路|街|商场|广场|购物中心|门店|分店|店)", message_key)
         ):
             return None
-        facts = (product.get("structured") or {}).get("facts") or {}
-        knowledge = "\n".join(filter(None, (
-            str(product.get("raw_text") or ""),
-            str(product.get("ai_summary") or ""),
-            cls._use_rule_text(product),
-            cls._first_fact(
-                facts,
-                ("使用规则", "使用条件", "核销规则", "限制", "usage", "conditions"),
-            ),
-        )))
-        clauses = []
-        for part in re.split(r"[\r\n。；;]+", knowledge):
-            value = part.strip(" \t，,。；;")
-            if subject in value and value not in clauses:
-                clauses.append(value)
-        reply = (
-            "根据当前商品使用规则：" + "；".join(clauses[:3]) + "。"
-            if clauses else f"当前商品资料没有明确说明{subject}是否可用，暂时无法准确确认。"
-        )
+
+        sku_intent = bool(re.search(
+            r"有吗|有没有|有无|多少钱|什么价|价格|怎么买|怎么拍|卖吗|"
+            r"几张|几份|规格",
+            text,
+        ))
+        if subject == "套餐" and not re.search(r"代金券|抵扣券|现金券|优惠券|抵扣", text):
+            sku_intent = True
+        if sku_intent:
+            matches = [
+                option for option in cls.extract_sale_options(product)
+                if any(alias in str(option.get("name") or "") for alias in aliases)
+            ]
+            if not matches:
+                return {
+                    "reply": f"当前商品没有“{subject}”这一在售规格。",
+                    "source": "当前商品真实SKU列表", "decision": "allow",
+                    "kind": "sku_availability",
+                }
+            return None
+
+        knowledge = cls._product_rule_knowledge(product)
+        relevant_clauses = [
+            value.strip(" \t，,。；;")
+            for value in re.split(r"[\r\n。；;]+", knowledge)
+            if any(alias in value for alias in aliases)
+        ]
+        negative = next((clause for clause in relevant_clauses if re.search(
+            r"不可|不能|不支持|不适用|除外|不参与|不抵扣", clause
+        )), "")
+        exclusion_segments = []
+        for pattern in (
+            r"除([^。；\n]{1,80}?)外[^。；\n]{0,30}(?:全场通用|全场可用|均可使用|都可使用)",
+            r"(?:全场通用|全场可用|均可使用|都可使用)[，,：:]?([^。；\n]{1,80}?)除外",
+        ):
+            exclusion_segments.extend(match.group(1) for match in re.finditer(pattern, knowledge))
+        excluded = next((
+            segment for segment in exclusion_segments
+            if any(alias in segment for alias in aliases)
+        ), "")
+        global_scope = bool(re.search(
+            r"全场通用|全场可用|除[^。；\n]{1,80}外[^。；\n]{0,30}(?:均可使用|都可使用)",
+            knowledge,
+        ))
+        positive = next((clause for clause in relevant_clauses if re.search(
+            r"(?:可以|可|支持)[^。；\n]{0,8}(?:使用|抵扣)|"
+            r"(?:使用|抵扣)[^。；\n]{0,8}(?:可以|可|支持)|可用", clause
+        ) and not re.search(r"不可|不能|不支持|不适用", clause)), "")
+
+        if negative or excluded:
+            evidence = negative or f"除{excluded}外全场通用"
+            reply = f"不可以，当前代金券不可用于{subject}。商品规则：{evidence}。"
+        elif global_scope:
+            exclusion_text = "、".join(dict.fromkeys(
+                value.strip(" ，,、") for value in exclusion_segments if value.strip(" ，,、")
+            ))
+            rule = f"除{exclusion_text}外全场通用" if exclusion_text else "全场通用"
+            reply = f"{subject}消费可以使用当前代金券抵扣，商品规则为{rule}。"
+        elif positive:
+            reply = f"{subject}消费可以使用当前代金券抵扣。商品规则：{positive}。"
+        else:
+            reply = f"当前商品资料没有明确说明{subject}是否可用，暂时无法准确确认。"
         return {
             "reply": reply, "source": "当前商品使用规则",
             "decision": "allow", "kind": "usage_scope",

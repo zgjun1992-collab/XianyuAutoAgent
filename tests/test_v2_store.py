@@ -3672,6 +3672,49 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("不可用于锅底和酒水", result["reply"])
         self.assertNotIn("适用门店资料", result["reply"])
 
+    def test_global_scope_allows_only_items_outside_explicit_exclusions(self):
+        self.store.save_v2_product(
+            "10001", "火锅代金券",
+            "100元代金券：售价76元。除锅底外，全场通用。",
+        )
+        beverage = self.store.resolve_deterministic("10001", "饮料可以用吗")
+        self.assertEqual("usage_scope", beverage["kind"])
+        self.assertIn("饮料消费可以使用", beverage["reply"])
+        self.assertIn("除锅底外全场通用", beverage["reply"])
+        pot = self.store.resolve_deterministic("10001", "锅底可以用吗")
+        self.assertIn("不可用于锅底", pot["reply"])
+
+    def test_exclusion_without_positive_scope_cannot_prove_other_items_are_usable(self):
+        product = {
+            "raw_text": "锅底除外。",
+            "ai_summary": "", "structured": {},
+        }
+        result = self.store.usage_subject_reply(product, "饮料可以用吗")
+        self.assertIn("没有明确说明", result["reply"])
+
+    def test_usage_scope_does_not_invent_a_missing_sku(self):
+        product = {
+            "raw_text": "100元代金券：售价76元。除锅底外全场通用。",
+            "ai_summary": "", "structured": {},
+        }
+        result = self.store.usage_subject_reply(product, "有饮料这个规格并且可以用吗")
+        self.assertEqual("sku_availability", result["kind"])
+        self.assertIn("没有“饮料”这一在售规格", result["reply"])
+
+    def test_package_and_coupon_default_to_no_combination_without_positive_rule(self):
+        self.store.save_v2_product(
+            "10001", "代金券", "100元代金券：售价76元。除锅底外全场通用。",
+        )
+        denied = self.store.resolve_deterministic("10001", "套餐可以用代金券吗")
+        self.assertEqual("benefit_combination", denied["kind"])
+        self.assertIn("不能一起使用", denied["reply"])
+        self.store.save_ai_summary("10001", "明确叠加规则", {
+            "facts": {"使用规则": "套餐可与代金券叠加使用"},
+        })
+        allowed = self.store.resolve_deterministic("10001", "套餐可以用代金券吗")
+        self.assertIn("明确说明", allowed["reply"])
+        self.assertIn("可以和套餐一起使用", allowed["reply"])
+
     def test_weight_decimal_is_not_a_date_and_holiday_exclusion_is_respected(self):
         self.store.save_v2_product(
             "10001", "鱼酷烤鱼",
@@ -3682,6 +3725,29 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "中秋可以用吗")
         self.assertEqual("date_use", result["kind"])
         self.assertIn("不能使用", result["reply"])
+
+    def test_holiday_reads_structured_blackout_and_is_not_duplicated_as_store(self):
+        self.store.save_v2_product(
+            "10001", "大树餐厅代金券", "100元代金券：售价68元。",
+        )
+        self.store.save_ai_summary("10001", "节日规则", {
+            "facts": {"不可用日期": "中秋节（9.25-9.27）、国庆节（10.1-10.7）不可用"},
+        })
+        for question in ("中秋可以用吗", "中秋期间可以使用吗", "中秋节可以用吗"):
+            with self.subTest(question=question):
+                result = self.store.resolve_deterministic("10001", question)
+                self.assertEqual("date_use", result["kind"])
+                self.assertIn("不能使用", result["reply"])
+                self.assertNotIn("适用门店：", result["reply"])
+
+    def test_workday_only_sku_does_not_claim_holiday_availability(self):
+        self.store.save_v2_product(
+            "10001", "工作日代金券",
+            "100元代金券：售价66.8元，仅限工作日可用。",
+        )
+        result = self.store.resolve_deterministic("10001", "中秋节可以用吗")
+        self.assertEqual("date_use", result["kind"])
+        self.assertIn("没有可用的商品规格", result["reply"])
 
     def test_bare_exact_denomination_uses_real_sku_price_not_limit_number(self):
         self.store.save_v2_product(
