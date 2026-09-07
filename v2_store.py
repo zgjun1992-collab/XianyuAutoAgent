@@ -1469,12 +1469,12 @@ class V2Store(AppStore):
             if start and end and 0 < start <= end <= 20:
                 return list(range(start, end + 1))
         match = re.search(
-            r"([一二两三四五六七八九十单双俩仨\d]+)\s*(?:个|口)?(?:人|位)?",
+            r"([一二两三四五六七八九十单双俩仨\d]+)\s*(?:个|口)?(?:人|位)",
             text,
         )
-        count = None
-        if match and re.search(r"人|位|口|单人|双人|[俩仨]", match.group(0)):
-            count = cls._chinese_count(match.group(1))
+        if not match:
+            match = re.search(r"(?<![一二两三四五六七八九十])([俩仨])(?![一二两三四五六七八九十])", text)
+        count = cls._chinese_count(match.group(1)) if match else None
         return [count] if count and 0 < count <= 20 else []
 
     @staticmethod
@@ -2346,9 +2346,9 @@ class V2Store(AppStore):
         if lines and missing:
             names = "、".join(missing_labels[item] for item in missing)
             return {
-                "reply": "，".join(lines) + "。" + (
-                    f"您好，本店目前没有“{names}”这一有货规格，"
-                    "暂时无法通过当前商品购买，您可以到店咨询。"
+                "reply": "，".join(lines) + "。\n\n" + (
+                    f"当前商品暂时没有“{names}”这一规格，"
+                    "无法通过本商品购买，相关价格可以到店咨询。"
                 ),
                 "source": "当前商品缺少对应的有货身份票种",
                 "decision": "deny", "kind": "audience_price",
@@ -2418,6 +2418,13 @@ class V2Store(AppStore):
         direct_slots = self._conditional_query_slots(text)
         if not direct_slots.get("day_type"):
             direct_slots["day_type"] = self._requested_day_type(text)
+        # Buyers often send only a compact condition bundle, for example
+        # “三人明天中午”. A person count plus an explicit date/day/meal period
+        # is a complete local price request even when “多少钱/能用吗” is omitted.
+        implicit_condition_price = bool(
+            direct_slots.get("people_count")
+            and (direct_slots.get("day_type") or direct_slots.get("meal_period"))
+        )
         if (
             availability_intent
             and any(word.lower() in text.lower() for word in STORE_LANDMARK_WORDS)
@@ -2467,7 +2474,7 @@ class V2Store(AppStore):
         referential = bool(re.search(r"(?:呢|那|这个|这种|这款)[？?。！!]*$", text))
         context_followup = bool(previous and (has_direct_slot or pending_filled) and len(normalize_text(text)) <= 16)
         if not (
-            price_intent or availability_intent or pending_filled
+            price_intent or availability_intent or implicit_condition_price or pending_filled
             or bool(direct_slots.get("purchase_quantity"))
             or ((referential or context_followup) and previous)
         ) or not (has_direct_slot or previous):
@@ -2513,7 +2520,8 @@ class V2Store(AppStore):
             slots.get("day_type") == "weekend" and has_holiday_options and not has_weekend_options
         )
         effective_intent = (
-            "price" if price_intent else "availability" if availability_intent
+            "price" if (price_intent or implicit_condition_price)
+            else "availability" if availability_intent
             else str(previous.get("intent") or "price")
         )
 
@@ -2610,6 +2618,10 @@ class V2Store(AppStore):
                 option = single_options[0]
                 total = Decimal(str(option.get("sale_price"))) * int(people_count)
                 name = str(option.get("name") or "单人商品").strip()
+                selected_context = {
+                    "selected_sku_key": self.sku_key_for_option(option),
+                    "selected_sku_name": name,
+                }
                 return {
                     "reply": (
                         f"{people_count}人需要购买{people_count}份{name}，"
@@ -2618,7 +2630,7 @@ class V2Store(AppStore):
                     ),
                     "source": "当前日期可用的单人商品规格与人数换算",
                     "decision": "allow", "kind": "price",
-                    "query_context_update": context_update,
+                    "query_context_update": {**context_update, **selected_context},
                 }
 
         # “一条鱼/单条/整条” is an ordinary package description, not a literal
@@ -2887,6 +2899,11 @@ class V2Store(AppStore):
             context_update = make_context("day_type")
         elif len(matched) == 1:
             reply = self._format_conditional_option(matched[0], slots)
+            context_update = {
+                **context_update,
+                "selected_sku_key": self.sku_key_for_option(matched[0]),
+                "selected_sku_name": str(matched[0].get("name") or "商品规格").strip(),
+            }
         else:
             reply = "符合条件的商品如下：\n" + "\n".join(
                 self._format_conditional_option(option, slots) for option in matched
@@ -4372,6 +4389,12 @@ class V2Store(AppStore):
             total_cap = unit_value * maximum
 
         delivered = self._purchase_contents_label(selected)
+        delivered_count = sum(count for _, count in pairs)
+        option_total = self._option_total_value(selected)
+        option_name = str(
+            selected.get("name") or f"{self._format_number(option_total)}元规格"
+        ).strip()
+        option_price = self._format_number(selected.get("sale_price") or "")
         mixed = (
             "支持不同面额代金券一起使用"
             if re.search(
@@ -4381,9 +4404,28 @@ class V2Store(AppStore):
             )
             else "不同面额的券不能混用"
         )
+        intro = option_name
+        if option_price:
+            intro += f"售价{option_price}元"
+        intro += f"，购买后发放{delivered}。"
+        if delivered_count > 1 and delivered_count <= maximum and option_total:
+            usage = (
+                f"这{delivered_count}张可以同一次使用，"
+                f"合计抵扣{self._format_number(option_total)}元；"
+            )
+            cap = (
+                f"每次最多使用{maximum}张"
+                f"{self._format_number(unit_value)}元券"
+            )
+        else:
+            usage = ""
+            cap = (
+                f"每次最多使用{maximum}张"
+                f"{self._format_number(unit_value)}元券，共可抵扣"
+                f"{self._format_number(total_cap)}元"
+            )
         return (
-            f"该商品购买后发放{delivered}，一桌一次最多使用{maximum}张，"
-            f"共可抵扣{self._format_number(total_cap)}元；{mixed}。"
+            f"{intro}{usage}{cap}；{mixed}。"
         )
 
     def stacking_reply(self, product: Dict, message: str) -> str:
@@ -7885,6 +7927,26 @@ class V2Store(AppStore):
             text,
             re.I,
         )
+        # A location statement is itself a store query. Probe the configured
+        # store dictionary so “深圳五和店三人明天中午” and a bare city/address
+        # can join the condition-price task without requiring “能用吗”.
+        statement_probe = None
+        if not store_trigger and is_meaningful_store_query(store_query):
+            statement_scope = self._multi_sku_store_scope(item_id, product)
+            statement_union = (
+                statement_scope.get("list_ids")
+                if statement_scope.get("stores_differ") else None
+            )
+            statement_probe = self.search_store(
+                item_id, text, list_ids_override=statement_union,
+            )
+            statement_query = str(
+                statement_probe.get("resolved_query") or store_query
+            ).strip()
+            if self.is_explicit_store_query(text, statement_query, statement_probe):
+                store_trigger = re.search(
+                    re.escape(statement_query), text, re.I,
+                ) or re.match(r".", text)
         if store_trigger:
             multi_store_scope = self._multi_sku_store_scope(item_id, product)
             union_ids = (
@@ -7900,7 +7962,9 @@ class V2Store(AppStore):
             # First let the configured store dictionary extract the smallest
             # grounded location directly from the untouched sentence.  Only
             # fall back to phrase deletion when no known location was found.
-            raw_probe = probe_store(text) if is_meaningful_store_query(text) else None
+            raw_probe = statement_probe or (
+                probe_store(text) if is_meaningful_store_query(text) else None
+            )
             if (
                 raw_probe and raw_probe.get("resolved_query")
                 and normalize_text(raw_probe.get("resolved_query")) != normalize_text(text)
@@ -8024,6 +8088,12 @@ class V2Store(AppStore):
             store_payload = dict(store_task[3] or {})
             store_query_value = str(store_payload.get("query") or "").strip()
             sku_text = str(store_payload.get("sku_text") or "").strip()
+            if not sku_text and conditional_child:
+                sku_text = str(
+                    (conditional_child.get("query_context_update") or {}).get(
+                        "selected_sku_name"
+                    ) or ""
+                ).strip()
             store_child_cache = self.resolve_deterministic(
                 item_id, f"{sku_text}{store_query_value}可以用吗", actual_paid_amount,
                 store_context, order_context, _allow_multi=False,
@@ -8081,9 +8151,13 @@ class V2Store(AppStore):
                 child_results.append(child)
             replies.append((label, reply.rstrip(" \t\r\n")))
 
+        ordered_tasks = sorted(tasks, key=lambda value: value[0])
+        compact_store_condition = {
+            kind for _, kind, _, _ in ordered_tasks
+        }.issubset({"store", "conditions"})
         result = {
             "reply": "\n\n".join(
-                f"{index}. {label}：{reply}"
+                reply if compact_store_condition else f"{index}. {label}：{reply}"
                 for index, (label, reply) in enumerate(replies, start=1)
             ),
             "source": "多个独立问题分别使用当前商品与门店资料回答",
@@ -8095,7 +8169,7 @@ class V2Store(AppStore):
             ),
             "kind": "multi_intent",
             "resolved_intents": [
-                kind for _, kind, _, _ in sorted(tasks, key=lambda value: value[0])
+                kind for _, kind, _, _ in ordered_tasks
             ],
         }
         store_child = next((

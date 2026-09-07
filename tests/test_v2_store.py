@@ -2667,7 +2667,7 @@ class V2StoreTests(unittest.TestCase):
         self.store.save_v2_product("10001", "成人自助", "成人双人券：售价176元")
         result = self.store.resolve_deterministic("10001", "两大一小多少钱")
         self.assertIn("176元", result["reply"])
-        self.assertIn("没有“儿童票”这一有货规格", result["reply"])
+        self.assertIn("\n\n当前商品暂时没有“儿童票”这一规格", result["reply"])
         self.assertIn("到店咨询", result["reply"])
         self.assertNotIn("三人", result["reply"])
 
@@ -2824,9 +2824,10 @@ class V2StoreTests(unittest.TestCase):
             "10001", "200代金券一次可以用几张",
         )
         self.assertEqual("stacking", result["kind"])
+        self.assertIn("200元代金券售价108元", result["reply"])
         self.assertIn("发放2张100元代金券", result["reply"])
-        self.assertIn("一次最多使用2张", result["reply"])
-        self.assertIn("共可抵扣200元", result["reply"])
+        self.assertIn("这2张可以同一次使用，合计抵扣200元", result["reply"])
+        self.assertIn("每次最多使用2张100元券", result["reply"])
         self.assertNotIn("200元代金券可以叠加", result["reply"])
 
     def test_location_landmark_matches_branch_with_unspoken_district_prefix(self):
@@ -2945,7 +2946,8 @@ class V2StoreTests(unittest.TestCase):
             ),
             "一次可以用几张": (
                 "stacking",
-                "该商品购买后发放100元代金券，一桌一次最多使用2张，共可抵扣200元；"
+                "100元代金券售价54元，购买后发放100元代金券。"
+                "每次最多使用2张100元券，共可抵扣200元；"
                 "不同面额的券不能混用。",
             ),
             "人工": (
@@ -3599,6 +3601,85 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("2张100元代金券", result["reply"])
         self.assertIn("111.8元", result["reply"])
         self.assertIn("可抵扣200元", result["reply"])
+
+    def test_condition_only_people_day_and_meal_defaults_to_sku_price(self):
+        self.store.save_v2_product(
+            "10001", "奶糖爸爸自助小火锅",
+            "单人自助：48.9元。平日周末全天通用，几人拍几张。",
+        )
+        self.store.save_ai_summary("10001", "单人自助", {
+            "sale_options": [{
+                "name": "奶糖爸爸自助小火锅单人自助",
+                "sale_price": "48.9", "people_counts": [1],
+                "applicable_time": "平日周末全天通用",
+            }],
+        })
+        for message in ("三人明天中午", "明天中午三人"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("price", result["kind"])
+                self.assertIn("3人需要购买3份", result["reply"])
+                self.assertIn("单价48.9元", result["reply"])
+                self.assertIn("共146.7元", result["reply"])
+
+    def test_location_and_condition_statement_combines_store_and_sku_price(self):
+        self.store.save_v2_product(
+            "10001", "奶糖爸爸自助小火锅",
+            "单人自助：48.9元。平日周末全天通用，几人拍几张。",
+        )
+        self.store.save_ai_summary("10001", "单人自助", {
+            "sale_options": [{
+                "name": "奶糖爸爸自助小火锅单人自助",
+                "sale_price": "48.9", "people_counts": [1],
+                "applicable_time": "平日周末全天通用",
+            }],
+        })
+        self.store.import_store_text(
+            "【广东省】\n【深圳】五和店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "深圳五和店三人明天中午",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "conditions"], result["resolved_intents"])
+        self.assertIn("五和店", result["reply"])
+        self.assertIn("3人需要购买3份", result["reply"])
+        self.assertIn("共146.7元", result["reply"])
+        self.assertIn("\n\n", result["reply"])
+        self.assertNotIn("1. 适用门店", result["reply"])
+
+    def test_composed_sku_quantity_reply_uses_delivered_coupon_units(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "200元代金券：售价111.8元，发100元券2张，最多使用2张。"
+            "仅支持同面额代金券叠加，不同面额不能混用。",
+        )
+        result = self.store.resolve_deterministic("10001", "200可以用几张")
+        self.assertEqual("stacking", result["kind"])
+        self.assertIn("售价111.8元", result["reply"])
+        self.assertIn("发放2张100元代金券", result["reply"])
+        self.assertIn("合计抵扣200元", result["reply"])
+        self.assertIn("最多使用2张100元券", result["reply"])
+        self.assertNotIn("200元代金券可以叠加", result["reply"])
+
+    def test_mixed_audience_result_is_split_into_paragraphs(self):
+        self.store.save_v2_product(
+            "10001", "奶糖爸爸自助小火锅",
+            "单人自助：48.9元。几人拍几张。儿童价格以门店为准。",
+        )
+        self.store.save_ai_summary("10001", "单人自助", {
+            "sale_options": [{
+                "name": "奶糖爸爸自助小火锅单人自助",
+                "sale_price": "48.9", "people_counts": [1],
+            }],
+        })
+        result = self.store.resolve_deterministic(
+            "10001", "2位成人1位儿童多少钱",
+        )
+        self.assertEqual("audience_price", result["kind"])
+        self.assertIn("2位成人需要购买2张", result["reply"])
+        self.assertIn("共97.8元。\n\n当前商品暂时没有“儿童票”", result["reply"])
+        self.assertNotIn("您好，本店目前没有", result["reply"])
 
     def test_colloquial_purchase_timing_and_store_are_answered_separately(self):
         self.store.save_v2_product(
