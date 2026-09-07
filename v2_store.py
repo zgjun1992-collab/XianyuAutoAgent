@@ -78,6 +78,21 @@ GENERIC_STORE_LANDMARKS = (
     "奥特莱斯", "ifs", "mall",
 )
 
+STORE_RELATION_WORDS = (
+    "附近", "旁边", "对面", "楼上", "楼下", "隔壁", "周边",
+)
+
+STORE_QUERY_NEUTRAL_WORDS = (
+    "请问一下", "麻烦帮忙", "麻烦帮我", "帮忙查一下", "帮我查一下",
+    "帮忙看看", "帮我看看", "请问", "麻烦", "帮忙", "帮我", "查一下",
+    "查下", "看一下", "看下", "我想问", "想问", "咨询一下", "咨询",
+    "那个门店", "这个门店", "那家门店", "这家门店", "那个店", "这个店",
+    "那家", "这家", "那边", "这边", "当前", "现在", "今天", "一下",
+    "可以使用", "可以用", "能不能用", "可不可以用", "是否可用", "能用",
+    "可用", "适用", "支持", "有没有", "有吗", "有不", "行不行", "行吗",
+    "的吗", "的么", "的嘛", "的", "吗", "嘛", "么", "呀", "呢", "吧",
+)
+
 try:
     CHINA_TZ = ZoneInfo("Asia/Shanghai")
 except ZoneInfoNotFoundError:
@@ -5784,6 +5799,34 @@ class V2Store(AppStore):
     ) -> Optional[Dict]:
         """Turn uncertain store matches into a confirmation, never an availability claim."""
         status = str(result.get("status") or "")
+        if status == "relation_query":
+            relation = "、".join(result.get("relation_words") or []) or "附近"
+            return {
+                "reply": (
+                    f"当前门店资料不能准确判断“{relation}”的位置关系。"
+                    "请发送要核对的完整门店名、商场名或门店地址。"
+                ),
+                "source": "门店位置关系缺少可验证地址锚点",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [], "store_query": query,
+                "store_status": "location_relation_unverified",
+            }
+        if status == "excluded_query":
+            return {
+                "reply": "已排除该门店。请发送您实际要查询的完整门店名、商场名或所在城市。",
+                "source": "门店排除问法缺少替代目标",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [], "store_query": query,
+                "store_status": "missing_target",
+            }
+        if status == "conflicting_scope":
+            return {
+                "reply": "消息中包含多个不同地区。请一次发送一个城市、区县或具体门店名称，我再准确核对。",
+                "source": "门店查询包含冲突地域锚点",
+                "decision": "allow", "kind": "stores_clarify",
+                "store_matches": [], "store_query": query,
+                "store_status": "conflicting_scope",
+            }
         if status == "ambiguous_area":
             count = int(result.get("candidate_count") or len(result.get("matches") or []))
             return {
@@ -6285,6 +6328,191 @@ class V2Store(AppStore):
                 return False
         return True
 
+    @staticmethod
+    def _store_query_target(value: object) -> Dict:
+        """Keep one explicit correction target and expose unsafe relations.
+
+        A correction such as “不是梦时代，是万象城” has a clear right-hand
+        target.  A relation such as “梦时代旁边” cannot be proved from a store
+        table, so the caller must ask for an exact store or address.
+        """
+        original = str(value or "").strip()
+        target = original
+        corrected = False
+        correction = re.search(
+            r"(?:不是|不要|别查|不查).{1,40}?"
+            r"(?:而是|改成|[，,；;]\s*(?:是|查|要))\s*(.{2,80})$",
+            original,
+        )
+        if correction:
+            target = correction.group(1).strip(" ，,。；;：:!?！？")
+            corrected = bool(target)
+        relation_words = [word for word in STORE_RELATION_WORDS if word in target]
+        excluded_without_target = bool(
+            not corrected and re.search(r"(?:不是|不要|别查|不查)", target)
+        )
+        return {
+            "original": original,
+            "target": target or original,
+            "corrected": corrected,
+            "relation_words": relation_words,
+            "excluded_without_target": excluded_without_target,
+        }
+
+    @classmethod
+    def _clean_store_search_term(cls, value: object) -> str:
+        """Remove conversational filler after grounded entities were parsed."""
+        key = cls._store_fuzzy_key(value)
+        for word in sorted(STORE_QUERY_NEUTRAL_WORDS, key=len, reverse=True):
+            key = key.replace(cls._store_fuzzy_key(word), "")
+        return key.strip()
+
+    @classmethod
+    def _grounded_store_aliases(cls, value: object, field: str) -> List[str]:
+        """Return conservative aliases derived from one configured field."""
+        display = str(value or "").strip()
+        if not display:
+            return []
+        aliases = {cls._store_fuzzy_key(display)}
+        if field == "brand":
+            aliases.update(
+                cls._store_fuzzy_key(part)
+                for part in re.split(r"[·•・|丨/\\\s]+", display)
+                if len(normalize_match_text(part)) >= 2
+            )
+        elif field == "branch":
+            normalized = normalize_match_text(display)
+            for suffix in ("旗舰店", "分店", "门店", "店"):
+                suffix_key = normalize_match_text(suffix)
+                if normalized.endswith(suffix_key) and len(normalized) > len(suffix_key) + 1:
+                    aliases.add(cls._store_fuzzy_key(normalized[:-len(suffix_key)]))
+        return sorted(
+            (alias for alias in aliases if len(alias) >= 2),
+            key=len, reverse=True,
+        )
+
+    @classmethod
+    def _store_scope_conflict(cls, rows: List[Dict], query: str) -> bool:
+        """Reject explicit alternatives that point at incompatible regions."""
+        query_key = normalize_match_text(query)
+        if not re.search(r"还是|或者|或是|[、/]", str(query or "")):
+            return False
+        for field in ("province", "city", "district"):
+            hits = {
+                cls._admin_key(row.get(field))
+                for row in rows
+                if row.get(field)
+                and len(cls._admin_key(row.get(field))) >= 2
+                and cls._admin_key(row.get(field)) in query_key
+            }
+            if len(hits) > 1:
+                return True
+        return False
+
+    @classmethod
+    def _store_match_evidence(
+        cls, row: Dict, query_key: str, province_scope: str,
+        city_scope: str, district_scope: str, brand_alias: str = "",
+    ) -> Dict:
+        """Score independent, locally grounded anchors for one store row."""
+        branch_key = cls._store_fuzzy_key(row.get("branch"))
+        local_branch_key = cls._local_branch_key(row, branch_key)
+        combined_key = cls._store_fuzzy_key("".join(
+            str(row.get(field) or "") for field in ("district", "branch")
+        ))
+        address_key = cls._store_fuzzy_key(row.get("address"))
+        aliases = list(dict.fromkeys(
+            cls._grounded_store_aliases(row.get("branch"), "branch")
+            + ([local_branch_key] if len(local_branch_key) >= 2 else [])
+            + ([combined_key] if len(combined_key) >= 2 else [])
+        ))
+        evidence = []
+        score = 0
+        quality = "none"
+        matched_anchor = ""
+
+        if province_scope:
+            evidence.append({"type": "province", "value": str(row.get("province") or ""), "score": 20})
+        if city_scope:
+            evidence.append({"type": "city", "value": str(row.get("city") or ""), "score": 25})
+        if district_scope:
+            evidence.append({"type": "district", "value": str(row.get("district") or ""), "score": 35})
+        if brand_alias:
+            evidence.append({"type": "brand", "value": str(row.get("brand") or ""), "score": 20})
+
+        exact_aliases = [alias for alias in aliases if query_key == alias]
+        if exact_aliases:
+            matched_anchor = max(exact_aliases, key=len)
+            score, quality = 100, "exact"
+            evidence.append({"type": "branch", "value": matched_anchor, "score": 100})
+        else:
+            contained_aliases = [
+                alias for alias in aliases
+                if alias and (query_key in alias or alias in query_key)
+            ]
+            if contained_aliases:
+                candidate = max(contained_aliases, key=len)
+                matched_anchor = candidate if candidate in query_key else query_key
+                score, quality = 90, "contained"
+                evidence.append({"type": "branch", "value": candidate, "score": 90})
+
+        if query_key and address_key and query_key in address_key:
+            address_score = 90 if re.search(r"\d+号", query_key) else 85
+            if address_score > score:
+                score, quality = address_score, "address"
+                matched_anchor = query_key
+            evidence.append({"type": "address", "value": query_key, "score": address_score})
+
+        ratios = [
+            (SequenceMatcher(None, query_key, alias).ratio(), alias)
+            for alias in aliases if query_key and alias
+        ]
+        best_ratio, best_alias = max(ratios, default=(0.0, ""))
+        if score < 75 and best_ratio >= 0.76:
+            score, quality = round(best_ratio * 80), "fuzzy"
+            matched_anchor = query_key
+            evidence.append({"type": "fuzzy_branch", "value": best_alias, "score": score})
+
+        if (
+            score < 85 and (province_scope or city_scope or district_scope)
+            and local_branch_key and cls._within_one_edit(query_key, local_branch_key)
+        ):
+            score, quality = 85, "fuzzy"
+            matched_anchor = query_key
+            evidence.append({"type": "one_edit_branch", "value": local_branch_key, "score": 85})
+
+        query_pinyin = cls._pinyin_key(query_key)
+        pinyin_keys = {
+            cls._pinyin_key(alias) for alias in aliases if alias
+        }
+        pinyin_keys.discard("")
+        if len(query_pinyin) >= 6 and any(
+            query_pinyin == key or query_pinyin in key
+            or ((province_scope or city_scope or district_scope) and key in query_pinyin)
+            for key in pinyin_keys
+        ):
+            if quality != "exact":
+                score, quality = max(score, 90), "phonetic"
+                matched_anchor = query_key
+            evidence.append({"type": "unique_phonetic_candidate", "value": query_key, "score": 90})
+
+        unexplained = query_key
+        removable = [matched_anchor, brand_alias]
+        removable.extend(
+            cls._admin_key(row.get(field)) for field in ("province", "city", "district")
+        )
+        for alias in sorted((value for value in removable if len(value) >= 2), key=len, reverse=True):
+            unexplained = unexplained.replace(alias, "", 1)
+        unexplained = cls._clean_store_search_term(unexplained)
+        if unexplained:
+            score = max(0, score - 25)
+            evidence.append({"type": "unresolved", "value": unexplained, "score": -25})
+
+        return {
+            "score": int(score), "quality": quality,
+            "evidence": evidence, "unresolved": unexplained,
+        }
+
     @classmethod
     def _best_location_query(cls, rows: List[Dict], query: str) -> str:
         """Extract the most specific known location from a noisy buyer sentence.
@@ -6590,21 +6818,20 @@ class V2Store(AppStore):
         remainder_key = cls._store_fuzzy_key(remainder)
         full_key = cls._store_fuzzy_key(query_norm)
 
-        brands = sorted(
-            {
-                (cls._store_fuzzy_key(row.get("brand")), str(row.get("brand") or "").strip())
-                for row in rows if row.get("brand")
-            },
-            key=lambda item: len(item[0]), reverse=True,
-        )
-        brand_key = brand = ""
-        for candidate_key, candidate in brands:
-            if len(candidate_key) >= 2 and candidate_key in full_key:
-                brand_key, brand = candidate_key, candidate
+        brands = sorted({
+            (alias, cls._store_fuzzy_key(row.get("brand")), str(row.get("brand") or "").strip())
+            for row in rows if row.get("brand")
+            for alias in cls._grounded_store_aliases(row.get("brand"), "brand")
+        }, key=lambda item: len(item[0]), reverse=True)
+        brand_alias = brand_key = brand = ""
+        for candidate_alias, candidate_key, candidate in brands:
+            if len(candidate_alias) >= 2 and candidate_alias in full_key:
+                brand_alias, brand_key, brand = candidate_alias, candidate_key, candidate
                 break
-        if brand_key:
-            remainder_key = remainder_key.replace(brand_key, "", 1)
+        if brand_alias:
+            remainder_key = remainder_key.replace(brand_alias, "", 1)
             remainder_key = re.sub(r"^(?:的|在|位于)+|(?:的|那边|这边|地区)$", "", remainder_key)
+        remainder_key = cls._clean_store_search_term(remainder_key)
 
         branches = sorted(
             {
@@ -6623,13 +6850,15 @@ class V2Store(AppStore):
 
         return {
             "province": province, "city": city, "district": district,
-            "brand": brand, "brand_key": brand_key,
+            "brand": brand, "brand_key": brand_key, "brand_alias": brand_alias,
             "branch": branch, "branch_key": branch_key,
             "search_term": "" if branch else remainder_key,
         }
 
     def search_store(self, item_id: str, query: str, limit: Optional[int] = None,
                      sku_key: str = "", list_ids_override: Optional[List[int]] = None) -> Dict:
+        query_meta = self._store_query_target(query)
+        query = str(query_meta["target"] or query)
         query_norm = normalize_text(query)
         # Intent words such as “问题/门店/查询” are not locations.  Refuse them
         # before fuzzy matching so a generic question can never accidentally
@@ -6664,6 +6893,28 @@ class V2Store(AppStore):
                 str(row["branch"] or row["brand"] or "")
             )
         ]
+        input_query = query
+        cleaned_query = extract_store_query(query)
+        if is_meaningful_store_query(cleaned_query):
+            query = cleaned_query
+            query_norm = normalize_text(query)
+        if query_meta["relation_words"]:
+            return {
+                "status": "relation_query", "matches": [],
+                "resolved_query": query,
+                "specific_query": query,
+                "relation_words": query_meta["relation_words"],
+            }
+        if query_meta["excluded_without_target"]:
+            return {
+                "status": "excluded_query", "matches": [],
+                "resolved_query": query, "specific_query": query,
+            }
+        if self._store_scope_conflict(rows, query):
+            return {
+                "status": "conflicting_scope", "matches": [],
+                "resolved_query": query, "specific_query": query,
+            }
         entities = self._parse_store_query_entities(rows, query_norm)
         original_scope = (
             entities["province"], entities["city"], entities["district"],
@@ -6674,7 +6925,11 @@ class V2Store(AppStore):
         exact_brand_area_query = original_area and bool(entities["brand"])
         # “宜家武汉/武汉宜家” already contains two reliable entities. Fuzzy
         # branch recovery must not rewrite it to an invented full branch name.
-        resolved_query = "" if exact_brand_area_query else self._best_location_query(rows, query)
+        has_street_number = bool(re.search(r"(?:路|街|道|巷)\s*\d+号", str(query or "")))
+        resolved_query = (
+            "" if exact_brand_area_query or has_street_number
+            else self._best_location_query(rows, input_query)
+        )
         if resolved_query:
             query = resolved_query
             query_norm = normalize_text(query)
@@ -6694,7 +6949,7 @@ class V2Store(AppStore):
                 row for row in rows
                 if self._store_fuzzy_key(row.get("brand")) == entities["brand_key"]
             ]
-            search_term = search_term.replace(entities["brand_key"], "", 1)
+            search_term = search_term.replace(entities["brand_alias"], "", 1)
             search_term = re.sub(
                 r"^(?:的|在|位于)+|(?:的|那边|这边|地区)$", "", search_term
             )
@@ -6735,137 +6990,46 @@ class V2Store(AppStore):
         if (province_scope or city_scope or district_scope) and not search_term:
             for item in rows:
                 item["score"] = 1.1
+                item["match_score"] = 100
                 item["match_quality"] = "area"
+                item["match_evidence"] = [
+                    {"type": field, "value": str(item.get(field) or ""), "score": score}
+                    for field, score, scope in (
+                        ("province", 20, province_scope),
+                        ("city", 25, city_scope),
+                        ("district", 35, district_scope),
+                    ) if scope
+                ]
+                item["unresolved_terms"] = []
             matches = rows
         else:
-            query_key = self._store_fuzzy_key(search_term or query_norm)
-            direct = []
-            fuzzy = []
-            phonetic = []
+            query_key = self._clean_store_search_term(search_term or query_norm)
+            strong = []
+            uncertain = []
             for item in rows:
                 store_name = str(item.get("branch") or item.get("brand") or "").strip()
                 if self._looks_like_product_title(store_name):
                     continue
-                branch_key = self._store_fuzzy_key(item.get("branch"))
-                local_branch_key = self._local_branch_key(item, branch_key)
-                combined_key = self._store_fuzzy_key("".join(str(item.get(key) or "") for key in (
-                    "district", "branch",
-                )))
-                # Textual shopping-centre and landmark names may live only in
-                # the address column (for example branch “武汉首店”, address
-                # “武商梦时代”). Pure amount queries still never reach this
-                # path, so they cannot hit a door number such as 300号.
-                address_key = ""
-                address_query = search_term or query_norm
-                if (
-                    re.search(r"(?:路|街|道|巷|号|大厦|中心)", address_query)
-                    or re.search(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", address_query)
-                ):
-                    address_key = self._store_fuzzy_key(item.get("address"))
-                # Generic labels such as “广场店” can normalize to an empty
-                # key.  Empty-string containment is always true in Python and
-                # previously let an unrelated “任丘悦都汇店” match that row.
-                branch_key = branch_key if len(branch_key) >= 2 else ""
-                local_branch_key = local_branch_key if len(local_branch_key) >= 2 else ""
-                combined_key = combined_key if len(combined_key) >= 2 else ""
-                address_key = address_key if len(address_key) >= 2 else ""
-
-                grounded_keys = [
-                    self._store_fuzzy_key(item.get(field))
-                    for field in ("brand", "province", "city", "district")
-                ]
-                unexplained = query_key
-                for grounded_key in sorted(
-                    (value for value in grounded_keys if len(value) >= 2),
-                    key=len, reverse=True,
-                ):
-                    unexplained = unexplained.replace(grounded_key, "", 1)
-                if branch_key:
-                    unexplained = unexplained.replace(branch_key, "", 1)
-                has_unverified_qualifier = bool(
-                    not (province_scope or city_scope or district_scope)
-                    and branch_key and branch_key in query_key
-                    and len(unexplained) >= 2
+                scored = self._store_match_evidence(
+                    item, query_key, province_scope, city_scope, district_scope,
+                    entities.get("brand_alias") or "",
                 )
-
-                if not query_key:
-                    score = 0.0
-                    quality = "none"
-                elif branch_key and (
-                    query_key == branch_key
-                    or (local_branch_key and query_key == local_branch_key)
-                ):
-                    score = 1.1
-                    quality = "exact"
-                elif (
-                    (branch_key and query_key in branch_key)
-                    or (branch_key and branch_key in query_key and not has_unverified_qualifier)
-                    or (
-                        (province_scope or city_scope or district_scope)
-                        and local_branch_key
-                        and (query_key in local_branch_key or local_branch_key in query_key)
-                    )
-                ):
-                    score = 1.02
-                    quality = "contained"
-                elif combined_key and query_key in combined_key:
-                    score = 1.0
-                    quality = "contained"
-                elif address_key and query_key in address_key:
-                    score = 1.0
-                    quality = "address"
-                else:
-                    scores = [
-                        SequenceMatcher(None, query_key, value).ratio()
-                        for value in (branch_key, local_branch_key, combined_key) if value
-                    ] or [0.0]
-                    if address_key:
-                        scores.append(SequenceMatcher(None, query_key, address_key).ratio())
-                    score = max(scores)
-                    if has_unverified_qualifier:
-                        # Keep a plausible tail as a confirmation candidate,
-                        # never as a positive availability match.
-                        score = max(score, 0.8)
-                    if (
-                        (province_scope or city_scope or district_scope)
-                        and self._within_one_edit(query_key, local_branch_key)
-                    ):
-                        score = max(score, 0.86)
-                    quality = "fuzzy"
-                    query_pinyin = self._pinyin_key(query_key)
-                    phonetic_values = [branch_key, combined_key]
-                    if province_scope or city_scope or district_scope:
-                        phonetic_values.append(local_branch_key)
-                    pinyin_keys = {
-                        self._pinyin_key(value) for value in phonetic_values if value
-                    }
-                    pinyin_keys.discard("")
-                    if len(query_pinyin) >= 6 and pinyin_keys:
-                        if any(
-                            query_pinyin == key or query_pinyin in key
-                            or (
-                                (province_scope or city_scope or district_scope)
-                                and key in query_pinyin
-                            )
-                            for key in pinyin_keys
-                        ):
-                            score = max(score, 0.96)
-                            quality = "phonetic"
-                item["score"] = round(score, 3)
-                item["match_quality"] = quality
-                if quality in {"exact", "contained", "address"}:
-                    direct.append(item)
-                elif quality == "phonetic":
-                    phonetic.append(item)
-                elif score >= 0.76:
-                    fuzzy.append(item)
-            matches = direct
-            if not matches and phonetic:
-                best = max(value["score"] for value in phonetic)
-                matches = [value for value in phonetic if value["score"] >= best - 0.02]
-            if not matches and fuzzy:
-                best = max(value["score"] for value in fuzzy)
-                matches = [value for value in fuzzy if value["score"] >= best - 0.05]
+                item["score"] = round(scored["score"] / 100, 3)
+                item["match_score"] = scored["score"]
+                item["match_quality"] = scored["quality"]
+                item["match_evidence"] = scored["evidence"]
+                item["unresolved_terms"] = [scored["unresolved"]] if scored["unresolved"] else []
+                if scored["score"] >= 85 and not scored["unresolved"]:
+                    strong.append(item)
+                elif scored["score"] >= 60:
+                    uncertain.append(item)
+            matches = strong
+            if matches:
+                best = max(value["match_score"] for value in matches)
+                matches = [value for value in matches if value["match_score"] >= best - 15]
+            elif uncertain:
+                best = max(value["match_score"] for value in uncertain)
+                matches = [value for value in uncertain if value["match_score"] >= best - 5]
         matches.sort(
             key=lambda value: (
                 -value["score"], value.get("province") or "", value.get("city") or "",
@@ -6881,10 +7045,11 @@ class V2Store(AppStore):
             seen.add(key)
             unique.append(item)
         matches = unique[: max(1, int(limit))] if limit else unique
+        output_query = query if resolved_query else input_query
         scoped_query = "".join(filter(None, (
             district_scope or city_scope or province_scope,
             search_term,
-        ))) or query
+        ))) or output_query
         generic_key = self._store_fuzzy_key(search_term or query_norm)
         generic_without_area = (
             not (province_scope or city_scope or district_scope)
@@ -6895,36 +7060,50 @@ class V2Store(AppStore):
                 "status": "ambiguous_area", "matches": matches,
                 "province": province_scope, "city": city_scope,
                 "district": district_scope, "search_term": search_term,
-                "resolved_query": query, "specific_query": scoped_query,
+                "resolved_query": output_query, "specific_query": scoped_query,
                 "candidate_count": len(matches),
             }
         if not matches:
             return {
                 "status": "unavailable", "matches": [], "province": province_scope,
                 "city": city_scope, "district": district_scope, "search_term": search_term,
-                "resolved_query": query, "specific_query": scoped_query,
+                "resolved_query": output_query, "specific_query": scoped_query,
             }
         unique_high_phonetic = bool(
             len(matches) == 1
             and matches[0].get("match_quality") == "phonetic"
-            and float(matches[0].get("score") or 0) >= 0.94
+            and int(matches[0].get("match_score") or 0) >= 90
+            and not matches[0].get("unresolved_terms")
+        )
+        close_competing_candidates = bool(
+            len(generic_key) >= 4 and search_term and len(matches) > 1
+            and int(matches[0].get("match_score") or 0)
+            - int(matches[1].get("match_score") or 0) < 20
+        )
+        uncertain_evidence = bool(
+            matches and all(
+                int(item.get("match_score") or 0) < 85
+                or bool(item.get("unresolved_terms"))
+                or item.get("match_quality") == "fuzzy"
+                for item in matches
+            )
         )
         if (
-            all(item.get("match_quality") in {"fuzzy", "phonetic"} for item in matches)
-            and not unique_high_phonetic
+            close_competing_candidates
+            or (uncertain_evidence and not unique_high_phonetic)
         ):
             return {
                 "status": "needs_confirmation", "matches": matches,
                 "province": province_scope, "city": city_scope,
                 "district": district_scope, "search_term": search_term,
-                "sku_key": sku_key, "mode": mode, "resolved_query": query,
+                "sku_key": sku_key, "mode": mode, "resolved_query": output_query,
                 "specific_query": scoped_query,
             }
         return {
             "status": "available", "matches": matches, "province": province_scope,
             "city": city_scope, "district": district_scope, "search_term": search_term,
             "sku_key": sku_key, "mode": mode,
-            "resolved_query": query,
+            "resolved_query": output_query,
         }
 
     @staticmethod

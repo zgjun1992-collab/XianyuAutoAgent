@@ -933,6 +933,69 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("武汉首店", result["reply"])
         self.assertEqual("address", result["store_matches"][0]["match_quality"])
 
+        evidence = result["store_matches"][0]["match_evidence"]
+        self.assertIn("address", {item["type"] for item in evidence})
+        self.assertGreaterEqual(result["store_matches"][0]["match_score"], 85)
+        self.assertEqual([], result["store_matches"][0]["unresolved_terms"])
+
+    def test_store_query_ignores_neutral_words_but_keeps_grounded_anchors(self):
+        path = os.path.join(self.temp.name, "neutral-query-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "区/县", "地址"])
+        sheet.append([
+            "胡恰·景德江西菜", "武汉首店", "湖北", "武汉", "武昌区",
+            "中南路街道武珞路598号武商梦时代7层B区711号",
+        ])
+        book.save(path)
+        self.store.import_store_list(path, "胡恰门店", ["10001"])
+
+        result = self.store.resolve_deterministic(
+            "10001", "麻烦帮我看一下梦时代那家能不能用"
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("武汉首店", result["reply"])
+
+    def test_store_relation_query_requires_exact_store_or_address(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】武昌梦时代店", "武汉门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "武汉梦时代旁边那家能用吗")
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("location_relation_unverified", result["store_status"])
+        self.assertNotIn("可以使用", result["reply"])
+
+    def test_store_correction_uses_only_replacement_target(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】武汉梦时代店、武汉万象城店",
+            "武汉门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "不是梦时代，是武汉万象城能用吗"
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("武汉万象城店", result["reply"])
+        self.assertNotIn("武汉梦时代店", result["reply"])
+
+    def test_store_query_with_conflicting_regions_requires_clarification(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】武汉万象城店\n"
+            "【江苏省】\n【南京】南京万象城店",
+            "跨地区门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "武汉还是南京万象城能用吗")
+        self.assertEqual("stores_clarify", result["kind"])
+        self.assertEqual("conflicting_scope", result["store_status"])
+
+    def test_store_street_and_house_number_are_strong_address_evidence(self):
+        self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
+        result = self.store.search_store("10001", "复兴路69号")
+        self.assertEqual("available", result["status"])
+        self.assertEqual("华熙五棵松店", result["matches"][0]["branch"])
+        self.assertEqual("address", result["matches"][0]["match_quality"])
+        self.assertEqual(90, result["matches"][0]["match_score"])
+
     def test_city_with_which_stores_wording_lists_only_that_city(self):
         self.store.import_store_text(
             "【广东省】\n【深圳】南昌品牌深圳店\n【江西省】\n【南昌】万寿宫店、北京东路店",
