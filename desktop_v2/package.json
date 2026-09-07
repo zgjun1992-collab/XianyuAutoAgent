@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-v3",
-  "version": "0.9.21",
+  "version": "0.9.22",
   "private": true,
   "description": "闲鱼餐饮卡券 AI 客服 V3.5",
   "main": "electron/main.cjs",
