@@ -88,6 +88,10 @@ class FastReplyTests(unittest.TestCase):
             "济南能用吗，还有300的能直接拍吗",
             {"kind": "stores", "decision": "allow"},
         ))
+        self.assertTrue(XianyuReplyBot.should_analyze_message(
+            "吃完再买对吧 丹竹头店可以用吗",
+            {"kind": "stores", "decision": "allow"},
+        ))
         self.assertFalse(XianyuReplyBot.should_analyze_message(
             "必须退款", {"kind": "refund_dispute", "decision": "review"},
         ))

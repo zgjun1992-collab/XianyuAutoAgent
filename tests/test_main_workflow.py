@@ -263,11 +263,8 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.should_send_first_reply(message, {"kind": "stores"}))
 
-    def test_enabled_first_reply_is_mandatory_for_every_first_turn_intent(self):
+    def test_enabled_first_reply_can_be_sent_for_a_pure_greeting(self):
         self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", "greeting"))
-        for kind in ("coupon_catalog", "stores", "day_use", "price", "refund_quality"):
-            with self.subTest(kind=kind):
-                self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
         self.assertFalse(XianyuLive.should_attach_first_reply(False, "商品首次回复", "stores"))
         self.assertFalse(XianyuLive.should_attach_first_reply(True, "", "stores"))
 
@@ -280,11 +277,11 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         first = await live.send_required_first_reply(
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
-            {"first_reply_sent": 0},
+            {"first_reply_sent": 0}, "你好",
         )
         second = await live.send_required_first_reply(
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
-            {"first_reply_sent": 0},
+            {"first_reply_sent": 0}, "你好",
         )
         self.assertTrue(first)
         self.assertFalse(second)
@@ -292,7 +289,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
         self.assertEqual("assistant", live.context_manager.messages[0][3])
 
-    async def test_concrete_first_question_still_sends_required_welcome(self):
+    async def test_concrete_first_question_skips_and_consumes_welcome(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()
         product = {
@@ -303,8 +300,8 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
             {"first_reply_sent": 0}, "你好，请问双人多少钱",
         )
-        self.assertTrue(sent)
-        live.send_message_template.assert_awaited_once()
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
 
     async def test_offline_product_never_sends_first_reply(self):

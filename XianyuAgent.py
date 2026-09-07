@@ -115,7 +115,8 @@ class XianyuReplyBot:
             r"多少钱|多钱|售价|价格|怎么卖|几元|几块|抵\s*\d+|代\s*\d+",
             r"怎么用|如何使用|怎么核销|如何核销|一次.*几张|最多.*几张|叠加",
             r"限制|条件|周末|工作日|节假日|早餐|午餐|晚餐|晚市|几个人|\d+\s*人",
-            r"直接拍|直接买|可以拍|能拍|怎么买|怎么拍|如何购买",
+            r"直接拍|直接买|可以拍|能拍|怎么买|怎么拍|如何购买|"
+            r"(?:吃完|吃了|用餐后|消费后|结账前|买单前).{0,10}(?:再|才)?(?:买|拍|购买|下单)",
             r"发货|发券|怎么领取|多久到账|自动发",
             r"退款|退货|退钱|不能核销|券码无效|过期",
         )
@@ -126,7 +127,12 @@ class XianyuReplyBot:
             r"(?:吗|嘛|么|呢|怎么|如何|多少|哪|能不能|可不可以)",
             text,
         ))
-        return family_count >= 2 or question_count >= 2 or linked_questions
+        confirmation_boundary = bool(re.search(
+            r"(?:对吧|是吧|没错吧|对不对)[，,；;\s]*.{1,40}"
+            r"(?:吗|嘛|么|呢|多少|能不能|可不可以|可以用|能用)",
+            text,
+        ))
+        return family_count >= 2 or question_count >= 2 or linked_questions or confirmation_boundary
 
     @staticmethod
     def semantic_router_mode() -> str:

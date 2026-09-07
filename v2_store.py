@@ -69,13 +69,14 @@ KNOWN_PROVINCE_NAMES = {
 STORE_LANDMARK_WORDS = (
     "门店", "店里", "店能", "店可", "商场", "商圈", "广场", "购物中心", "万达", "万象城",
     "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里", "印象城", "奥特莱斯",
-    "ifs", "mall", "地址", "位置", "在哪", "电话", "号码", "营业", "开门", "打烊", "使用嘛", "用嘛",
+    "天虹", "总店", "旗舰店", "分店", "ifs", "mall", "地址", "位置", "在哪", "电话", "号码",
+    "营业", "开门", "打烊", "使用嘛", "用嘛",
 )
 
 GENERIC_STORE_LANDMARKS = (
     "万达", "万象城", "万象汇", "壹方城", "壹方天地", "万科里", "天街",
     "银泰", "吾悦", "大悦城", "来福士", "太古里", "印象城", "海岸城",
-    "奥特莱斯", "ifs", "mall",
+    "奥特莱斯", "天虹", "ifs", "mall",
 )
 
 STORE_RELATION_WORDS = (
@@ -90,6 +91,8 @@ STORE_QUERY_NEUTRAL_WORDS = (
     "那家", "这家", "那边", "这边", "当前", "现在", "今天", "一下",
     "可以使用", "可以用", "能不能用", "可不可以用", "是否可用", "能用",
     "可用", "适用", "支持", "有没有", "有吗", "有不", "行不行", "行吗",
+    "吃完再买对吧", "吃完再买", "吃了再买对吧", "吃了再买", "用餐后再买",
+    "结账前再买", "买单前再买", "对吧", "是吧", "没错吧",
     "的吗", "的么", "的嘛", "的", "吗", "嘛", "么", "呀", "呢", "吧",
 )
 
@@ -3289,6 +3292,29 @@ class V2Store(AppStore):
             return "当前商品暂时没有可购买的在售规格。"
         return "直接在当前商品页面选择需要的规格下单即可。"
 
+    @classmethod
+    def purchase_timing_reply(cls, product: Dict, message: str) -> str:
+        """Answer colloquial questions about buying after dining but before checkout."""
+        text = str(message or "").strip()
+        if not re.search(
+            r"(?:吃完|吃了|用餐后|消费后|结账前|买单前)"
+            r"[^。！？\n]{0,10}(?:再|才)?(?:买|拍|购买|下单)",
+            text,
+        ):
+            return ""
+        knowledge = "\n".join((
+            str(product.get("raw_text") or ""),
+            str(product.get("ai_summary") or ""),
+        ))
+        same_day = bool(re.search(
+            r"当天[^。；\n]{0,12}(?:购买|使用)|(?:购买|使用)[^。；\n]{0,12}当天",
+            knowledge,
+        ))
+        prefix = "可以在用餐结束后、结账前购买，并在收到券码后交给门店核销。"
+        if same_day:
+            prefix += "该券需要当天购买、当天使用。"
+        return prefix
+
     def direct_coupon_purchase_reply(self, product: Dict, message: str) -> str:
         """Confirm a specifically named denomination without expanding the catalog."""
         text = str(message or "").strip()
@@ -3961,16 +3987,28 @@ class V2Store(AppStore):
         if not bare and any(self._option_total_value(option) == self._format_number(target) for option in options):
             return None  # Keep the existing atomic answer for an actual matching SKU.
         candidates = []
+        rejected = {"inventory": False, "stack": False, "value_limit": False, "composition": False}
         global_limit = re.search(r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张", knowledge)
         value_limit = re.search(r"(?:一桌|每桌|单桌|每次)[^\n。；]{0,12}?(?:最多|上限)[^\n。；\d]{0,5}(\d+(?:\.\d+)?)\s*元", knowledge)
-        forbidden = bool(re.search(r"不可叠加|不能叠加|不支持叠加|不得叠加", knowledge))
+        mixed_face_forbidden = bool(re.search(
+            r"(?:不同面额|跨面额|混合)[^。；\n]{0,12}"
+            r"(?:不可|不能|不支持|不得)[^。；\n]{0,6}叠加|"
+            r"(?:不可|不能|不支持|不得)[^。；\n]{0,12}"
+            r"(?:不同面额|跨面额|混合)[^。；\n]{0,6}叠加",
+            knowledge,
+        ))
         same_face_stacking = bool(re.search(r"(?:支持|允许|可|仅)[^。；\n]{0,12}同面额[^。；\n]{0,12}叠加", knowledge))
+        forbidden = bool(re.search(
+            r"不可叠加|不能叠加|不支持叠加|不得叠加", knowledge
+        )) and not mixed_face_forbidden and not same_face_stacking
         for option in options:
             try:
                 face = Decimal(self._option_total_value(option))
                 price = Decimal(str(option.get("sale_price") or "0"))
-                stock = Decimal(str(option.get("stock") or "0"))
-                if face <= 0 or price <= 0 or stock <= 0 or target % face:
+                stock_text = str(option.get("stock") or "").strip()
+                stock = Decimal(stock_text) if stock_text else None
+                if face <= 0 or price <= 0 or target % face:
+                    rejected["composition"] = True
                     continue
                 quantity = int(target / face)
                 delivered = sum(int(count) for _, count in re.findall(
@@ -3978,11 +4016,21 @@ class V2Store(AppStore):
                 )) or 1
                 default_limit = quantity * delivered if same_face_stacking else delivered
                 limit = int(Decimal(str(option.get("max_stack") or (global_limit.group(1) if global_limit else default_limit))))
-                if quantity > stock or quantity * delivered > limit:
+                # A missing legacy stock field means that no explicit sell-out
+                # state was supplied.  It must not be converted into numeric
+                # zero: explicit zero remains unavailable, while an otherwise
+                # active SKU can still be planned under its stacking limit.
+                if stock is not None and (stock <= 0 or quantity > stock):
+                    rejected["inventory"] = True
+                    continue
+                if quantity * delivered > limit:
+                    rejected["stack"] = True
                     continue
                 if forbidden and quantity * delivered > 1:
+                    rejected["stack"] = True
                     continue
                 if value_limit and target > Decimal(value_limit.group(1)):
+                    rejected["value_limit"] = True
                     continue
                 candidates.append((price * quantity, quantity, option))
             except (InvalidOperation, ValueError):
@@ -3991,17 +4039,25 @@ class V2Store(AppStore):
         if not candidates:
             if not bare:
                 return None
+            if rejected["inventory"]:
+                reason = f"当前可售库存不足，无法组成抵扣{amount}元的方案。"
+            elif rejected["stack"]:
+                reason = f"当前代金券的单次使用张数限制，无法组成抵扣{amount}元的方案。"
+            elif rejected["value_limit"]:
+                reason = f"当前单桌或单次抵扣上限不足{amount}元，无法按该金额抵扣。"
+            else:
+                reason = f"当前在售面额无法准确组成抵扣{amount}元的方案。"
             return {
-                "reply": f"您需要抵扣{amount}元。目前根据库存和使用规则，暂时无法确认可抵扣该金额的购买方案，请先核实可售库存及叠加限制。",
-                "kind": "redemption_plan", "decision": "clarify",
-                "source": "当前SKU库存、适用日和叠加限制不足以确认方案",
+                "reply": reason,
+                "kind": "redemption_plan", "decision": "deny",
+                "source": "当前SKU库存、适用日期、面额与叠加限制",
             }
         total, quantity, option = min(candidates, key=lambda row: (row[1] != 1, row[0], row[1]))
         contents = self._purchase_contents_label(option, quantity)
         return {
             "reply": f"需要抵扣{amount}元的话，可以购买{contents}，共支付{self._format_number(total)}元，可抵扣{amount}元。",
             "kind": "redemption_plan", "decision": "allow",
-            "source": "当前有库存且日期适用的同一SKU及明确叠加限制",
+            "source": "当前可售且日期适用的同一SKU及明确叠加限制",
         }
 
     def consumption_plan_reply(
@@ -7797,6 +7853,15 @@ class V2Store(AppStore):
         )
         add_task("restrictions", "使用限制", restriction_match)
 
+        timing_match = re.search(
+            r"(?:吃完|吃了|用餐后|消费后|结账前|买单前)"
+            r"[^。！？\n]{0,10}(?:再|才)?(?:买|拍|购买|下单)(?:对吧|是吧|吗)?",
+            text,
+        )
+        timing_reply = self.purchase_timing_reply(product, text) if timing_match else ""
+        if timing_reply:
+            add_task("purchase_timing", "购买时机", timing_match, timing_reply)
+
         purchase_match = re.search(
             r"直接(?:拍|买)|(?:可以|能|可不可以|能不能)(?:直接)?(?:拍|买|购买)",
             text,
@@ -7813,9 +7878,10 @@ class V2Store(AppStore):
         resolved_store_query = store_query
         store_trigger = re.search(
             r"(?:可以|能|可)(?:在这)?(?:使用|用)|是否可用|适用|"
-            r"门店|店铺|商场|商圈|购物中心|广场|万达|万象城|万象汇|"
+            r"门店|店铺|总店|旗舰店|分店|商场|商圈|购物中心|广场|天虹|万达|万象城|万象汇|"
             r"壹方城|壹方天地|万科里|天街|银泰|吾悦|大悦城|来福士|"
-            r"太古里|印象城|奥特莱斯|IFS|MALL",
+            r"太古里|印象城|奥特莱斯|IFS|MALL|"
+            r"[\u4e00-\u9fffA-Za-z0-9]{2,24}店(?=多少|多钱|价格|售价|几元|几块|[？?]|$)",
             text,
             re.I,
         )
@@ -7870,6 +7936,7 @@ class V2Store(AppStore):
                 )
 
         has_store_task = any(task[1] == "store" for task in tasks)
+        conditional_child = None
         if has_store_task:
             sku_question_match = re.search(
                 r"(?<!\d)\d+(?:\.\d+)?\s*元?\s*(?:的)?\s*(?:代金券|券)",
@@ -7930,20 +7997,58 @@ class V2Store(AppStore):
                 if day_child and condition_match:
                     add_task("day", "使用日期", condition_match, day_child)
 
-            price_match = re.search(
-                r"多少钱|多钱|什么价格|价格多少|价钱|售价|什么价|啥价|怎么卖|几元",
-                text,
-            )
-            if price_match and not conditional_child:
-                price_reply = self.price_reply(product, text)
-                if price_reply:
-                    add_task("price", "商品价格", price_match, price_reply)
+        price_match = re.search(
+            r"多少钱|多钱|什么价格|价格多少|价钱|售价|什么价|啥价|怎么卖|几元|几块|"
+            r"[\u4e00-\u9fffA-Za-z0-9]{2,24}(?:总店|旗舰店|分店|门店|店|"
+            r"商场|广场|购物中心)\s*(?:的)?多少(?:钱)?",
+            text,
+        )
+        if price_match and not conditional_child:
+            # Once a store entity is already bound to this question, do not
+            # pass the branch text to the named-SKU price parser.  The generic
+            # price resolver lists only current sellable options, while the
+            # store child independently verifies that the branch is supported.
+            price_question = "多少钱" if has_store_task else text
+            price_reply = self.price_reply(product, price_question)
+            if price_reply:
+                add_task("price", "商品价格", price_match, price_reply)
 
         if len(tasks) < 2:
             return None
 
         replies = []
         child_results = []
+        store_child_cache = None
+        store_task = next((task for task in tasks if task[1] == "store"), None)
+        if store_task:
+            store_payload = dict(store_task[3] or {})
+            store_query_value = str(store_payload.get("query") or "").strip()
+            sku_text = str(store_payload.get("sku_text") or "").strip()
+            store_child_cache = self.resolve_deterministic(
+                item_id, f"{sku_text}{store_query_value}可以用吗", actual_paid_amount,
+                store_context, order_context, _allow_multi=False,
+            )
+
+        def store_scoped_price(fallback: str) -> str:
+            child = store_child_cache or {}
+            status = str(child.get("store_status") or "")
+            if status and status != "available":
+                return "该门店尚未确认属于当前商品适用范围，暂不推荐购买规格。"
+            matrix = list(child.get("store_sku_matrix") or [])
+            supported = []
+            seen_keys = set()
+            for row in matrix:
+                for sku in row.get("supported_skus") or []:
+                    key = str(sku.get("sku_key") or sku.get("sku_name") or "")
+                    if key and key not in seen_keys and sku.get("sellable", True):
+                        seen_keys.add(key)
+                        supported.append(sku)
+            if supported:
+                return "该门店当前可用规格价格：" + "；".join(
+                    self._sku_public_label(sku) for sku in supported
+                ) + "。"
+            return fallback
+
         for _, kind, label, payload in sorted(tasks, key=lambda value: value[0]):
             child = None
             if kind == "usage":
@@ -7956,23 +8061,19 @@ class V2Store(AppStore):
                 reply = self.stacking_reply(product, text)
             elif kind == "restrictions":
                 reply = self.usage_restrictions_reply(product)
-            elif kind == "purchase":
+            elif kind in {"purchase", "purchase_timing"}:
                 reply = str(payload or "")
             elif kind in {"date", "day", "conditions"}:
                 child = dict(payload or {})
                 reply = str(child.get("reply") or "").strip()
             elif kind == "price":
-                reply = str(payload or "")
+                reply = store_scoped_price(str(payload or ""))
             elif kind == "sku":
                 reply = str(payload or "")
             else:
                 store_payload = dict(payload or {})
                 store_query_value = str(store_payload.get("query") or "").strip()
-                sku_text = str(store_payload.get("sku_text") or "").strip()
-                child = self.resolve_deterministic(
-                    item_id, f"{sku_text}{store_query_value}可以用吗", actual_paid_amount,
-                    store_context, order_context, _allow_multi=False,
-                )
+                child = store_child_cache
                 reply = str((child or {}).get("reply") or "").strip()
                 if not reply:
                     reply = f"暂时无法确认{store_query_value}是否属于当前商品的适用门店。"
@@ -8189,8 +8290,37 @@ class V2Store(AppStore):
         if media_marker:
             text_only = strip_media_markers(message)
             if not text_only or is_media_dependent_query(text_only):
+                context = store_context if isinstance(store_context, dict) else {}
+                prior_query = str(
+                    context.get("query") or context.get("pending_store_query") or ""
+                ).strip()
+                prior_matches = list(context.get("matches") or [])
+                if "图片" in message and prior_query and prior_matches:
+                    return {
+                        "reply": self.format_store_matches(
+                            prior_matches, prior_query, "可以用吗",
+                        ),
+                        "source": "图片沿用当前会话最近一次门店查询",
+                        "decision": "allow", "kind": "stores",
+                        "store_matches": prior_matches,
+                        "store_query": prior_query,
+                        "store_status": str(context.get("status") or "available"),
+                    }
+                if "图片" in message and prior_query:
+                    return {
+                        "reply": (
+                            f"我已记录您上一条提到的“{prior_query}”，但暂时无法读取图片中的"
+                            "补充信息。请把图片里的完整门店名称或地址发成文字，我继续核对。"
+                        ),
+                        "source": "图片无法识别但保留上一轮门店查询",
+                        "decision": "allow", "kind": "media_context",
+                    }
                 return {
-                    "reply": "抱歉，暂时不支持语音图片识别，请发文字交流。",
+                    "reply": (
+                        "暂时无法读取图片中的文字，请把完整门店名称或地址发成文字。"
+                        if "图片" in message else
+                        "暂时无法识别语音内容，请把问题发成文字。"
+                    ),
                     "source": "图片或语音及其关联文字无法识别",
                     "decision": "allow",
                     "kind": "media",
@@ -8584,6 +8714,15 @@ class V2Store(AppStore):
         current_use = self.current_use_reply(item_id, product, message)
         if current_use:
             return current_use
+
+        purchase_timing = self.purchase_timing_reply(product, message)
+        if purchase_timing:
+            return {
+                "reply": purchase_timing,
+                "source": "当前商品购买、发券与核销规则",
+                "decision": "allow",
+                "kind": "purchase_timing",
+            }
 
         candidate_followup = self.resolve_store_candidate_followup(
             item_id, product, message, store_context,
@@ -9641,6 +9780,22 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         correction = re.search(r"(?:而是|改成|[，,；;]\s*(?:是|查|要))\s*(.+)$", text)
         if correction:
             text = correction.group(1)
+    # A buyer may put an independent purchase-timing confirmation directly
+    # before a branch without punctuation, for example “吃完再买对吧 丹竹头店
+    # 可以用吗”.  Treat the confirmation word as an entity boundary so that
+    # the first question can never become part of the store search key.
+    text = re.sub(
+        r"^.*?(?:对吧|是吧|没错吧|对不对)[，,；;\s]*"
+        r"(?=(?:[\u4e00-\u9fffA-Za-z0-9]{2,40})(?:总店|旗舰店|分店|门店|店|"
+        r"商场|广场|购物中心|万达|万象城|万象汇|天虹))",
+        "", text,
+    )
+    text = re.sub(
+        r"^(?:吃完|吃了|用餐后|消费后|结账前|买单前)"
+        r"[^。！？\n]{0,10}(?:再|才)?(?:买|拍|购买|下单)(?:对吧|是吧)?"
+        r"[，,；;\s]*",
+        "", text,
+    )
     text = re.sub(
         r"^(?:老板|亲|您好|你好|哈喽|那个|这个|请问(?:一下|下)?|问一下|我在|"
         r"我这边(?:在|是)?|我的地址(?:在|是)?|定位(?:在|是)?|我想问|想问下|想咨询|"

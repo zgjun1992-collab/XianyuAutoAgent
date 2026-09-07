@@ -868,7 +868,7 @@ class XianyuLive:
 
     @staticmethod
     def should_attach_first_reply(enabled, first_reply, deterministic_kind=""):
-        """An enabled welcome is mandatory on the first buyer turn, regardless of intent."""
+        """Return whether this product has an enabled greeting available."""
         return bool(enabled and str(first_reply or "").strip())
 
     @staticmethod
@@ -944,7 +944,7 @@ class XianyuLive:
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
         message="",
     ):
-        """Send an enabled product welcome once, before every first-turn answer."""
+        """Send the product introduction only for a pure first-turn greeting."""
         if (
             self.is_product_offline(product)
             or int((conversation or {}).get("first_reply_sent", 0))
@@ -962,6 +962,19 @@ class XianyuLive:
         async with lock:
             durable_getter = getattr(self.app_store, "is_first_reply_sent", None)
             if durable_getter and durable_getter(scope_id):
+                return False
+            if (
+                bool((product or {}).get("enabled", 1))
+                and not self.should_send_first_reply(message)
+            ):
+                # A concrete first question must receive its direct answer
+                # without a long catalog in front of it. Consume the welcome
+                # flag so it cannot appear unexpectedly later in the chat.
+                self.app_store.mark_first_reply_sent(scope_id)
+                self.emit_event(
+                    "product_first_reply_skipped", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message="买家首条消息为具体问题，已直接回答",
+                )
                 return False
             reply = self.prepare_product_first_reply(product)
             if not reply:
@@ -1640,7 +1653,9 @@ class XianyuLive:
                 }
                 next_store_context.update(deterministic.get("store_context_update") or {})
                 self._store_contexts[scope_id] = next_store_context
-            elif not deterministic or deterministic.get("kind") not in {"stores"}:
+            elif not deterministic or deterministic.get("kind") not in {
+                "stores", "media", "media_context",
+            }:
                 self._store_contexts.pop(scope_id, None)
             if deterministic and deterministic.get("kind") == "offline":
                 bot_reply = deterministic["reply"]

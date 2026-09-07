@@ -1102,13 +1102,17 @@ class V2StoreTests(unittest.TestCase):
         link = self.store.resolve_deterministic("10001", "链接打不开")
         self.assertIn("浏览器地址栏", link["reply"])
         image = self.store.resolve_deterministic("10001", "[图片]")
-        self.assertEqual("抱歉，暂时不支持语音图片识别，请发文字交流。", image["reply"])
+        self.assertEqual("暂时无法读取图片中的文字，请把完整门店名称或地址发成文字。", image["reply"])
 
     def test_media_with_dependent_text_never_guesses_store_or_price(self):
         for message in ("[图片]\n可以用么", "[语音]\n多少钱"):
             result = self.store.resolve_deterministic("10001", message)
             self.assertEqual("media", result["kind"])
-            self.assertEqual("抱歉，暂时不支持语音图片识别，请发文字交流。", result["reply"])
+            expected = (
+                "暂时无法读取图片中的文字，请把完整门店名称或地址发成文字。"
+                if "图片" in message else "暂时无法识别语音内容，请把问题发成文字。"
+            )
+            self.assertEqual(expected, result["reply"])
 
     def test_media_with_complete_text_can_use_the_text_only(self):
         self.store.import_store_list(self.create_multi_region_store_sheet(), "多地区门店", ["10001"])
@@ -3570,7 +3574,100 @@ class V2StoreTests(unittest.TestCase):
                 self.assertIn("可抵扣200元", result["reply"])
                 self.assertNotIn("没有200元代金券", result["reply"])
         blocked = self.store.resolve_deterministic("10001", "400")
-        self.assertEqual("clarify", blocked["decision"])
+        self.assertEqual("deny", blocked["decision"])
+
+    def test_redemption_plan_does_not_treat_missing_legacy_stock_as_zero(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价79.5元，最多使用2张；仅支持同面额叠加",
+        )
+        result = self.store.resolve_deterministic("10001", "200")
+        self.assertEqual("redemption_plan", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("159元", result["reply"])
+
+    def test_bare_amount_accepts_composed_sku_when_only_mixed_faces_are_forbidden(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "200元代金券：售价111.8元，发100元券2张，最多使用2张。"
+            "仅支持同面额代金券叠加，不同面额代金券不能叠加。",
+        )
+        result = self.store.resolve_deterministic("10001", "200")
+        self.assertEqual("redemption_plan", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("2张100元代金券", result["reply"])
+        self.assertIn("111.8元", result["reply"])
+        self.assertIn("可抵扣200元", result["reply"])
+
+    def test_colloquial_purchase_timing_and_store_are_answered_separately(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价79.5元。请当天购买、当天使用。",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【深圳】丹竹头店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "吃完再买对吧 丹竹头店可以用吗",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["purchase_timing", "store"], result["resolved_intents"])
+        self.assertEqual("丹竹头店", result["store_query"])
+        self.assertIn("用餐结束后、结账前购买", result["reply"])
+        self.assertIn("丹竹头店", result["reply"])
+
+    def test_store_name_with_bare_price_word_resolves_store_and_price(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券", "100元代金券：售价72元，最多使用2张",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【东莞】常平天虹店", "东莞门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "东莞常平天虹店多少？")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "price"], result["resolved_intents"])
+        self.assertEqual("东莞常平天虹店", result["store_query"])
+        self.assertIn("常平天虹店", result["reply"])
+        self.assertIn("72元", result["reply"])
+        self.assertNotIn("没有“东莞常平天虹店”这一规格", result["reply"])
+
+    def test_store_price_question_lists_only_skus_supported_by_that_store(self):
+        self.store.save_v2_product(
+            "10001", "多规格代金券",
+            "100元代金券：售价64元\n300元代金券：售价192元",
+        )
+        first = self.store.import_store_text(
+            "【广东省】\n【东莞】东莞常平天虹店", "100元门店", [],
+        )
+        second = self.store.import_store_text(
+            "【广东省】\n【东莞】东莞万象汇店", "300元门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = first["id"] if sku["face_value"] == "100" else second["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        result = self.store.resolve_deterministic("10001", "东莞常平天虹店多少？")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertIn("100元代金券（售价64元）", result["reply"])
+        self.assertNotIn("300元代金券", result["reply"])
+
+    def test_image_only_message_reuses_verified_store_context(self):
+        context = {
+            "query": "深圳总店", "status": "available",
+            "matches": [{
+                "province": "广东省", "city": "深圳", "branch": "深圳总店",
+                "address": "深圳市测试路1号", "match_quality": "exact",
+            }],
+        }
+        result = self.store.resolve_deterministic(
+            "10001", "[图片]", store_context=context,
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("深圳总店", result["reply"])
+        self.assertNotIn("不支持语音图片识别", result["reply"])
 
     def test_redemption_requests_obey_inventory_day_and_stack_limits(self):
         for stock, limit, time in ((0, 3, "周末"), (1, 3, "周末"), (3, 1, "周末"), (3, 3, "工作日")):
@@ -3583,7 +3680,7 @@ class V2StoreTests(unittest.TestCase):
                 })
                 with patch.object(V2Store, "_current_day_type", return_value="weekend"):
                     result = self.store.resolve_deterministic("10001", "200")
-                self.assertEqual("clarify", result["decision"])
+                self.assertEqual("deny", result["decision"])
                 self.assertNotIn("可以购买", result["reply"])
 
     def test_buyer_store_statement_is_locally_verified_not_model_fallback(self):
