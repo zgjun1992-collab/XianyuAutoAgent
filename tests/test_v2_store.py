@@ -3,6 +3,7 @@ import re
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime
 from unittest.mock import patch
 
 from openpyxl import Workbook
@@ -10,8 +11,18 @@ from openpyxl import Workbook
 from v2_store import V2Store, extract_store_query, normalize_text
 
 
+class HandoffDate(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 9, 6, 12, 0, tzinfo=tz)
+
+
 class V2StoreTests(unittest.TestCase):
     def setUp(self):
+        # Existing "today" scenarios use the Sunday handoff baseline.
+        clock = patch("v2_store.datetime", HandoffDate)
+        clock.start()
+        self.addCleanup(clock.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.store = V2Store(os.path.join(self.temp.name, "v2.db"))
         self.store.save_v2_product(
@@ -3341,6 +3352,62 @@ class V2StoreTests(unittest.TestCase):
         })
         product = self.store.get_v2_product("10001")
         self.assertEqual([], self.store.extract_product_options(product))
+
+    def test_matching_manual_coupon_text_respects_structured_stock(self):
+        for stock in (0, "0", 3):
+            with self.subTest(stock=stock):
+                self.store.save_v2_product(
+                    "10001", "100元代金券",
+                    "100元代金券：售价79.5元，周末可用",
+                )
+                self.store.save_ai_summary("10001", "库存", {
+                    "skus": [{
+                        "name": "100元代金券", "face_value": "100",
+                        "sale_price": "79.5", "applicable_time": "周末",
+                        "stock": stock,
+                    }], "facts": {}, "time_rules": [],
+                })
+                with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+                    result = self.store.resolve_deterministic("10001", "100元代金券有吗")
+                self.assertEqual("sku_availability", result["kind"])
+                if str(stock) == "0":
+                    self.assertEqual("deny", result["decision"])
+                    self.assertNotIn("有的", result["reply"])
+                    self.assertNotIn("售价79.5元", result["reply"])
+                else:
+                    self.assertEqual("allow", result["decision"])
+                    self.assertIn("售价79.5元", result["reply"])
+
+    def test_redemption_requests_use_in_stock_stackable_sku(self):
+        self.store.save_v2_product("10001", "同仁四季代金券", "仅支持同面额叠加，一桌最多代300元")
+        self.store.save_ai_summary("10001", "", {
+            "skus": [{"name": "100元代金券", "face_value": "100",
+                      "sale_price": "79.5", "stock": 5}],
+        })
+        for message in ("200", "200元", "有没有200的", "200有吗", "有200元代金券吗", "没有200的了？"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("redemption_plan", result["kind"])
+                self.assertIn("2张100元代金券", result["reply"])
+                self.assertIn("159元", result["reply"])
+                self.assertIn("可抵扣200元", result["reply"])
+                self.assertNotIn("没有200元代金券", result["reply"])
+        blocked = self.store.resolve_deterministic("10001", "400")
+        self.assertEqual("clarify", blocked["decision"])
+
+    def test_redemption_requests_obey_inventory_day_and_stack_limits(self):
+        for stock, limit, time in ((0, 3, "周末"), (1, 3, "周末"), (3, 1, "周末"), (3, 3, "工作日")):
+            with self.subTest(stock=stock, limit=limit, time=time):
+                self.store.save_v2_product("10001", "代金券", "")
+                self.store.save_ai_summary("10001", "", {
+                    "skus": [{"name": "100元代金券", "face_value": "100",
+                              "sale_price": "79.5", "stock": stock, "max_stack": limit,
+                              "applicable_time": time}],
+                })
+                with patch.object(V2Store, "_current_day_type", return_value="weekend"):
+                    result = self.store.resolve_deterministic("10001", "200")
+                self.assertEqual("clarify", result["decision"])
+                self.assertNotIn("可以购买", result["reply"])
 
     def test_buyer_store_statement_is_locally_verified_not_model_fallback(self):
         self.store.import_store_text(

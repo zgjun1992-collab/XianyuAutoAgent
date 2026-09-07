@@ -1121,6 +1121,17 @@ class V2Store(AppStore):
         supplements = raw_options if sku_authoritative else structured_options
         for option in supplements:
             key = (option.get("face_value", ""), option.get("applicable_time", ""), option.get("sale_price", ""))
+            if key in seen and option.get("availability_explicit"):
+                # Exact prose/SKU matches still need the structured inventory.
+                # Deduplication must not discard a zero-stock update.
+                for existing in output:
+                    existing_key = (existing.get("face_value", ""), existing.get("applicable_time", ""), existing.get("sale_price", ""))
+                    if existing_key == key:
+                        existing.update({
+                            "availability": option["availability"],
+                            "stock": option.get("stock", ""),
+                            "availability_explicit": True,
+                        })
             if key not in seen:
                 same_sku = next((
                     item for item in output
@@ -3803,6 +3814,73 @@ class V2Store(AppStore):
             )
         ) or 1
         return max(1, maximum // delivered)
+
+    def amount_inquiry_plan_reply(self, product: Dict, message: str) -> Optional[Dict]:
+        """Plan an amount inquiry using one in-stock denomination and explicit stacking."""
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*[?？。!！]?\s*", message)
+        bare = bool(match)
+        if not match and re.search(r"有吗|有没有|有无|有么|有嘛|有货|没有|还有|有.*[吗么嘛？?]", message):
+            if re.search(r"单张|一张|1\s*张|\d\s*(?:人|位|份|折|路|号|点)", message):
+                return None
+            amounts = re.findall(r"(?<!\d)\d+(?:\.\d+)?", message)
+            if len(amounts) == 1:
+                match = re.search(r"(\d+(?:\.\d+)?)", message)
+        if not match:
+            return None
+        knowledge = "\n".join(str(product.get(key) or "") for key in ("title", "raw_text", "ai_summary"))
+        options = self.extract_product_options(product)
+        if not options and not re.search(r"代金券|抵扣券|现金券", knowledge):
+            return None
+        target = Decimal(match.group(1))
+        if target <= 0:
+            return None
+        day = self._requested_day_type(message, default_today=True)
+        options = self._filter_options_for_day(options, day)
+        if not bare and any(self._option_total_value(option) == self._format_number(target) for option in options):
+            return None  # Keep the existing atomic answer for an actual matching SKU.
+        candidates = []
+        global_limit = re.search(r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张", knowledge)
+        value_limit = re.search(r"(?:一桌|每桌|单桌|每次)[^\n。；]{0,12}?(?:最多|上限)[^\n。；\d]{0,5}(\d+(?:\.\d+)?)\s*元", knowledge)
+        forbidden = bool(re.search(r"不可叠加|不能叠加|不支持叠加|不得叠加", knowledge))
+        same_face_stacking = bool(re.search(r"(?:支持|允许|可|仅)[^。；\n]{0,12}同面额[^。；\n]{0,12}叠加", knowledge))
+        for option in options:
+            try:
+                face = Decimal(self._option_total_value(option))
+                price = Decimal(str(option.get("sale_price") or "0"))
+                stock = Decimal(str(option.get("stock") or "0"))
+                if face <= 0 or price <= 0 or stock <= 0 or target % face:
+                    continue
+                quantity = int(target / face)
+                delivered = sum(int(count) for _, count in re.findall(
+                    r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
+                )) or 1
+                default_limit = quantity * delivered if same_face_stacking else delivered
+                limit = int(Decimal(str(option.get("max_stack") or (global_limit.group(1) if global_limit else default_limit))))
+                if quantity > stock or quantity * delivered > limit:
+                    continue
+                if forbidden and quantity * delivered > 1:
+                    continue
+                if value_limit and target > Decimal(value_limit.group(1)):
+                    continue
+                candidates.append((price * quantity, quantity, option))
+            except (InvalidOperation, ValueError):
+                continue
+        amount = self._format_number(target)
+        if not candidates:
+            if not bare:
+                return None
+            return {
+                "reply": f"您需要抵扣{amount}元。目前根据库存和使用规则，暂时无法确认可抵扣该金额的购买方案，请先核实可售库存及叠加限制。",
+                "kind": "redemption_plan", "decision": "clarify",
+                "source": "当前SKU库存、适用日和叠加限制不足以确认方案",
+            }
+        total, quantity, option = min(candidates, key=lambda row: (row[1] != 1, row[0], row[1]))
+        contents = self._purchase_contents_label(option, quantity)
+        return {
+            "reply": f"需要抵扣{amount}元的话，可以购买{contents}，共支付{self._format_number(total)}元，可抵扣{amount}元。",
+            "kind": "redemption_plan", "decision": "allow",
+            "source": "当前有库存且日期适用的同一SKU及明确叠加限制",
+        }
 
     def consumption_plan_reply(
         self, product: Dict, target_value: object, missing_denomination: bool = False,
@@ -8144,6 +8222,11 @@ class V2Store(AppStore):
         )
         if candidate_followup:
             return candidate_followup
+
+        if not (store_context or {}).get("price_filters"):
+            redemption_plan = self.amount_inquiry_plan_reply(product, message)
+            if redemption_plan:
+                return redemption_plan
 
         voucher_sku = self.voucher_sku_lookup_reply(product, message)
         if voucher_sku:
