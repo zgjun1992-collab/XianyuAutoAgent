@@ -188,6 +188,20 @@ class V2Store(AppStore):
         super().__init__(db_path)
         self._init_v2_db()
 
+    @staticmethod
+    def _platform_description(product: Dict) -> str:
+        """Return the untouched marketplace description from its stored payload."""
+        payload = str((product or {}).get("platform_summary") or "").strip()
+        if not payload:
+            return ""
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return payload
+        if isinstance(parsed, dict):
+            return str(parsed.get("description") or "").strip()
+        return ""
+
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15, check_same_thread=False)
@@ -659,6 +673,21 @@ class V2Store(AppStore):
             summary = str(pending.get("summary") or "").strip()
             structured = pending.get("structured") or {}
             if summary:
+                # Rebuild from the complete page payload.  The AI summary is an
+                # index, not the source of truth: rules omitted by the model
+                # (for example "除酒水外全场通用") must still survive approval.
+                normalized_product = dict(product)
+                source_description = (
+                    self._platform_description(product)
+                    or str(pending.get("description") or "").strip()
+                )
+                normalized_product.update({
+                    "raw_text": "\n".join(
+                        value for value in (summary, source_description) if value
+                    ),
+                    "structured": structured,
+                })
+                summary = self.build_knowledge_summary(normalized_product) or summary
                 now = self._now()
                 with self._connect() as conn:
                     conn.execute(
@@ -741,7 +770,16 @@ class V2Store(AppStore):
         now = self._now()
         summary = str(summary or "").strip()
         normalized_product = dict(current)
-        normalized_product.update({"raw_text": summary, "structured": structured or {}})
+        # ``platform_summary`` contains the complete title/description/SKU JSON.
+        # Feeding the condensed AI summary back into the completeness pass made
+        # any clause omitted by the model impossible to recover.
+        source_description = self._platform_description(current)
+        normalized_product.update({
+            "raw_text": "\n".join(
+                value for value in (summary, source_description) if value
+            ),
+            "structured": structured or {},
+        })
         summary = self.build_knowledge_summary(normalized_product) or summary
         structured_text = json.dumps(structured or {}, ensure_ascii=False)
         effective = current["raw_text"] if current.get("manual_edited") else summary
@@ -1988,6 +2026,9 @@ class V2Store(AppStore):
         values = [
             str(product.get("raw_text") or ""),
             str(product.get("ai_summary") or ""),
+            # Keep the original marketplace payload available as a read-only
+            # fallback when an older AI summary omitted a page rule.
+            cls._platform_description(product),
         ]
 
         def collect(node):

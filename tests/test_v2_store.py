@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import tempfile
 import unittest
@@ -2026,7 +2027,10 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual([old["id"]], [row["id"] for row in staged["store_lists"]])
         self.store.apply_source_update("10001", ["knowledge"])
         applied = self.store.get_v2_product("10001")
-        self.assertEqual("新版知识", applied["raw_text"])
+        self.assertTrue(applied["raw_text"].startswith("新版知识"))
+        self.assertIn("四川省", applied["raw_text"])
+        self.assertIn("成都", applied["raw_text"])
+        self.assertIn("新店", applied["raw_text"])
         self.assertEqual("人工首次回复", applied["first_reply_text"])
         self.assertEqual([old["id"]], [row["id"] for row in applied["store_lists"]])
 
@@ -3683,6 +3687,40 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("除锅底外全场通用", beverage["reply"])
         pot = self.store.resolve_deterministic("10001", "锅底可以用吗")
         self.assertIn("不可用于锅底", pot["reply"])
+
+    def test_usage_scope_falls_back_to_complete_marketplace_description(self):
+        product = {
+            "raw_text": "【商品规格】\n100元代金券：售价76元。",
+            "ai_summary": "酒水饮料不可用。",
+            "platform_summary": json.dumps({
+                "description": "除酒水饮料外全场通用，不可使用包间。仅限堂食。无需预约。"
+            }, ensure_ascii=False),
+            "structured": {"facts": {"酒水限制": "酒水饮料不可用"}},
+        }
+        pot = self.store.usage_subject_reply(product, "锅底可以用吗")
+        self.assertIn("锅底消费可以使用", pot["reply"])
+        self.assertIn("除酒水饮料外全场通用", pot["reply"])
+        beverage = self.store.usage_subject_reply(product, "饮料可以用吗")
+        self.assertIn("不可用于饮料", beverage["reply"])
+
+    def test_synced_summary_preserves_page_rules_omitted_by_ai(self):
+        platform_summary = json.dumps({
+            "title": "代金券",
+            "description": (
+                "【使用规则】\n1. 除酒水饮料外全场通用，不可使用包间。\n"
+                "2. 仅限堂食。\n3. 无需预约，高峰期可能需要等位。"
+            ),
+            "sku": [],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "sync-rules", "title": "代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "76",
+        })
+        product = self.store.save_synced_summary(
+            "sync-rules", "AI只保留了售价", {"facts": {}, "time_rules": []},
+        )
+        for expected in ("除酒水饮料外全场通用", "不可使用包间", "仅限堂食", "无需预约"):
+            self.assertIn(expected, product["raw_text"])
 
     def test_exclusion_without_positive_scope_cannot_prove_other_items_are_usable(self):
         product = {

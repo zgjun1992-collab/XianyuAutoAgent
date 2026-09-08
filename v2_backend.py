@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import ctypes
+import hashlib
 import json
 import os
 import re
@@ -81,6 +83,38 @@ class BackendState:
         self.service_status = "stopped"
         self.service_message = ""
         self.lock = threading.RLock()
+        self._service_mutex_handle = None
+        self._service_mutex_api = None
+
+    def _acquire_service_mutex(self):
+        """Allow only one live customer-service worker per local data directory."""
+        if os.name != "nt" or self._service_mutex_handle:
+            return
+        digest = hashlib.sha256(os.path.normcase(self.data_dir).encode("utf-8")).hexdigest()[:24]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Keep a named kernel object open for the lifetime of the worker.  An
+        # event is used instead of a mutex because the worker may stop on a
+        # different thread than the HTTP request that started it.
+        kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateEventW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateEventW(None, True, False, f"Local\\XianyuCardAI-{digest}")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "无法创建客服单实例锁")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            raise ValueError("同一数据目录已有客服实例运行，请先关闭旧程序后再启动")
+        self._service_mutex_handle = handle
+        self._service_mutex_api = kernel32
+
+    def _release_service_mutex(self):
+        handle = self._service_mutex_handle
+        kernel32 = self._service_mutex_api
+        self._service_mutex_handle = None
+        self._service_mutex_api = None
+        if handle and kernel32:
+            kernel32.CloseHandle(handle)
 
     def configure(self, payload):
         with self.lock:
@@ -513,18 +547,23 @@ class BackendState:
                 raise ValueError("请先保存API Key")
             if not self.runtime["cookie"]:
                 raise ValueError("请先在内置闲鱼登录，等待Cookie自动同步")
+            self._acquire_service_mutex()
             os.environ["API_KEY"] = self.runtime["api_key"]
             os.environ["COOKIES_STR"] = self.runtime["cookie"]
             os.environ["MODEL_BASE_URL"] = self.runtime["base_url"]
             os.environ["MODEL_NAME"] = self.runtime["model"]
             bot = XianyuReplyBot()
-            self.live = XianyuLive(
-                self.runtime["cookie"],
-                bot_instance=bot,
-                app_store=self.store,
-                event_callback=self.on_live_event,
-                interactive=False,
-            )
+            try:
+                self.live = XianyuLive(
+                    self.runtime["cookie"],
+                    bot_instance=bot,
+                    app_store=self.store,
+                    event_callback=self.on_live_event,
+                    interactive=False,
+                )
+            except Exception:
+                self._release_service_mutex()
+                raise
             self.service_status = "starting"
             self.service_message = ""
 
@@ -535,6 +574,8 @@ class BackendState:
                     self.service_status = "error"
                     self.service_message = str(exc)
                     self.store.add_event("service_error", str(exc), {})
+                finally:
+                    self._release_service_mutex()
 
             self.worker = threading.Thread(target=run, name="xianyu-v2-live", daemon=True)
             self.worker.start()

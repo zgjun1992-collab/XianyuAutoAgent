@@ -42,6 +42,11 @@ class _Context:
 
 
 class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    def test_plain_base64_json_sync_payload_is_not_discarded(self):
+        payload = {"1": {"10": {"reminderContent": "北京安贞店，大概300，几折"}}}
+        encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        self.assertEqual(payload, XianyuLive.decode_sync_message(encoded))
+
     def test_saved_template_parser_orders_text_and_images(self):
         parts = XianyuLive.parse_message_template(
             "第一段{$分段符}{$分段符}第二段{$图片:7}{$分段符}第三段"
@@ -144,6 +149,15 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event = {"1": "buyer-1@goofish", "3": {"reminderContent": "我已拍下，待付款"}}
         self.assertTrue(await live.handle_order_reminder(event, object()))
         live.send_msg.assert_awaited_once()
+
+    async def test_seller_price_change_system_card_never_triggers_a_reply(self):
+        live = self.make_live()
+        event = {
+            "1": {"10": {"reminderContent": "我已修改价格，等待你付款"}},
+            "3": {"reminderContent": "请确认价格与协商一致，并在24小时内付款"},
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_not_awaited()
 
     def test_recall_and_paid_amount_helpers(self):
         self.assertTrue(XianyuLive.is_recall_message("对方撤回了一条消息"))
