@@ -348,6 +348,19 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.send_message_template.assert_awaited_once()
         live.send_msg.assert_not_awaited()
 
+    def test_sync_batch_is_split_without_dropping_later_messages(self):
+        package = {
+            "headers": {"mid": "m1"},
+            "body": {"syncPushPackage": {"data": [
+                {"data": "first"}, {"data": "second"},
+            ]}},
+        }
+        split = XianyuLive.split_sync_packages(package)
+        self.assertEqual(2, len(split))
+        self.assertEqual("first", split[0]["body"]["syncPushPackage"]["data"][0]["data"])
+        self.assertEqual("second", split[1]["body"]["syncPushPackage"]["data"][0]["data"])
+        self.assertEqual(2, len(package["body"]["syncPushPackage"]["data"]))
+
     async def test_purchase_order_only_answers_later_pure_greetings(self):
         product = {
             "coupon_type": "purchase_order", "item_status": "onsale", "enabled": 1,
@@ -365,7 +378,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             websocket, "chat-1", "buyer-1", XianyuLive.PURCHASE_ORDER_GREETING_REPLY
         )
 
-        for message in ("390元怎么买", "怎么付款", "深圳能用吗", "我要退款"):
+        for message in ("390元怎么买", "怎么付款", "深圳能用吗", "我要退款", "[图片]", "[语音]"):
             with self.subTest(message=message):
                 live = self.make_live()
                 live.app_store.first_reply_scopes.add("scope-1")
@@ -393,10 +406,19 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
     def test_aftersale_entry_requires_actual_post_purchase_evidence(self):
         for message in ("券码核销失败", "我已经付款了但是不能用", "发来的券已经过期"):
             with self.subTest(message=message):
-                self.assertTrue(XianyuLive.is_aftersale_entry_message(message))
+                self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
+                self.assertTrue(XianyuLive.is_aftersale_entry_message(
+                    message, {"status": "已付款"}
+                ))
         for message in ("可以退款吗", "退款政策是什么", "如果不能用怎么办", "锅底能用吗"):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
+        self.assertFalse(XianyuLive.is_aftersale_entry_message(
+            "我下单了然后买单的时候和他们说美团核销吗", {"status": "已付款"}
+        ))
+        self.assertFalse(XianyuLive.is_aftersale_entry_message(
+            "券码核销失败", {"status": "等待买家付款"}
+        ))
         self.assertTrue(XianyuLive.is_aftersale_entry_message(
             "进度怎么样", {"status": "退款申请处理中"}
         ))

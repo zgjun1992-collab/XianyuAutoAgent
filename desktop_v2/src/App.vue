@@ -749,7 +749,7 @@ onBeforeUnmount(() => {
           <input v-model="productSearch" class="search-input" placeholder="搜索商品名称或ID" />
           <div v-for="product in filteredProducts" :key="product.item_id" :class="['product-row', { active: productDraft.item_id === product.item_id }]" @click="openProductKnowledge(product)">
             <span class="product-thumb image"><img v-if="product.thumbnail_url" :src="product.thumbnail_url" /><b v-else>券</b></span>
-            <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? '闲鱼来源有更新' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
+            <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? '闲鱼来源有更新' : product.sync_status === 'summary_failed' ? 'AI归纳失败·已保留页面资料' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
             <span class="product-row-actions"><button class="ai-toggle" :class="{ off: !product.enabled }" :title="product.enabled ? '点击关闭当前商品AI客服' : '点击开启当前商品AI客服'" @click.stop="setProductAiEnabled(product)">{{ product.enabled ? 'AI开' : 'AI关' }}</button><button title="打开商品页面" @click.stop="confirmOpenProductPage(product)">↗</button><button class="danger-icon" title="删除本地商品" @click.stop="deleteProduct(product)">删</button></span>
           </div>
           <div v-if="!filteredProducts.length" class="empty-card">登录闲鱼后点击“同步闲鱼在售商品”。</div>

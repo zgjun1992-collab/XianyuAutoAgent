@@ -323,6 +323,7 @@ class BackendState:
                 unchanged = bool(
                     old and old.get("platform_summary") == platform_summary
                     and old.get("ai_summary")
+                    and old.get("sync_status") != "summary_failed"
                 )
                 self.store.upsert_synced_product({
                     "item_id": item_id, "title": title, "platform_summary": platform_summary,
@@ -340,15 +341,37 @@ class BackendState:
                         self.store.stage_source_update(item_id, "", {}, "")
                         failed.append({"item_id": item_id, "error": "商品详情文案和规格均为空，已保留当前知识"})
                         continue
-                    summary, structured = self._generate_summary(platform_summary)
-                    if old:
-                        self.store.stage_source_update(
-                            item_id, summary, structured, str(item_do.get("desc") or "")
+                    description = str(item_do.get("desc") or "")
+                    try:
+                        summary, structured = self._generate_summary(platform_summary)
+                    except Exception as summary_exc:
+                        # Page acquisition and AI condensation are independent.
+                        # A model timeout must not discard rules/stores already
+                        # present in the complete marketplace payload.
+                        fallback = description or platform_summary
+                        has_effective_knowledge = bool(
+                            old and (str(old.get("raw_text") or "").strip()
+                                     or str(old.get("ai_summary") or "").strip())
                         )
+                        if has_effective_knowledge:
+                            self.store.stage_source_update(item_id, fallback, {}, description)
+                        else:
+                            self.store.save_synced_summary(item_id, fallback, {})
+                            self.store.sync_platform_store_list(
+                                item_id, title, description, {}
+                            )
+                            self.store.mark_summary_failed(item_id)
+                        failed.append({
+                            "item_id": item_id,
+                            "error": f"AI归纳失败，已保留完整商品页面资料：{summary_exc}",
+                        })
+                        continue
+                    if old:
+                        self.store.stage_source_update(item_id, summary, structured, description)
                     else:
                         self.store.save_synced_summary(item_id, summary, structured)
                         self.store.sync_platform_store_list(
-                            item_id, title, str(item_do.get("desc") or ""), structured
+                            item_id, title, description, structured
                         )
                     synced.append(item_id)
                 time.sleep(0.12)

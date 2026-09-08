@@ -698,6 +698,27 @@ class XianyuLive:
         except Exception:
             return False
 
+    @staticmethod
+    def split_sync_packages(message_data):
+        """Preserve every event when Xianyu batches several sync entries."""
+        try:
+            push = message_data["body"]["syncPushPackage"]
+            entries = list(push.get("data") or [])
+        except (KeyError, TypeError):
+            return [message_data]
+        if len(entries) <= 1:
+            return [message_data]
+        packages = []
+        for entry in entries:
+            package = dict(message_data)
+            body = dict(message_data.get("body") or {})
+            single_push = dict(push)
+            single_push["data"] = [entry]
+            body["syncPushPackage"] = single_push
+            package["body"] = body
+            packages.append(package)
+        return packages
+
     def is_typing_status(self, message):
         """判断是否为用户正在输入状态消息"""
         try:
@@ -831,26 +852,31 @@ class XianyuLive:
 
     @staticmethod
     def is_aftersale_entry_message(message="", order_context=None):
-        """Enter aftersales only for a system-confirmed order or an actual post-purchase fault."""
+        """Enter aftersales only after the platform confirms a paid/current order."""
         text = re.sub(r"\s+", "", str(message or ""))
         order_status = str((order_context or {}).get("status") or "")
         if re.search(r"退款|退货|售后|纠纷", order_status):
             return True
-        if not text:
+        paid_order = bool(re.search(
+            r"已付款|买家已付款|等待卖家发货|待发货|已发货|等待买家收货|"
+            r"确认收货|交易成功|已完成",
+            order_status,
+        )) and not bool(re.search(r"待付款|等待买家付款|未付款|已取消|交易关闭", order_status))
+        if not text or not paid_order:
             return False
-
-        hypothetical = bool(re.search(
-            r"还没买|尚未购买|未购买|买之前|购买前|如果|假如|万一|"
-            r"退款政策|退款规则|能退吗|可以退吗|可不可以退|能不能退",
+        # Questions about how to use/redeem a purchased coupon are normal
+        # pre-use consultations, not proof that an aftersales incident occurred.
+        operational_question = bool(re.search(
+            r"(?:怎么|如何|需要|要不要|是不是|可以|能否|能不能|吗|对吧).{0,10}"
+            r"(?:核销|扫码|扫几次|一起用|叠加)|"
+            r"(?:核销|扫码|扫几次|一起用|叠加).{0,10}(?:怎么|如何|需要|吗|对吧)",
             text,
         ))
-        confirmed_purchase = bool(re.search(
-            r"已付款|付款了|付过款|已经买|已购买|买了|拍下了|下单了|"
-            r"收到(?:的|了)?|发给我|发来的|已申请|申请了",
-            text,
-        ))
+        if operational_question and not re.search(r"失败|不了|不能用|无效|错误|拒绝|过期|失效", text):
+            return False
         intrinsic_fault = bool(re.search(
             r"券码(?:无效|失效|错误|不能用|用不了)|卡券(?:无效|失效|不能用|用不了)|"
+            r"(?:但是|但|已经|现在)(?:不能用|用不了)|"
             r"核销(?:失败|不了|不成功)|无法核销|不能核销|"
             r"发错(?:券|码|商品)|少发|漏发|没收到(?:券|码)|未收到(?:券|码)|"
             r"收到(?:的|了)?.{0,8}(?:过期|失效)|发来(?:的)?.{0,8}(?:过期|失效)",
@@ -861,13 +887,11 @@ class XianyuLive:
             r"(?:退款|退货|售后)(?:申请)?(?:已提交|提交了|申请了|处理中|不到账|金额不对)",
             text,
         ))
-        refund_after_purchase = confirmed_purchase and bool(re.search(
-            r"退款|退货|退钱|申请退|不能用|用不了|核销|过期|失效|发错|少发|没收到",
+        explicit_refund = bool(re.search(
+            r"我要退款|申请退款|已经申请退款|退款不到账|退款金额不对|退货|售后申请",
             text,
         ))
-        if hypothetical and not (confirmed_purchase or intrinsic_fault or completed_problem):
-            return False
-        return intrinsic_fault or completed_problem or refund_after_purchase
+        return intrinsic_fault or completed_problem or explicit_refund
 
     async def send_aftersale_state_reply(
         self, websocket, chat_id, send_user_id, send_user_name, scope_id,
@@ -1350,7 +1374,7 @@ class XianyuLive:
         self.emit_event("order_payment_notice", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
         return True
 
-    async def handle_message(self, message_data, websocket):
+    async def handle_message(self, message_data, websocket, send_ack=True):
         """处理所有类型的消息"""
         try:
 
@@ -1369,7 +1393,8 @@ class XianyuLive:
                     ack["headers"]["ua"] = message["headers"]["ua"]
                 if 'dt' in message["headers"]:
                     ack["headers"]["dt"] = message["headers"]["dt"]
-                await websocket.send(json.dumps(ack))
+                if send_ack:
+                    await websocket.send(json.dumps(ack))
             except Exception as e:
                 pass
 
@@ -1471,6 +1496,13 @@ class XianyuLive:
             self._seen_messages.add(fingerprint)
             if len(self._seen_messages) > 3000:
                 self._seen_messages.clear()
+
+            if send_user_id != self.myid:
+                self.emit_event(
+                    "buyer_message_received", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message_id=message_id,
+                    message=redact_sensitive_text(send_message),
+                )
 
             if send_user_id != self.myid:
                 marker = self.media_marker(send_message)
@@ -2217,7 +2249,10 @@ class XianyuLive:
                                 await websocket.send(json.dumps(ack))
                             
                             # 处理其他消息
-                            asyncio.create_task(self.handle_message(message_data, websocket))
+                            for sync_message in self.split_sync_packages(message_data):
+                                asyncio.create_task(
+                                    self.handle_message(sync_message, websocket, send_ack=False)
+                                )
                                 
                         except json.JSONDecodeError:
                             logger.error("消息解析失败")

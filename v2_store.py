@@ -802,6 +802,15 @@ class V2Store(AppStore):
         self.refresh_first_reply(item_id, force=False)
         return self.get_v2_product(item_id)
 
+    def mark_summary_failed(self, item_id: str) -> Dict:
+        """Expose an AI-summary failure while retaining complete page facts."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE v2_products SET sync_status='summary_failed',updated_at=? WHERE item_id=?",
+                (self._now(), str(item_id)),
+            )
+        return self.get_v2_product(item_id)
+
     def mark_unsynced_products(self, seen_item_ids: List[str]):
         seen = {str(value).strip() for value in seen_item_ids if str(value).strip()}
         with self._connect() as conn:
