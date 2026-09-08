@@ -997,6 +997,13 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("华熙五棵松店", result["matches"][0]["branch"])
         self.assertEqual("address", result["matches"][0]["match_quality"])
         self.assertEqual(90, result["matches"][0]["match_score"])
+        resolved = self.store.resolve_deterministic("10001", "复兴路69号")
+        self.assertEqual("stores", resolved["kind"])
+        self.assertEqual("allow", resolved["decision"])
+        self.assertEqual(
+            "可以用，根据“复兴路69号”查询到可用门店：华熙五棵松店。",
+            resolved["reply"],
+        )
 
     def test_city_with_which_stores_wording_lists_only_that_city(self):
         self.store.import_store_text(
@@ -1041,6 +1048,29 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "寿光可以用不")
         self.assertEqual("stores", result["kind"])
         self.assertIn("寿光万达广场店", result["reply"])
+
+    def test_bare_store_city_mall_and_address_are_store_queries(self):
+        self.store.import_store_text(
+            "【湖北省】\n【武汉】武汉首店、和平店、武汉万达广场店\n"
+            "【广东省】\n【汕头】汕头陈店\n【深圳】深圳坂田五和店、腾讯园区总部店",
+            "纯文本门店查询", ["10001"],
+        )
+        expected = {
+            "武汉首店": "武汉首店",
+            "和平店": "和平店",
+            "汕头": "汕头陈店",
+            "深圳坂田五和": "深圳坂田五和店",
+            "腾讯园区总部": "腾讯园区总部店",
+            "万达广场": "武汉万达广场店",
+        }
+        for query, branch in expected.items():
+            with self.subTest(query=query):
+                result = self.store.resolve_deterministic("10001", query)
+                self.assertEqual("stores", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertTrue(result["reply"].startswith("可以用，根据“"))
+                self.assertIn("”查询到可用门店：", result["reply"])
+                self.assertIn(branch, result["reply"])
 
     def test_short_followup_inherits_previous_store_result(self):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])

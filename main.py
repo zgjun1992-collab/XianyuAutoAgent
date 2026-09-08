@@ -312,6 +312,11 @@ class XianyuLive:
         stack = [payload]
         visited = 0
         location_hint = False
+        location_value_keys = {
+            "poiname", "placename", "locationname", "address",
+            "poiaddress", "locationaddress",
+        }
+        generic_value_keys = {"title", "name", "remindercontent"}
         while stack and visited < 160:
             current = stack.pop()
             visited += 1
@@ -328,19 +333,25 @@ class XianyuLive:
                     ))
                 if isinstance(value, (dict, list)):
                     stack.append(value)
-                elif isinstance(value, str) and key_norm in {
-                    "title", "name", "poiname", "placename", "locationname",
-                    "address", "poiaddress", "locationaddress", "remindercontent",
-                }:
+                elif isinstance(value, str) and key_norm in location_value_keys | generic_value_keys:
                     text = value.strip()
                     if text:
-                        values.append(text)
-                        location_hint = location_hint or bool(re.search(
-                            r"店|商场|广场|mall|城|中心|地址|路|街|大道", text, re.I
-                        ))
+                        # Only platform location fields or an explicit location
+                        # card type establish card identity.  A normal text
+                        # message is also carried in reminderContent and may be
+                        # exactly "和平店"/"汕头"; inferring a card from those
+                        # words silently drops a valid store query upstream.
+                        if key_norm in location_value_keys:
+                            location_hint = True
+                            priority = 0 if key_norm in {
+                                "poiname", "placename", "locationname",
+                            } else 2
+                        else:
+                            priority = 1
+                        values.append((priority, text))
         if not location_hint:
             return ""
-        for value in values:
+        for _, value in sorted(values, key=lambda item: item[0]):
             inner = re.search(r"[（(]([^（）()\n]{2,36}(?:店|商场|广场|MALL|Mall|mall))[）)]", value)
             if inner:
                 return inner.group(1).strip()

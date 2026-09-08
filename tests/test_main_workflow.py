@@ -253,6 +253,15 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         payload = {"contentType": 1, "title": "半秋山100元代金券", "price": "79.5"}
         self.assertEqual("", XianyuLive.inbound_location_card(payload))
 
+    def test_plain_store_place_and_address_text_are_not_treated_as_location_cards(self):
+        for text in (
+            "和平店", "武汉首店", "汕头", "深圳坂田五和",
+            "腾讯园区总部", "万达广场", "深圳市南山区科技园路1号",
+        ):
+            with self.subTest(text=text):
+                payload = {"contentType": 1, "reminderContent": text}
+                self.assertEqual("", XianyuLive.inbound_location_card(payload))
+
     def test_model_number_grounding_blocks_only_unverified_facts(self):
         self.assertEqual(
             "",
