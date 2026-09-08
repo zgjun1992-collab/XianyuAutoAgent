@@ -6217,7 +6217,7 @@ class V2Store(AppStore):
             }
         prefix = f"{self._sku_public_label(selected_skus[0])}：" if len(selected_skus) == 1 else ""
         return {
-            "reply": prefix + self.format_store_reply(match, str(message or "")),
+            "reply": prefix + self.format_store_matches([match], query, str(message or "")),
             "source": "买家确认门店候选后按当前商品门店表核验",
             "decision": "allow", "kind": "stores",
             "store_matches": [match], "store_query": query,
@@ -7415,76 +7415,20 @@ class V2Store(AppStore):
         for city, names in grouped.items():
             lines.append(f"{city}：{'、'.join(dict.fromkeys(names))}")
         query_value = str(query or "该关键词").strip(" \t\r\n，,。！？!?~～") or "该关键词"
-        query_area = V2Store._area_key(query_value)
-        row_areas = {
-            V2Store._area_key(match.get("city")) for match in matches if match.get("city")
-        } | {
-            V2Store._area_key(match.get("province")) for match in matches if match.get("province")
-        }
-        area_only = query_area in row_areas
-        if (
-            len(matches) == 1 and not area_only
-            and any(word in str(message or "") for word in (
-                "能用", "可以用", "可用", "适用", "支持", "能不能", "可不可以",
-            ))
-            and not any(word in str(message or "") for word in (
-                "地址", "位置", "在哪", "怎么走", "电话", "号码", "营业",
-            ))
-        ):
-            display = str(matches[0].get("branch") or matches[0].get("brand") or "该门店").strip()
-            if matches[0].get("match_quality") == "phonetic":
-                # Preserve the existing explicit confirmation wording for
-                # homophone recovery; only exact/contained store replies shrink.
-                return (
-                    f"可以使用。根据“{query_value}”查询到可用门店：【{display}】。"
-                    f"您说的“{query_value}”对应【{display}】，"
-                    "该门店属于当前商品适用门店。"
-                )
-            return (
-                f"可以使用。根据“{query_value}”查询到可用门店：【{display}】"
-            )
-        if (
-            len(matches) == 1 and not area_only
-            and matches[0].get("match_quality") == "phonetic"
-        ):
-            display = str(matches[0].get("branch") or matches[0].get("brand") or "该门店").strip()
-            return f"根据“{query_value}”的同音匹配，查询到可用门店：【{display}】。"
-        if area_only:
-            if len(grouped) == 1:
-                names = next(iter(grouped.values()))
-                unique_names = list(dict.fromkeys(names))
-                body = "\n".join(
-                    f"{index}. 【{name}】" for index, name in enumerate(unique_names, start=1)
-                )
-            else:
-                body = "\n".join(lines)
-            return f"根据“{query_value}”查询到以下可用门店：\n\n{body}\n\n以上均为当前商品的适用门店。"
         displays = []
         for city, names in grouped.items():
             if len(grouped) == 1:
                 displays.extend(names)
             else:
                 displays.extend(f"{city}{name}" for name in names)
-        return f"根据“{query_value}”查询到可用门店：{'、'.join(dict.fromkeys(displays))}。"
+        return f"可以用，根据“{query_value}”查询到可用门店：{'、'.join(dict.fromkeys(displays))}。"
 
     @classmethod
     def format_store_unavailable(cls, query: str, area_only: bool = False) -> str:
         value = str(query or "该关键词").strip(" \t\r\n，,。！？!?~～") or "该关键词"
-        area_key = cls._area_key(value)
-        known_areas = {
-            cls._area_key(item) for item in KNOWN_CITY_NAMES | KNOWN_PROVINCE_NAMES
-        }
-        if area_only or area_key in known_areas:
-            return (
-                f"当前适用门店资料中暂未查询到{value}。\n\n"
-                "建议您核对城市或完整门店名称，也可以更换其他地区查询。"
-            )
-        commercial_words = ("万达", "万象城", "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里")
-        if any(word in value for word in commercial_words) and not value.endswith(("店", "商场", "广场", "购物中心")):
-            value += "店"
         return (
-            f"当前适用门店资料中暂未查询到{value}。\n\n"
-            "建议您核对完整门店名称，或更换其他门店查询。"
+            f"根据“{value}”未查询到可用门店。\n"
+            "该门店不可用，或请更换关键词查询。"
         )
 
     @classmethod
@@ -8569,6 +8513,17 @@ class V2Store(AppStore):
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
         product = self.get_v2_product(item_id) or {}
 
+        # This resolver never produces buyer-facing business answers for a
+        # purchase-order product. The live workflow owns its one-time welcome
+        # and pure greeting response before reaching this fallback.
+        if str(product.get("coupon_type") or "").strip() == "purchase_order":
+            return {
+                "reply": "",
+                "source": "代买单仅自动处理首次回复和纯寒暄",
+                "decision": "silent",
+                "kind": "purchase_order_other",
+            }
+
         # Product status is the highest business gate. Once the listing is
         # offline, every buyer consultation gets the same deterministic answer;
         # no price/store/keyword/aftersale branch may leak through.
@@ -8907,49 +8862,6 @@ class V2Store(AppStore):
                 "source": "缺少可核验的申请类型和状态",
                 "decision": "allow",
                 "kind": "aftersale_clarify",
-            }
-
-        # 代买单只自动处理首次回复和流程。金额、报价以及其他问题均静默转人工。
-        if (
-            str(product.get("coupon_type") or "").strip() == "purchase_order"
-            and not aftersale_candidate
-        ):
-            purchase_price_words = (
-                "多少钱", "价格", "报价", "售价", "价钱", "几元", "几块",
-                "怎么卖", "便宜", "优惠", "折扣", "最低", "少点", "小刀",
-                "怎么凑", "如何凑", "多少代", "要付多少", "付多少钱",
-            )
-            explicit_amount = bool(
-                re.search(r"\d+(?:\.\d+)?\s*(?:元|块|折|%)", message)
-                or re.search(
-                    r"\d+(?:\.\d+)?\s*(?:元)?\s*(?:怎么拍|如何拍|怎么买|如何买|怎么凑|如何凑)",
-                    message,
-                )
-            )
-            if explicit_amount or any(word in message for word in purchase_price_words):
-                return {
-                    "reply": "",
-                    "source": "代买单报价由人工回复",
-                    "decision": "silent_review",
-                    "kind": "purchase_order_price",
-                }
-            if any(word in message for word in (
-                "怎么领取", "如何领取", "怎么领", "怎么核销", "如何核销",
-                "怎么使用", "如何使用", "怎么用", "发什么", "如何发",
-                "怎么拍", "如何拍", "怎么买", "如何买", "怎么付款", "如何付款",
-                "付款流程", "购买流程", "怎么操作", "桌码发哪里", "发桌码",
-            )):
-                return {
-                    "reply": self.purchase_order_public_instructions(product),
-                    "source": "代买单付款、领取与核销说明",
-                    "decision": "allow",
-                    "kind": "purchase_order_usage",
-                }
-            return {
-                "reply": "",
-                "source": "代买单仅自动处理首次回复和付款核销流程",
-                "decision": "silent",
-                "kind": "purchase_order_other",
             }
 
         if _allow_multi and not aftersale_candidate:

@@ -136,22 +136,22 @@ class V2StoreTests(unittest.TestCase):
     def test_coupon_type_defaults_to_meituan(self):
         self.assertEqual("meituan", self.store.get_v2_product("10001")["coupon_type"])
 
-    def test_purchase_order_price_questions_wait_for_manual_reply(self):
+    def test_purchase_order_business_questions_are_all_silent(self):
         self.store.save_v2_product("10001", "代买服务", "按实际需求人工报价", coupon_type="purchase_order")
         for message in ("多少钱", "给个报价", "300怎么拍", "可以便宜点吗"):
             result = self.store.resolve_deterministic("10001", message)
-            self.assertEqual("purchase_order_price", result["kind"])
-            self.assertEqual("silent_review", result["decision"])
+            self.assertEqual("purchase_order_other", result["kind"])
+            self.assertEqual("silent", result["decision"])
             self.assertEqual("", result["reply"])
 
-    def test_purchase_order_keeps_greeting_and_redemption_replies(self):
+    def test_purchase_order_store_fallback_never_answers_business_questions(self):
         self.store.save_v2_product("10001", "代买服务", "付款后发送领取信息", coupon_type="purchase_order")
         greeting = self.store.resolve_deterministic("10001", "你好")
         self.assertEqual("purchase_order_other", greeting["kind"])
         self.assertEqual("silent", greeting["decision"])
         usage = self.store.resolve_deterministic("10001", "付款后怎么领取和核销")
-        self.assertIsNotNone(usage)
-        self.assertNotEqual("purchase_order_price", usage["kind"])
+        self.assertEqual("purchase_order_other", usage["kind"])
+        self.assertEqual("silent", usage["decision"])
 
     def test_excel_import_fuzzy_match_and_unavailable(self):
         result = self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
@@ -283,7 +283,7 @@ class V2StoreTests(unittest.TestCase):
 
         result = self.store.resolve_deterministic("10001", "济南弘扬")
         self.assertEqual("stores", result["kind"])
-        self.assertIn("【济南弘阳广场店】", result["reply"])
+        self.assertIn("济南弘阳广场店", result["reply"])
         self.assertNotIn("100元代金券", result["reply"])
         self.assertNotEqual("济南", result["store_query"])
 
@@ -413,7 +413,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotEqual("too_many", result.get("store_status"))
         for name in ("襄阳万达店", "襄阳吾悦店", "襄阳民发店", "襄阳武商店"):
             self.assertIn(name, result["reply"])
-        self.assertIn("以上均为当前商品的适用门店", result["reply"])
+        self.assertIn("可以用，根据“襄阳”查询到可用门店：", result["reply"])
 
     def test_multi_sku_city_up_to_three_lists_each_store_specs(self):
         self.store.save_v2_product(
@@ -660,7 +660,7 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertEqual("stores", result["kind"])
         self.assertEqual(
-            "可以使用。根据“杭州萧山万象汇店”查询到可用门店：【杭州萧山万象汇店】",
+            "可以用，根据“杭州萧山万象汇店”查询到可用门店：杭州萧山万象汇店。",
             result["reply"],
         )
 
@@ -671,8 +671,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("deny", result["decision"])
         self.assertEqual(
-            "当前适用门店资料中暂未查询到沧州。\n\n"
-            "建议您核对城市或完整门店名称，也可以更换其他地区查询。",
+            "根据“沧州”未查询到可用门店。\n"
+            "该门店不可用，或请更换关键词查询。",
             result["reply"],
         )
 
@@ -703,7 +703,7 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "北京哪些店能用")
         self.assertEqual("stores", result["kind"])
         self.assertIn("北京", result["reply"])
-        self.assertIn("以上均为当前商品的适用门店", result["reply"])
+        self.assertIn("可以用，根据“北京”查询到可用门店：", result["reply"])
 
     def test_store_negative_confirmation_stays_in_store_intent(self):
         self.store.import_store_text(
@@ -876,8 +876,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("deny", result["decision"])
         self.assertEqual(
-            "当前适用门店资料中暂未查询到湖州。\n\n"
-            "建议您核对城市或完整门店名称，也可以更换其他地区查询。",
+            "根据“湖州”未查询到可用门店。\n"
+            "该门店不可用，或请更换关键词查询。",
             result["reply"],
         )
         self.assertNotIn("杭州", result["reply"])
@@ -897,7 +897,7 @@ class V2StoreTests(unittest.TestCase):
         self.store.import_store_list(self.create_multi_region_store_sheet(), "多地区门店", ["10001"])
         city = self.store.resolve_deterministic("10001", "深圳有门店吗")
         self.assertEqual("stores", city["kind"])
-        self.assertIn("根据“深圳”查询到以下可用门店", city["reply"])
+        self.assertIn("可以用，根据“深圳”查询到可用门店：", city["reply"])
         self.assertIn("龙岗万科里店", city["reply"])
         self.assertIn("西丽益田假日里店", city["reply"])
         self.assertNotIn("广州万达广场店", city["reply"])
@@ -1005,7 +1005,7 @@ class V2StoreTests(unittest.TestCase):
         )
         result = self.store.resolve_deterministic("10001", "南昌有哪些可以用")
         self.assertEqual("stores", result["kind"])
-        self.assertIn("根据“南昌”查询到以下可用门店", result["reply"])
+        self.assertIn("可以用，根据“南昌”查询到可用门店：", result["reply"])
         self.assertIn("万寿宫店", result["reply"])
         self.assertIn("北京东路店", result["reply"])
         self.assertNotIn("南昌品牌深圳店", result["reply"])
@@ -1031,8 +1031,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("西丽益田假日里店", fuzzy["reply"])
         missing = self.store.resolve_deterministic("10001", "焦作万达能用吗")
         self.assertEqual(
-            "当前适用门店资料中暂未查询到焦作万达店。\n\n"
-            "建议您核对完整门店名称，或更换其他门店查询。",
+            "根据“焦作万达”未查询到可用门店。\n"
+            "该门店不可用，或请更换关键词查询。",
             missing["reply"],
         )
 
@@ -1593,16 +1593,18 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("实际审核结果为准", result["reply"])
         self.assertNotIn("已经为您记录", result["reply"])
 
-    def test_purchase_order_only_bypasses_silence_for_real_aftersale_intent(self):
+    def test_purchase_order_aftersale_language_also_stays_silent(self):
         self.store.save_v2_product(
             "10001", "代买服务", "付款后按订单说明领取", coupon_type="purchase_order",
         )
         greeting = self.store.resolve_deterministic("10001", "你好")
         self.assertEqual("purchase_order_other", greeting["kind"])
         unredeemed = self.store.resolve_deterministic("10001", "我没验")
-        self.assertEqual("aftersale_clarify", unredeemed["kind"])
+        self.assertEqual("purchase_order_other", unredeemed["kind"])
+        self.assertEqual("silent", unredeemed["decision"])
         refund = self.store.resolve_deterministic("10001", "给我退了吧")
-        self.assertEqual("aftersale_clarify", refund["kind"])
+        self.assertEqual("purchase_order_other", refund["kind"])
+        self.assertEqual("silent", refund["decision"])
 
     def test_refund_status_uses_only_known_order_status(self):
         known = self.store.resolve_deterministic(
@@ -1638,7 +1640,7 @@ class V2StoreTests(unittest.TestCase):
         city = self.store.resolve_deterministic("10001", "北京可以吗")
         self.assertEqual("stores", city["kind"])
         self.assertIn("北京", city["reply"])
-        self.assertIn("以上均为当前商品的适用门店", city["reply"])
+        self.assertIn("可以用，根据“北京”查询到可用门店：", city["reply"])
         unclear = self.store.resolve_deterministic("10001", "该门店不可用吗")
         self.assertEqual("stores_clarify", unclear["kind"])
         self.assertNotIn("该 不", unclear["reply"])
@@ -2308,19 +2310,18 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("300元代金券", result["reply"])
         self.assertIn("235元", result["reply"])
 
-    def test_purchase_order_flow_hides_internal_price_formula(self):
+    def test_purchase_order_flow_and_price_are_both_silent(self):
         self.store.save_v2_product(
             "10001", "代买服务", "人工处理", coupon_type="purchase_order",
             coupon_instructions="买家点餐后发桌码，拍下商品后，改价为实际金额*0.78，买家付款后由卖家代付账单",
         )
         flow = self.store.resolve_deterministic("10001", "怎么买")
-        self.assertEqual("purchase_order_usage", flow["kind"])
-        self.assertIn("拍下商品", flow["reply"])
-        self.assertNotIn("0.78", flow["reply"])
-        self.assertNotIn("改价", flow["reply"])
+        self.assertEqual("purchase_order_other", flow["kind"])
+        self.assertEqual("silent", flow["decision"])
+        self.assertEqual("", flow["reply"])
         price = self.store.resolve_deterministic("10001", "390元怎么买")
-        self.assertEqual("purchase_order_price", price["kind"])
-        self.assertEqual("silent_review", price["decision"])
+        self.assertEqual("purchase_order_other", price["kind"])
+        self.assertEqual("silent", price["decision"])
         self.assertEqual("", price["reply"])
 
     def test_missing_coupon_denomination_recommends_closest_lower_sku(self):
@@ -3051,7 +3052,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("allow", result["decision"])
         self.assertIn("寿光万达广场店", result["reply"])
-        self.assertTrue(result["reply"].startswith("可以使用"))
+        self.assertTrue(result["reply"].startswith("可以用"))
 
     def test_composite_store_constraints_are_not_dropped(self):
         self.store.import_store_list(
@@ -3062,7 +3063,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("寿光万达广场店", result["reply"])
         self.assertNotIn("广州万达广场店", result["reply"])
         self.assertEqual(
-            "可以使用。根据“寿光万达广场店”查询到可用门店：【寿光万达广场店】",
+            "可以用，根据“寿光万达广场店”查询到可用门店：寿光万达广场店。",
             result["reply"],
         )
 

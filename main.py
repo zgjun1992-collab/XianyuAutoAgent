@@ -23,6 +23,7 @@ class XianyuLive:
     TEMPLATE_SEGMENT_TOKEN = "{$分段符}"
     TEMPLATE_IMAGE_PATTERN = re.compile(r"\{\$图片:(\d+)\}")
     AFTERSALE_FOLLOWUP_NOTICE = "您的售后问题已记录并提交人工核实，通常会在72小时内处理，请耐心等待。"
+    PURCHASE_ORDER_GREETING_REPLY = "您好，请问有什么可以帮您？"
 
     @staticmethod
     def decode_sync_message(data):
@@ -1075,6 +1076,55 @@ class XianyuLive:
             )
             return True
 
+    async def handle_purchase_order_buyer_message(
+        self, websocket, chat_id, send_user_id, scope_id, item_id,
+        product, conversation, message,
+    ):
+        """Keep purchase-order products out of every normal business route."""
+        product = product or {}
+        if str(product.get("coupon_type") or "").strip() != "purchase_order":
+            return False
+        product_offline = self.is_product_offline(product)
+        first_reply_sent_now = False
+        if not product_offline:
+            try:
+                first_reply_sent_now = await self.send_required_first_reply(
+                    websocket, chat_id, send_user_id, scope_id, item_id,
+                    product, conversation, message,
+                )
+            except Exception as exc:
+                logger.error(f"代买单首次回复发送失败: {exc}")
+                self.emit_event(
+                    "product_first_reply_error", chat_id=chat_id,
+                    item_id=item_id, scope_id=scope_id, message=str(exc),
+                )
+                return True
+        self.context_manager.add_message_by_chat(
+            scope_id, send_user_id, item_id, "user", message
+        )
+        if first_reply_sent_now:
+            logger.info(f"代买单仅发送商品首次回复 (会话: {chat_id})")
+            return True
+        if (
+            product_offline
+            or not bool(product.get("enabled", 1))
+            or self.is_manual_mode(scope_id)
+            or self.should_silence_disabled_purchase_order_greeting(product, message)
+            or not self.should_send_first_reply(message)
+        ):
+            logger.info(f"代买单非寒暄消息保持静默 (会话: {chat_id})")
+            return True
+        reply = self.PURCHASE_ORDER_GREETING_REPLY
+        await self.send_msg(websocket, chat_id, send_user_id, reply)
+        self.context_manager.add_message_by_chat(
+            scope_id, self.myid, item_id, "assistant", reply
+        )
+        self.emit_event(
+            "purchase_order_greeting", chat_id=chat_id, item_id=item_id,
+            scope_id=scope_id,
+        )
+        return True
+
     def exit_manual_mode(self, chat_id):
         """退出人工接管模式"""
         self.manual_mode_conversations.discard(chat_id)
@@ -1163,11 +1213,15 @@ class XianyuLive:
         ):
             logger.info("检测到卖家改价后的平台待付款卡片，跳过自动回复")
             return True
-        if not status:
-            if re.search(r"我已拍下\s*[,，]?\s*待付款|等待买家付款|已拍下[^\n]{0,12}待付款", serialized):
-                status = "等待买家付款"
-            elif re.search(r"(?:买家已申请|退款申请|退货退款申请|等待卖家处理|售后申请)", serialized):
-                status = "退款申请"
+        # Some waiting-payment cards contain a non-empty generic redReminder
+        # such as “请双方沟通及时确认价格”.  The explicit card state must win.
+        if re.search(r"我已拍下\s*[,，]?\s*待付款|等待买家付款|已拍下[^\n]{0,12}待付款", serialized):
+            status = "等待买家付款"
+        elif not status and re.search(
+            r"(?:买家已申请|退款申请|退货退款申请|等待卖家处理|售后申请)",
+            serialized,
+        ):
+            status = "退款申请"
         refund_status = any(word in status for word in ("退款", "退货", "售后", "纠纷"))
         ordinary_order_status = any(word in status for word in (
             "等待买家付款", "待付款", "等待卖家发货", "待发货", "已付款",
@@ -1272,6 +1326,9 @@ class XianyuLive:
         scope_id = self.scope_key(chat_id, item_id)
         product_getter = getattr(self.app_store, "get_v2_product", None)
         product = product_getter(item_id) if product_getter else None
+        if str((product or {}).get("coupon_type") or "").strip() == "purchase_order":
+            logger.info(f"代买单待付款卡片保持静默 (商品: {item_id})")
+            return True
         if product and product.get("item_status") != "offline" and not bool(product.get("enabled", 1)):
             logger.info(f"商品 {item_id} 已关闭AI客服，跳过付款前自动提示")
             return True
@@ -1510,6 +1567,14 @@ class XianyuLive:
                     )
                 except Exception as exc:
                     logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+
+            # 代买单与普通卡券完全隔离：首次消息只发已配置的首次回复；
+            # 后续只处理纯寒暄，其余问题不进入业务规则、AI、审核或售后。
+            if await self.handle_purchase_order_buyer_message(
+                websocket, chat_id, send_user_id, scope_id, item_id,
+                current_product, conversation, send_message,
+            ):
+                return
 
             # Aftersales owns the conversation before the normal product welcome.
             # The first entry sends the policy currently saved in the backend;

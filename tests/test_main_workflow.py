@@ -67,6 +67,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live._order_notice_scopes = set()
         live._buyer_routes = {"buyer-1": ("chat-1", "item-1")}
         live._first_reply_locks = {}
+        live.manual_mode_conversations = set()
         live.send_msg = AsyncMock()
         return live
 
@@ -149,6 +150,34 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event = {"1": "buyer-1@goofish", "3": {"reminderContent": "我已拍下，待付款"}}
         self.assertTrue(await live.handle_order_reminder(event, object()))
         live.send_msg.assert_awaited_once()
+
+    async def test_waiting_payment_card_text_overrides_generic_red_reminder(self):
+        live = self.make_live()
+        event = {
+            "1": "buyer-1@goofish",
+            "3": {
+                "redReminder": "请双方沟通及时确认价格",
+                "reminderContent": "我已拍下，待付款",
+            },
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_awaited_once()
+
+    async def test_purchase_order_waiting_payment_card_stays_silent(self):
+        live = self.make_live()
+        live.app_store.get_v2_product = lambda item_id: {
+            "item_id": item_id, "coupon_type": "purchase_order",
+            "item_status": "onsale", "enabled": 1,
+        }
+        event = {
+            "1": "buyer-1@goofish",
+            "3": {
+                "redReminder": "请双方沟通及时确认价格",
+                "reminderContent": "我已拍下，待付款",
+            },
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_not_awaited()
 
     async def test_seller_price_change_system_card_never_triggers_a_reply(self):
         live = self.make_live()
@@ -302,6 +331,49 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.send_message_template.assert_awaited_once()
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
         self.assertEqual("assistant", live.context_manager.messages[0][3])
+
+    async def test_purchase_order_first_message_sends_only_configured_welcome(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        product = {
+            "coupon_type": "purchase_order", "item_status": "onsale", "enabled": 1,
+            "first_reply_enabled": True, "first_reply_text": "代买单首次回复",
+            "first_reply_manual": True,
+        }
+        handled = await live.handle_purchase_order_buyer_message(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "390元怎么买",
+        )
+        self.assertTrue(handled)
+        live.send_message_template.assert_awaited_once()
+        live.send_msg.assert_not_awaited()
+
+    async def test_purchase_order_only_answers_later_pure_greetings(self):
+        product = {
+            "coupon_type": "purchase_order", "item_status": "onsale", "enabled": 1,
+            "first_reply_enabled": True, "first_reply_text": "代买单首次回复",
+            "first_reply_manual": True,
+        }
+        greeting_live = self.make_live()
+        greeting_live.app_store.first_reply_scopes.add("scope-1")
+        websocket = object()
+        self.assertTrue(await greeting_live.handle_purchase_order_buyer_message(
+            websocket, "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 1}, "你好",
+        ))
+        greeting_live.send_msg.assert_awaited_once_with(
+            websocket, "chat-1", "buyer-1", XianyuLive.PURCHASE_ORDER_GREETING_REPLY
+        )
+
+        for message in ("390元怎么买", "怎么付款", "深圳能用吗", "我要退款"):
+            with self.subTest(message=message):
+                live = self.make_live()
+                live.app_store.first_reply_scopes.add("scope-1")
+                self.assertTrue(await live.handle_purchase_order_buyer_message(
+                    object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+                    {"first_reply_sent": 1}, message,
+                ))
+                live.send_msg.assert_not_awaited()
 
     async def test_concrete_first_question_still_sends_welcome_once(self):
         live = self.make_live()
