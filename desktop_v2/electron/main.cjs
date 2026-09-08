@@ -100,6 +100,66 @@ async function freePort() {
   })
 }
 
+function canReachProxy(host, port, timeout = 450) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port: Number(port) })
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    socket.setTimeout(timeout)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+  })
+}
+
+async function configureGoofishProxy(goofishSession) {
+  const candidates = []
+  const addCandidate = (host, port, rule, source) => {
+    if (!host || !port || candidates.some((item) => item.host === host && item.port === String(port))) return
+    candidates.push({ host, port: String(port), rule, source })
+  }
+
+  for (const value of [process.env.HTTPS_PROXY, process.env.HTTP_PROXY]) {
+    if (!value) continue
+    try {
+      const parsed = new URL(value)
+      const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+      addCandidate(parsed.hostname, port, `${parsed.protocol}//${parsed.hostname}:${port}`, 'environment')
+    } catch (_error) {}
+  }
+
+  try {
+    const resolved = await goofishSession.resolveProxy('https://www.goofish.com/im')
+    for (const match of resolved.matchAll(/(?:PROXY|HTTPS?|SOCKS5?)\s+([^:;\s]+):(\d+)/gi)) {
+      addCandidate(match[1], match[2], `http://${match[1]}:${match[2]}`, 'system')
+    }
+  } catch (error) {
+    console.error('V3 proxy: resolveProxy failed', error?.message || String(error))
+  }
+
+  // Local proxy clients commonly expose a mixed HTTP port here. Probe only
+  // loopback so this cannot redirect the embedded browser to a remote host.
+  for (const port of ['7897', '7890', '10809', '10808']) {
+    addCandidate('127.0.0.1', port, `http://127.0.0.1:${port}`, 'local-probe')
+  }
+
+  for (const candidate of candidates) {
+    if (!await canReachProxy(candidate.host, candidate.port)) continue
+    await goofishSession.setProxy({ mode: 'fixed_servers', proxyRules: candidate.rule })
+    console.error(`V3 proxy: embedded workbench uses ${candidate.host}:${candidate.port} (${candidate.source})`)
+    return candidate
+  }
+
+  await goofishSession.setProxy({ mode: 'direct' })
+  console.error('V3 proxy: no reachable proxy found; embedded workbench uses direct connection')
+  return null
+}
+
 async function requestBackend(method, requestPath, body) {
   if (!backendReady) await waitForBackend()
   const response = await fetch(`http://127.0.0.1:${backendPort}${requestPath}`, {
@@ -201,8 +261,9 @@ async function syncGoofishCookie() {
   return { saved: true, count: relevant.length, at: saved.cookie_updated_at }
 }
 
-function createGoofishView() {
+async function createGoofishView() {
   const goofishSession = session.fromPartition('persist:xianyu-main')
+  await configureGoofishProxy(goofishSession)
   goofishView = new WebContentsView({
     webPreferences: {
       session: goofishSession,
@@ -253,7 +314,7 @@ async function createWindow() {
   })
   if (isDev) await mainWindow.loadURL('http://127.0.0.1:5173')
   else await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
-  createGoofishView()
+  await createGoofishView()
   mainWindow.on('closed', () => {
     if (goofishView && !goofishView.webContents.isDestroyed()) goofishView.webContents.close()
     goofishView = null
