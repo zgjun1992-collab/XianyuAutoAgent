@@ -52,6 +52,7 @@ let backendReady = false
 let backendIdentity = null
 let lastPendingCount = 0
 let cookieTimer = null
+let goofishSession = null
 
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
@@ -151,6 +152,11 @@ async function configureGoofishProxy(goofishSession) {
   for (const candidate of candidates) {
     if (!await canReachProxy(candidate.host, candidate.port)) continue
     await goofishSession.setProxy({ mode: 'fixed_servers', proxyRules: candidate.rule })
+    // The Python receiver must use the same reachable route as the embedded
+    // workbench.  Set this before spawning it so token and WebSocket traffic
+    // does not hang on a dead system proxy or an unavailable direct route.
+    process.env.HTTP_PROXY = candidate.rule
+    process.env.HTTPS_PROXY = candidate.rule
     console.error(`V3 proxy: embedded workbench uses ${candidate.host}:${candidate.port} (${candidate.source})`)
     return candidate
   }
@@ -262,8 +268,6 @@ async function syncGoofishCookie() {
 }
 
 async function createGoofishView() {
-  const goofishSession = session.fromPartition('persist:xianyu-main')
-  await configureGoofishProxy(goofishSession)
   goofishView = new WebContentsView({
     webPreferences: {
       session: goofishSession,
@@ -420,6 +424,9 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     console.error('V3 stage: app ready')
     registerIpc()
     console.error('V3 stage: IPC ready')
+    goofishSession = session.fromPartition('persist:xianyu-main')
+    await configureGoofishProxy(goofishSession)
+    console.error('V3 stage: network route ready')
     await startBackend()
     console.error('V3 stage: backend ready')
     await createWindow()
