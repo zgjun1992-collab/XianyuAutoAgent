@@ -15,6 +15,23 @@ if (process.platform === 'win32') {
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   console.error('V3 compatibility: GPU sandbox disabled')
 }
+// Chromium follows the Windows Internet Settings proxy, which can retain a
+// dead local port after proxy software changes ports.  Node/Python already use
+// HTTPS_PROXY/HTTP_PROXY, so prefer that live runtime proxy for the embedded
+// Goofish page as well.  Credentials are never logged or persisted here.
+const runtimeProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+if (runtimeProxy) {
+  try {
+    const parsedProxy = new URL(runtimeProxy)
+    if (['http:', 'https:', 'socks:', 'socks5:'].includes(parsedProxy.protocol)) {
+      const proxyOrigin = `${parsedProxy.protocol}//${parsedProxy.hostname}${parsedProxy.port ? `:${parsedProxy.port}` : ''}`
+      app.commandLine.appendSwitch('proxy-server', proxyOrigin)
+      console.error(`V3 proxy: using runtime proxy ${parsedProxy.hostname}:${parsedProxy.port || 'default'}`)
+    }
+  } catch (error) {
+    console.error('V3 proxy: ignored invalid runtime proxy', error?.message || String(error))
+  }
+}
 // Only one desktop main process may own the Xianyu WebSocket/backend.  Without
 // this lock, double-clicking the shortcut twice starts two independent backend
 // processes and both of them can reply to the same buyer message.
