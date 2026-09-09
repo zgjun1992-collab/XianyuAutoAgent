@@ -764,6 +764,10 @@ onBeforeUnmount(() => {
 
           <article v-if="productDraft.sync_status === 'source_updated'" class="knowledge-card source-update-card">
             <div class="knowledge-head"><div><span class="number">新</span><div><strong>闲鱼页面发现更新</strong><small>当前生效知识、门店和首次回复均未被覆盖；只有你确认的项目才会修改。</small></div></div><span class="authority">等待人工允许</span></div>
+            <details v-if="productDraft.source_update?.summary" class="source-update-preview">
+              <summary>查看闲鱼页面待更新内容</summary>
+              <pre>{{ productDraft.source_update.summary }}</pre>
+            </details>
             <div class="button-row end">
               <button :disabled="productDraft.source_update?.resolved_sections?.includes('knowledge')" @click="applySourceUpdate('knowledge')">允许更新商品知识</button>
               <button :disabled="productDraft.source_update?.resolved_sections?.includes('stores')" @click="applySourceUpdate('stores')">允许更新适用门店</button>
@@ -782,7 +786,7 @@ onBeforeUnmount(() => {
               <div class="source-images"><img v-for="url in productDraft.image_urls.slice(0, 8)" :key="url" :src="url" /></div>
               <pre>{{ productDraft.platform_summary || '当前没有同步到闲鱼页面资料。' }}</pre>
             </div>
-            <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea></article>
+            <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea><div class="button-row end"><button class="primary" @click="saveProduct">保存当前生效知识</button></div></article>
             <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>仅用于核对；重新归纳不会自动覆盖上方人工知识。确认无误后可人工采纳为当前知识，并保留历史版本</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_summary" v-model="productDraft.ai_summary" rows="16" placeholder="AI会尽量整理规格、价格、时间、适用限制、发券核销及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="productDraft.structured?.risk_fields?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in productDraft.structured.risk_fields" :key="field">{{ field }}</span></div></article>
           </div>
 

@@ -1071,6 +1071,29 @@ class XianyuLive:
             return text
         return self.sanitize_buyer_reply(text)
 
+    @staticmethod
+    def should_suppress_first_reply_for_question(product, message):
+        """Do not stack a product introduction before a concrete buyer answer."""
+        if str((product or {}).get("coupon_type") or "").strip() == "purchase_order":
+            return False
+        text = str(message or "").strip()
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", text)
+        if compact in {
+            "怎么下单", "如何下单", "购买流程", "怎么买", "如何购买", "拍哪个",
+            "哪里买", "在哪里买", "在哪买", "哪里购买", "在哪购买",
+            "购买入口在哪", "购买入口在哪里", "从哪里下单", "在哪下单",
+        }:
+            return True
+        has_store_entity = bool(re.search(
+            r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|商圈|商场|广场|"
+            r"购物中心|门店|分店|旗舰店|总店|店)", text,
+        ))
+        asks_store_use = bool(re.search(
+            r"(?:可以|能|可不可以|能不能|是否)(?:使用|用)|(?:支持|适用)(?:吗|么|嘛)?",
+            compact,
+        ))
+        return has_store_entity and asks_store_use
+
     async def send_required_first_reply(
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
         message="",
@@ -1093,6 +1116,13 @@ class XianyuLive:
         async with lock:
             durable_getter = getattr(self.app_store, "is_first_reply_sent", None)
             if durable_getter and durable_getter(scope_id):
+                return False
+            if self.should_suppress_first_reply_for_question(product, message):
+                self.app_store.mark_first_reply_sent(scope_id)
+                self.emit_event(
+                    "product_first_reply_suppressed", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message="买家首条为明确业务问题，仅发送对应答案",
+                )
                 return False
             reply = self.prepare_product_first_reply(product)
             if not reply:
@@ -1849,7 +1879,7 @@ class XianyuLive:
             if deterministic and "store_matches" in deterministic:
                 store_status = deterministic.get("store_status", "available")
                 store_matches = deterministic.get("store_matches", [])
-                trusted_qualities = {"exact", "contained", "area", "phonetic"}
+                trusted_qualities = {"exact", "contained", "area", "phonetic", "alias", "reordered"}
                 verified_store_context = bool(
                     store_status == "unavailable"
                     or (

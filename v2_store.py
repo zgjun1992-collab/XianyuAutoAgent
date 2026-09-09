@@ -79,6 +79,15 @@ GENERIC_STORE_LANDMARKS = (
     "奥特莱斯", "天虹", "ifs", "mall",
 )
 
+# Only aliases confirmed against a canonical branch in the current product's
+# bound store table are eligible. This keeps merchant-specific nicknames from
+# leaking into other products or inventing an unsupported branch.
+STORE_QUERY_ALIASES = {
+    "深圳大运中心": "龙岗大运天地店",
+    "龙岗大运中心": "龙岗大运天地店",
+    "深圳大运天地": "龙岗大运天地店",
+}
+
 STORE_RELATION_WORDS = (
     "附近", "旁边", "对面", "楼上", "楼下", "隔壁", "周边",
 )
@@ -155,7 +164,7 @@ STORE_COLUMN_ALIASES = {
     "district": ("区县", "区", "县", "行政区", "所在区县"),
     "address": ("地址", "详细地址", "门店地址", "店铺地址", "所在地址"),
     "phone": ("电话", "联系电话", "手机号", "联系方式", "门店电话", "店铺电话"),
-    "business_hours": ("营业时间", "营业时段", "营业时间段", "开放时间", "服务时间"),
+    "business_hours": ("营业时间", "显示营业时间", "营业时段", "营业时间段", "开放时间", "服务时间"),
 }
 
 
@@ -3405,12 +3414,18 @@ class V2Store(AppStore):
         if compact not in {
             "哪里买", "在哪里买", "在哪买", "哪里购买", "在哪购买",
             "购买入口在哪", "购买入口在哪里", "从哪里下单", "在哪下单",
+            "怎么下单", "如何下单", "购买流程", "怎么买", "如何购买", "拍哪个",
         }:
             return ""
         if str(product.get("item_status") or "").lower() in {
             "offline", "off_shelf", "offshelf", "deleted", "下架",
         }:
             return "当前商品目前已下架，暂时无法购买。"
+        if compact in {"怎么下单", "如何下单", "购买流程", "怎么买", "如何购买", "拍哪个"}:
+            return (
+                "直接在当前商品页面选择需要的规格并完成付款即可。"
+                "付款后会按商品说明发送领券信息，到店出示券码核销。"
+            )
         options = self.extract_product_options(product)
         if options and self._has_explicit_day_options(options):
             day_type = self._requested_day_type(message, default_today=True)
@@ -3427,7 +3442,10 @@ class V2Store(AppStore):
             str(product.get("title") or ""), str(product.get("raw_text") or ""),
         ))):
             return "当前商品暂时没有可购买的在售规格。"
-        return "直接在当前商品页面选择需要的规格下单即可。"
+        return (
+            "直接在当前商品页面选择需要的规格并完成付款即可。"
+            "付款后会按商品说明发送领券信息，到店出示券码核销。"
+        )
 
     @classmethod
     def purchase_timing_reply(cls, product: Dict, message: str) -> str:
@@ -4513,8 +4531,8 @@ class V2Store(AppStore):
             ),
         ))
         amount_cap = re.search(
-            r"(?:一桌|每桌|单桌|每次)[^。；\n]{0,12}?"
-            r"(?:最多)?(?:可)?(?:代|抵(?:用|扣)?|使用)?\s*(\d+(?:\.\d+)?)\s*元",
+            r"(?:一桌|每桌|单桌|每次|单次)[^。；\n]{0,12}?"
+            r"(?:最多)?(?:可)?(?:代|抵(?:用|扣)?)\s*(\d+(?:\.\d+)?)\s*元",
             knowledge,
         )
         maximum = 0
@@ -4528,7 +4546,12 @@ class V2Store(AppStore):
             except (InvalidOperation, ValueError):
                 maximum = 0
         if maximum <= 0:
+            unit_label = re.escape(self._format_number(unit_value))
             count_cap = re.search(
+                rf"{unit_label}\s*元(?:代金)?券[^。；\n]{{0,12}}?"
+                r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
+                knowledge,
+            ) or re.search(
                 r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
                 knowledge,
             )
@@ -5353,7 +5376,16 @@ class V2Store(AppStore):
     @staticmethod
     def _read_rows(path: str) -> Iterable[Dict]:
         def canonical_headers(values) -> List[str]:
-            return [classify_store_header(value) for value in values]
+            headers = [classify_store_header(value) for value in values]
+            normalized = [normalize_store_header(value) for value in values]
+            # Merchant sheets often use 门店名称 for the brand and 分店名 for
+            # the physical branch. The sibling column removes that ambiguity.
+            if "分店名" in normalized or "分店名称" in normalized:
+                headers = [
+                    "brand" if name == "门店名称" else field
+                    for name, field in zip(normalized, headers)
+                ]
+            return headers
 
         def rows_from_values(rows) -> Iterable[Dict]:
             headers = None
@@ -6704,6 +6736,26 @@ class V2Store(AppStore):
                 score, quality = 90, "contained"
                 evidence.append({"type": "branch", "value": candidate, "score": 90})
 
+        # Some buyers naturally reverse a mall/operator name and its local
+        # qualifier ("凯德武胜" vs canonical "武胜凯德店"). Accept only an
+        # exact character multiset inside an already grounded administrative
+        # scope; this is intentionally narrower than fuzzy matching.
+        reordered_query = query_key[:-1] if query_key.endswith(("路", "街")) else query_key
+        if (
+            score < 90 and (province_scope or city_scope or district_scope)
+            and len(reordered_query) >= 4
+        ):
+            reordered_aliases = [
+                alias for alias in aliases
+                if len(alias) == len(reordered_query)
+                and sorted(alias) == sorted(reordered_query)
+            ]
+            if reordered_aliases:
+                candidate = max(reordered_aliases, key=len)
+                score, quality = 95, "reordered"
+                matched_anchor = query_key
+                evidence.append({"type": "reordered_branch", "value": candidate, "score": 95})
+
         if query_key and address_key and query_key in address_key:
             address_score = 90 if re.search(r"\d+号", query_key) else 85
             if address_score > score:
@@ -6917,7 +6969,10 @@ class V2Store(AppStore):
                 for start in range(start_floor, max(start_floor, end - 1)):
                     street = normalized_address[start:end].strip(" ，,。；;：:0123456789")
                     street_key = normalize_match_text(street)
-                    if len(street_key) >= 2 and street_key in query_key:
+                    # Two-character address tails such as "胜路" are too weak:
+                    # they previously hijacked a precise mall query and matched
+                    # an unrelated branch whose address happened to contain it.
+                    if len(street_key) >= 3 and street_key in query_key:
                         street_candidates.append((len(street_key), street))
 
         if row_candidates:
@@ -6930,6 +6985,7 @@ class V2Store(AppStore):
                 "万达", "万象城", "万象汇", "壹方城", "壹方天地", "万科里",
                 "海岸城", "天街", "银泰", "吾悦", "大悦城", "来福士",
                 "太古里", "印象城", "奥特莱斯", "ifs", "mall", "店",
+                "凯德",
             )
         )
         if area_candidates and not store_specific_tail:
@@ -7049,6 +7105,14 @@ class V2Store(AppStore):
             for index in range(start, end):
                 chars[index] = ""
         remainder = "".join(chars)
+        # Store spreadsheets do not always provide a district column. Once a
+        # city/province is grounded, remove one explicit leading district token
+        # from the branch remainder instead of treating it as fuzzy name noise.
+        if (province or city) and not district:
+            remainder = re.sub(
+                r"^[\u4e00-\u9fff]{2,6}?(?:区|县|旗)(?=[\u4e00-\u9fffA-Za-z0-9])",
+                "", remainder, count=1,
+            )
         return province, city, district, remainder
 
     @classmethod
@@ -7146,6 +7210,32 @@ class V2Store(AppStore):
         if is_meaningful_store_query(cleaned_query):
             query = cleaned_query
             query_norm = normalize_text(query)
+
+        alias_key = normalize_match_text(query)
+        canonical_alias = next((
+            canonical for alias, canonical in STORE_QUERY_ALIASES.items()
+            if normalize_match_text(alias) == alias_key
+        ), "")
+        if canonical_alias:
+            alias_matches = [
+                row for row in rows
+                if normalize_match_text(row.get("branch")) == normalize_match_text(canonical_alias)
+            ]
+            if alias_matches:
+                for item in alias_matches:
+                    item["score"] = 1.0
+                    item["match_score"] = 100
+                    item["match_quality"] = "alias"
+                    item["match_evidence"] = [{
+                        "type": "configured_alias", "value": canonical_alias, "score": 100,
+                    }]
+                    item["unresolved_terms"] = []
+                return {
+                    "status": "available", "matches": alias_matches,
+                    "province": "", "city": "", "district": "",
+                    "search_term": query, "sku_key": sku_key, "mode": mode,
+                    "resolved_query": query,
+                }
         if query_meta["relation_words"]:
             return {
                 "status": "relation_query", "matches": [],
@@ -7451,6 +7541,14 @@ class V2Store(AppStore):
             r"锅底|酒水|饮料|菜品|餐品|套餐|包间|堂食|外带|打包|外卖",
             message_key,
         ))
+        grounded_store_match = bool(
+            result and result.get("status") == "available"
+            and any(
+                int(match.get("match_score") or 0) >= 85
+                and not match.get("unresolved_terms")
+                for match in result.get("matches") or []
+            )
+        )
         known_areas = {
             cls._area_key(value) for value in KNOWN_CITY_NAMES | KNOWN_PROVINCE_NAMES
         }
@@ -7458,6 +7556,7 @@ class V2Store(AppStore):
             any(word in message_key for word in STORE_LANDMARK_WORDS)
             or any(area and area in message_key for area in known_areas if len(area) >= 2)
             or bool(re.search(r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|商圈|商场|广场|购物中心|门店|分店|店)", raw_query))
+            or grounded_store_match
         )
         temporal_subject = bool(re.search(
             r"今天|今日|明天|明日|后天|周末|工作日|平日|节假日|法定假日|"
@@ -7908,10 +8007,25 @@ class V2Store(AppStore):
         if clarification:
             return clarification
         if result.get("status") == "available":
+            if contextual:
+                names = "、".join(dict.fromkeys(
+                    str(match.get("branch") or match.get("brand") or "").strip()
+                    for match in result.get("matches") or []
+                    if str(match.get("branch") or match.get("brand") or "").strip()
+                ))
+                if names:
+                    return {
+                        "reply": f"可以用，{names}在当前商品的可用门店范围内。",
+                        "source": "当前会话最近一次门店查询重新核验",
+                        "decision": "allow", "kind": "stores",
+                        "store_matches": result["matches"], "store_query": query,
+                        "store_status": "available",
+                    }
             return {
                 "reply": prefix + self.format_store_matches(result["matches"], query, text),
                 "source": "门店否定问法按适用门店查询", "decision": "allow", "kind": "stores",
                 "store_matches": result["matches"], "store_query": query,
+                "store_status": "available",
             }
         if result.get("status") == "unavailable":
             return {
@@ -8362,9 +8476,11 @@ class V2Store(AppStore):
             replies.append((label, reply.rstrip(" \t\r\n")))
 
         ordered_tasks = sorted(tasks, key=lambda value: value[0])
-        compact_store_condition = {
+        compact_store_condition = "store" in {
             kind for _, kind, _, _ in ordered_tasks
-        }.issubset({"store", "conditions"})
+        } and {
+            kind for _, kind, _, _ in ordered_tasks
+        }.issubset({"store", "date", "day", "conditions"})
         result = {
             "reply": "\n\n".join(
                 reply if compact_store_condition else f"{index}. {label}：{reply}"
@@ -9683,6 +9799,7 @@ class V2Store(AppStore):
         query = extract_store_query(
             message, product=product, product_brand=self.extract_brand(product)
         )
+        requested_store_query = query
         inherited_day = str((store_context or {}).get("pending_day_type") or "")
         sku_message = message
         if (
@@ -9798,12 +9915,21 @@ class V2Store(AppStore):
                             "store_query": query,
                         }
                 return {
-                    "reply": prefix + self.format_store_matches(store_result["matches"], query, message),
+                    "reply": prefix + self.format_store_matches(
+                        store_result["matches"],
+                        requested_store_query
+                        if (
+                            is_meaningful_store_query(requested_store_query)
+                            and re.search(r"(?:区|县|旗)", requested_store_query)
+                        ) else query,
+                        message,
+                    ),
                     "source": "当前商品绑定门店表",
                     "decision": "allow",
                     "kind": "stores",
                     "store_matches": store_result["matches"],
                     "store_query": query,
+                    "store_status": "available",
                     "query_context_update": ({
                         "selected_sku_key": selected_sku["sku_key"],
                         "selected_sku_name": selected_sku["sku_name"],
@@ -10022,6 +10148,8 @@ class V2Store(AppStore):
 def extract_store_query(message: str, product: Optional[Dict] = None,
                         product_brand: str = "") -> str:
     text = str(message or "").strip()
+    # Tolerate common key-repeat typos without widening fuzzy store matching.
+    text = re.sub(r"能{2,}(?=(?:使用|用))", "能", text)
     # Product titles are frequently followed by a parenthesized branch.  That
     # bracket is a reliable entity boundary; use it before deleting intent
     # words from the rest of the sentence.

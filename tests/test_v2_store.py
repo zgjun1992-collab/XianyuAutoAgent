@@ -3942,6 +3942,131 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("全国", result["reply"])
         self.assertNotIn("上海除外", result["reply"])
 
+    def test_store_import_preserves_province_city_branch_and_address(self):
+        path = os.path.join(self.temp.name, "province-city-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["序号", "省份", "城市", "门店名称", "分店名", "地址", "显示营业时间"])
+        sheet.append([1, "广东省", "广州市", "山缓缓火锅", "广州番禺天河城店",
+                      "番禺区南村镇天河城2层", "10:00-22:00"])
+        book.save(path)
+        self.store.import_store_list(path, "山缓缓门店", ["10001"])
+
+        result = self.store.search_store("10001", "广州番禺天河城店")
+        self.assertEqual("available", result["status"])
+        match = result["matches"][0]
+        self.assertEqual("广东省", match["province"])
+        self.assertEqual("广州市", match["city"])
+        self.assertEqual("广州番禺天河城店", match["branch"])
+        self.assertEqual("番禺区南村镇天河城2层", match["address"])
+
+    def test_configured_store_alias_resolves_only_to_existing_current_branch(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】龙岗大运天地店", "深圳门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "深圳大运中心可以使用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertIn("龙岗大运天地店", result["reply"])
+        self.assertIn("根据“深圳大运中心”", result["reply"])
+
+        other = V2Store(os.path.join(self.temp.name, "other.db"))
+        other.save_v2_product("20002", "其他代金券", "100元代金券售价80元")
+        other.import_store_text("【广东省】\n【深圳】深圳湾店", "其他门店", ["20002"])
+        missing = other.search_store("20002", "深圳大运中心")
+        self.assertEqual("unavailable", missing["status"])
+
+    def test_wuhan_kaide_wusheng_query_does_not_match_short_address_fragment(self):
+        path = os.path.join(self.temp.name, "wuhan-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "地址"])
+        sheet.append(["鱼酷", "武胜凯德店", "湖北", "武汉", "中山大道238号凯德广场"])
+        sheet.append(["鱼酷", "白沙龙湖天街店", "湖北", "武汉", "张家湾烽胜路龙湖天街"])
+        book.save(path)
+        self.store.import_store_list(path, "鱼酷门店", ["10001"])
+
+        result = self.store.resolve_deterministic("10001", "武汉凯德广场武胜路能用吗")
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual(["武胜凯德店"], [row["branch"] for row in result["store_matches"]])
+        self.assertIn("武胜凯德店", result["reply"])
+        self.assertNotIn("白沙龙湖天街店", result["reply"])
+
+    def test_purchase_flow_is_answered_locally(self):
+        result = self.store.resolve_deterministic("10001", "怎么下单")
+        self.assertEqual("purchase_flow", result["kind"])
+        self.assertIn("当前商品页面", result["reply"])
+        self.assertIn("完成付款", result["reply"])
+
+    def test_300_coupon_quantity_uses_300_total_cap_not_100_denomination(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "100元代金券：售价111.8元，发100元券2张；"
+            "300元代金券：售价204.8元，发300元券1张。"
+            "单次或每桌限用数量：100元券最多使用2张；300元券最多使用1张；"
+            "单次最多抵扣300元。",
+        )
+        result = self.store.resolve_deterministic("10001", "300可以用几张")
+        self.assertIn("每次最多使用1张300元券", result["reply"])
+        self.assertIn("共可抵扣300元", result["reply"])
+        self.assertNotIn("共可抵扣100元", result["reply"])
+
+    def test_city_unknown_district_and_reordered_mall_name_match_bound_store(self):
+        self.store.import_store_text(
+            "【山东省】\n【青岛】青岛未来城万科广场店",
+            "鱼酷青岛门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "青岛市市北区万科未来城可以用吗",
+        )
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("available", result["store_status"])
+        self.assertEqual(
+            ["青岛未来城万科广场店"],
+            [row["branch"] for row in result["store_matches"]],
+        )
+        self.assertIn("可以用，根据“青岛市市北区万科未来城”", result["reply"])
+
+    def test_store_and_today_are_both_answered_for_bare_exact_branch(self):
+        self.store.import_store_text(
+            "【北京市】\n【北京】西直门店", "北京门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "西直门今天能用么？")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "date"], result["resolved_intents"])
+        self.assertIn("可以用，根据“西直门”查询到可用门店：西直门店。", result["reply"])
+        self.assertIn("可以使用", result["reply"])
+
+    def test_repeated_ability_word_does_not_break_store_and_date_query(self):
+        self.store.import_store_text(
+            "【北京市】\n【北京】西直门店", "北京门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic("10001", "西直门今天能能用么？")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual(["store", "date"], result["resolved_intents"])
+        self.assertIn("西直门店", result["reply"])
+
+    def test_negative_followup_rechecks_available_store_and_confirms_naturally(self):
+        self.store.import_store_text(
+            "【山东省】\n【青岛】青岛未来城万科广场店",
+            "鱼酷青岛门店", ["10001"],
+        )
+        first = self.store.resolve_deterministic(
+            "10001", "青岛市市北区万科未来城可以用吗",
+        )
+        context = {
+            "query": first["store_query"], "matches": first["store_matches"],
+            "status": first["store_status"], "verified": True,
+        }
+        followup = self.store.resolve_deterministic(
+            "10001", "不能用吗", store_context=context,
+        )
+        self.assertEqual("stores", followup["kind"])
+        self.assertEqual("available", followup["store_status"])
+        self.assertEqual(
+            "可以用，青岛未来城万科广场店在当前商品的可用门店范围内。",
+            followup["reply"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
