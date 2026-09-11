@@ -1,7 +1,10 @@
 import base64
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from requests import Session
 
 from main import XianyuLive
 
@@ -70,6 +73,23 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.manual_mode_conversations = set()
         live.send_msg = AsyncMock()
         return live
+
+    def test_cookie_hot_swap_invalidates_token_and_requests_reconnect(self):
+        live = self.make_live()
+        live.cookies_str = "unb=seller; _m_h5_tk=old_1"
+        live.cookies = {}
+        live.xianyu = SimpleNamespace(session=Session())
+        live.current_token = "old-message-token"
+        live.last_token_refresh_time = 100
+        live.cookie_revision = 0
+        live.connection_restart_flag = False
+        live.loop = None
+        live.ws = None
+        self.assertTrue(live.update_cookie("unb=seller; _m_h5_tk=new_2"))
+        self.assertEqual("new_2", live.xianyu.session.cookies.get("_m_h5_tk"))
+        self.assertIsNone(live.current_token)
+        self.assertEqual(1, live.cookie_revision)
+        self.assertTrue(live.connection_restart_flag)
 
     async def test_complete_live_listing_marks_absent_product_offline(self):
         live = self.make_live()
@@ -397,7 +417,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ))
                 live.send_msg.assert_not_awaited()
 
-    async def test_concrete_first_question_suppresses_stacked_welcome(self):
+    async def test_concrete_store_question_keeps_mandatory_first_reply(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()
         product = {
@@ -408,11 +428,11 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
             {"first_reply_sent": 0}, "武汉凯德广场武胜路能用吗",
         )
-        self.assertFalse(sent)
-        live.send_message_template.assert_not_awaited()
+        self.assertTrue(sent)
+        live.send_message_template.assert_awaited_once()
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
 
-    async def test_purchase_flow_question_suppresses_stacked_welcome(self):
+    async def test_purchase_flow_question_keeps_mandatory_first_reply(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()
         product = {
@@ -423,8 +443,8 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
             {"first_reply_sent": 0}, "怎么下单",
         )
-        self.assertFalse(sent)
-        live.send_message_template.assert_not_awaited()
+        self.assertTrue(sent)
+        live.send_message_template.assert_awaited_once()
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
 
     def test_aftersale_entry_requires_actual_post_purchase_evidence(self):

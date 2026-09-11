@@ -234,6 +234,8 @@ function unbindStoreList(id) {
 }
 
 async function syncProducts() {
+  const login = await desktop.syncCookie()
+  if (!login.saved) return notify('尚未检测到闲鱼登录，请先在内置闲鱼页面登录', 'error')
   syncReport.value = await call('POST', '/products/sync', {})
   await refresh()
   if (snapshot.products.length) selectProduct(snapshot.products[0])

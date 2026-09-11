@@ -88,6 +88,13 @@ STORE_QUERY_ALIASES = {
     "深圳大运天地": "龙岗大运天地店",
 }
 
+# County-level city names buyers commonly use while merchant exports keep only
+# the parent prefecture in the city column. Values are the canonical city keys
+# used by the imported store rows.
+KNOWN_SUBCITY_TO_CITY = {
+    "乐清": "温州",
+}
+
 STORE_RELATION_WORDS = (
     "附近", "旁边", "对面", "楼上", "楼下", "隔壁", "周边",
 )
@@ -97,9 +104,11 @@ STORE_QUERY_NEUTRAL_WORDS = (
     "帮忙看看", "帮我看看", "请问", "麻烦", "帮忙", "帮我", "查一下",
     "查下", "看一下", "看下", "我想问", "想问", "咨询一下", "咨询",
     "那个门店", "这个门店", "那家门店", "这家门店", "那个店", "这个店",
-    "那家", "这家", "那边", "这边", "当前", "现在", "今天", "一下",
+    "那家", "这家", "那边", "这边", "您好", "你好", "当前", "现在", "今天", "一下",
+    "本周末", "周末", "工作日", "平日", "节假日", "早餐", "中午", "午餐", "晚上", "晚餐", "晚市",
     "可以使用", "可以用", "能不能用", "可不可以用", "是否可用", "能用",
-    "可用", "适用", "支持", "有没有", "有吗", "有不", "行不行", "行吗",
+    "可用", "适用", "支持", "还有没有", "还有吗", "还有么", "还有嘛",
+    "有没有", "有吗", "有不", "行不行", "行吗",
     "吃完再买对吧", "吃完再买", "吃了再买对吧", "吃了再买", "用餐后再买",
     "结账前再买", "买单前再买", "对吧", "是吧", "没错吧",
     "的吗", "的么", "的嘛", "的", "吗", "嘛", "么", "呀", "呢", "吧",
@@ -1444,7 +1453,8 @@ class V2Store(AppStore):
         patterns = (
             rf"(?P<count>{number})\s*(?P<unit>{unit})[^。！？\n]{{0,16}}"
             r"(?:多少钱|多钱|几多钱|多少(?:钱|元|块)?|什么价|啥价|价格|怎么卖|"
-            r"怎么收|怎么买|怎么拍|一共|总共|合计|要付)",
+            r"怎么收|怎么买|怎么拍|一共|总共|合计|要付|"
+            r"还有吗|还有么|还有嘛|还有没有|有货吗|有没有|有吗|能用吗|可以用吗)",
             rf"(?:买|要|来|拿|拍|购)\s*(?P<count>{number})\s*(?P<unit>{unit})",
             rf"(?P<count>{number})\s*(?P<unit>{unit})\s*(?:的)?\s*(?:呢|可以吗|有吗)[？?。！!]*$",
         )
@@ -1862,6 +1872,9 @@ class V2Store(AppStore):
         elif "明天" in text or "明日" in text:
             tomorrow = datetime.now(CHINA_TZ) + timedelta(days=1)
             day_types = ["weekend" if tomorrow.weekday() >= 5 else "weekday"]
+        target_date = cls._query_date(text)
+        if target_date:
+            day_types = ["weekend" if target_date.weekday() >= 5 else "weekday"]
         purchase_quantity, purchase_unit = cls._purchase_quantity_slot(text)
         target_amount = cls._requested_price_amount(text)
         quantity_denomination = cls._quantity_denomination(text)
@@ -1876,6 +1889,11 @@ class V2Store(AppStore):
             "day_types": day_types,
             "meal_period": meal_periods[-1] if meal_periods else "",
             "meal_periods": meal_periods,
+            "date_label": (
+                "今天" if re.search(r"今天|今日", text)
+                else "明天" if re.search(r"明天|明日", text)
+                else f"{target_date.month}月{target_date.day}日" if target_date else ""
+            ),
             "target_amount": target_amount,
             "purchase_quantity": purchase_quantity,
             "purchase_unit": purchase_unit,
@@ -1888,7 +1906,9 @@ class V2Store(AppStore):
     @staticmethod
     def _conditional_subject(slots: Dict) -> str:
         labels = []
-        if slots.get("day_type"):
+        if slots.get("date_label"):
+            labels.append(str(slots["date_label"]))
+        elif slots.get("day_type"):
             labels.append({
                 "weekday": "工作日", "weekend": "周末", "holiday": "节假日", "any": "全周",
             }.get(slots["day_type"], slots["day_type"]))
@@ -2498,7 +2518,9 @@ class V2Store(AppStore):
         prefixes = []
         day = slots.get("day_type")
         meal = slots.get("meal_period")
-        if day and not cls._day_types(name):
+        if slots.get("date_label"):
+            prefixes.append(f"{slots['date_label']}可用的")
+        elif day and not cls._day_types(name):
             prefixes.append({
                 "weekday": "工作日可用的", "weekend": "周末可用的", "holiday": "节假日可用的",
             }.get(day, ""))
@@ -2550,9 +2572,16 @@ class V2Store(AppStore):
         # Buyers often send only a compact condition bundle, for example
         # “三人明天中午”. A person count plus an explicit date/day/meal period
         # is a complete local price request even when “多少钱/能用吗” is omitted.
+        package_tier_intent = bool(re.search(
+            r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛|轻享和牛",
+            text, re.I,
+        ))
         implicit_condition_price = bool(
             direct_slots.get("people_count")
-            and (direct_slots.get("day_type") or direct_slots.get("meal_period"))
+            and (
+                direct_slots.get("day_type") or direct_slots.get("meal_period")
+                or package_tier_intent
+            )
         )
         if (
             availability_intent
@@ -2597,15 +2626,16 @@ class V2Store(AppStore):
 
         slot_keys = (
             "people_count", "day_type", "meal_period", "target_amount",
-            "purchase_quantity", "purchase_unit", "amount_kind",
+            "purchase_quantity", "purchase_unit", "amount_kind", "date_label",
         )
         has_direct_slot = any(direct_slots.get(key) not in (None, "") for key in slot_keys)
         referential = bool(re.search(r"(?:呢|那|这个|这种|这款)[？?。！!]*$", text))
         context_followup = bool(previous and (has_direct_slot or pending_filled) and len(normalize_text(text)) <= 16)
+        tier_followup = bool(previous and package_tier_intent and len(normalize_text(text)) <= 16)
         if not (
             price_intent or availability_intent or implicit_condition_price or pending_filled
             or bool(direct_slots.get("purchase_quantity"))
-            or ((referential or context_followup) and previous)
+            or ((referential or context_followup or tier_followup) and previous)
         ) or not (has_direct_slot or previous):
             return None
 
@@ -2617,7 +2647,7 @@ class V2Store(AppStore):
             and len(normalize_text(text)) <= 12
         )
         inherited = (
-            ((referential or context_followup) and not (price_intent or availability_intent))
+            ((referential or context_followup or tier_followup) and not (price_intent or availability_intent))
             or only_new_amount or pending_filled
         )
         slots = {key: previous.get(key) for key in slot_keys} if inherited else {}
@@ -2639,6 +2669,27 @@ class V2Store(AppStore):
         if not any(slots.get(key) not in (None, "") for key in slot_keys):
             return None
         options = [option for option in self.extract_sale_options(product) if option.get("sale_price")]
+        requested_audiences = set(direct_slots.get("audience_types") or [])
+        if not requested_audiences:
+            # Child/senior/student fares must never become the default adult
+            # answer merely because they are the only option left after date filtering.
+            options = [option for option in options if not (option.get("audience_types") or [])]
+
+        # Keep package tiers isolated. “M8 M9/高阶和牛” identifies the M8-9
+        # option even when the requested party size is two; it must not be
+        # replaced by an unrelated two-person “轻享和牛” SKU.
+        tier_options = []
+        if re.search(r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛", text, re.I):
+            tier_options = [
+                option for option in options
+                if re.search(r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9", str(option.get("name") or ""), re.I)
+            ]
+        elif re.search(r"轻享和牛", text):
+            tier_options = [
+                option for option in options if "轻享和牛" in str(option.get("name") or "")
+            ]
+        if tier_options:
+            options = tier_options
         if not slots.get("day_type") and self._has_explicit_day_options(options):
             # A buyer asking the current price/availability without naming a
             # date means today. Never fall back to the first or cheapest tier.
@@ -2777,6 +2828,19 @@ class V2Store(AppStore):
             candidates = voucher_matches if purchase_unit == "张" and voucher_matches else package_matches
             if not candidates:
                 candidates = voucher_matches or package_matches
+            if candidates and package_matches and candidates is package_matches:
+                # “两张” is a purchase count, not a two-person SKU request.  If
+                # the listing title identifies the advertised ticket size, keep
+                # that real option and multiply it instead of asking the buyer to
+                # choose between unrelated single/double/triple packages.
+                title_people = self._people_counts(product.get("title") or "")
+                if len(title_people) == 1:
+                    titled = [
+                        option for option in candidates
+                        if title_people[0] in (option.get("people_counts") or [])
+                    ]
+                    if len(titled) == 1:
+                        candidates = titled
             if voucher_matches and candidates is voucher_matches:
                 faces = sorted({
                     self._format_number(option.get("face_value")) for option in candidates
@@ -2993,15 +3057,23 @@ class V2Store(AppStore):
             if slots.get("meal_period"):
                 complete = complete and bool(relevant_options) and all(item.get("meal_periods") for item in relevant_options)
             if effective_intent == "availability":
-                named_subject = re.sub(
-                    r"^(?:请问)?(?:有没有|有无)\s*|\s*(?:有吗|有没有|有么|有嘛)[？?]?$",
-                    "", text,
-                ).strip(" ，,。.!！?？~～")
-                reply = (
-                    f"当前商品没有“{named_subject or subject}”这一规格。"
-                    f"您好，本店目前没有“{named_subject or subject}”这一有货规格，"
-                    "暂时无法通过当前商品购买，您可以到店咨询。"
-                )
+                # The original sentence may also contain a branch and words
+                # such as “还有吗”.  It is not a SKU name.  Report only the
+                # structured conditions that failed to match.
+                named_option_question = bool(re.search(
+                    r"套餐|自助|代金券|优惠券|抵扣券|套餐券", text,
+                )) and not bool(re.search(
+                    r"门店|总店|旗舰店|分店|[\u4e00-\u9fffA-Za-z0-9]{2,24}店", text,
+                ))
+                if named_option_question:
+                    named_subject = re.sub(
+                        r"^(?:请问)?(?:有没有|有无)\s*|"
+                        r"\s*(?:还有没有|还有吗|还有么|还有嘛|有吗|有没有|有么|有嘛)[？?]?$",
+                        "", text,
+                    ).strip(" ，,。.!！?？~～")
+                    reply = f"当前商品没有“{named_subject or subject}”这一规格。"
+                else:
+                    reply = f"当前商品没有符合“{subject}”的商品选项。"
             elif complete:
                 reply = f"当前商品没有符合“{subject}”的商品选项。"
             elif effective_intent == "availability":
@@ -4120,8 +4192,19 @@ class V2Store(AppStore):
 
     def amount_inquiry_plan_reply(self, product: Dict, message: str) -> Optional[Dict]:
         """Plan an amount inquiry using one in-stock denomination and explicit stacking."""
-        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*[?？。!！]?\s*", message)
+        text = str(message or "").strip()
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*[?？。!！]?\s*", text)
         bare = bool(match)
+        discount_total = False
+        if not match:
+            discount_match = re.fullmatch(
+                r"\s*(?:消费|吃|用餐)?\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+                r"(?:优惠完|优惠后|打折后)[^。！？]{0,6}(?:多少|多少钱)\s*[?？。!！]?\s*",
+                text,
+            )
+            if discount_match:
+                match = discount_match
+                discount_total = True
         if not match and re.search(r"有吗|有没有|有无|有么|有嘛|有货|没有|还有|有.*[吗么嘛？?]", message):
             if re.search(r"单张|一张|1\s*张|\d\s*(?:人|位|份|折|路|号|点)", message):
                 return None
@@ -4140,22 +4223,30 @@ class V2Store(AppStore):
         day = self._requested_day_type(message, default_today=True)
         options = self._filter_options_for_day(options, day)
         if bare:
-            exact = [
+            exact_sale_prices = [
                 option for option in self.extract_sale_options(product)
                 if option.get("option_type") == "voucher"
-                and self._option_total_value(option) == self._format_number(target)
                 and option.get("sale_price")
+                and int(Decimal(str(option.get("sale_price")))) == int(target)
             ]
-            exact = self._filter_options_for_day(exact, day)
-            if exact:
-                option = max(
-                    exact,
-                    key=lambda value: (bool(value.get("availability_explicit")), -exact.index(value)),
-                )
+            exact_sale_prices = self._filter_options_for_day(exact_sale_prices, day)
+            if exact_sale_prices:
                 return {
-                    "reply": self._atomic_voucher_option_text(option) + "。",
+                    "reply": "\n".join(
+                        self._atomic_voucher_option_text(option) + "。"
+                        for option in exact_sale_prices
+                    ),
                     "kind": "sku_price", "decision": "allow",
-                    "source": "当前精确面额SKU、售价与发券组成",
+                    "source": "当前SKU售价按整数部分匹配",
+                }
+        if discount_total:
+            plan = self.consumption_plan_reply(
+                product, target, available_options=options, include_final_cost=True,
+            )
+            if plan:
+                return {
+                    "reply": plan, "kind": "consumption_plan", "decision": "allow",
+                    "source": "优惠后金额问法按当前SKU生成不超额凑单方案",
                 }
         if not bare and any(self._option_total_value(option) == self._format_number(target) for option in options):
             return None  # Keep the existing atomic answer for an actual matching SKU.
@@ -4212,6 +4303,15 @@ class V2Store(AppStore):
         if not candidates:
             if not bare:
                 return None
+            if options and not any(rejected[key] for key in ("inventory", "stack", "value_limit")):
+                plan = self.consumption_plan_reply(
+                    product, target, available_options=options, include_final_cost=False,
+                )
+                if plan:
+                    return {
+                        "reply": plan, "kind": "consumption_plan", "decision": "allow",
+                        "source": "裸数字未匹配SKU售价，按消费金额生成不超额凑单方案",
+                    }
             if rejected["inventory"]:
                 reason = f"当前可售库存不足，无法组成抵扣{amount}元的方案。"
             elif rejected["stack"]:
@@ -4235,7 +4335,7 @@ class V2Store(AppStore):
 
     def consumption_plan_reply(
         self, product: Dict, target_value: object, missing_denomination: bool = False,
-        available_options: Optional[List[Dict]] = None,
+        available_options: Optional[List[Dict]] = None, include_final_cost: bool = False,
     ) -> str:
         """Recommend the closest real coupon plan not exceeding consumption."""
         try:
@@ -4250,6 +4350,8 @@ class V2Store(AppStore):
         )
         exact = []
         for option in options:
+            if not self._is_sellable_option(option):
+                continue
             try:
                 face = Decimal(str(option.get("face_value") or "0"))
                 price = Decimal(str(option.get("sale_price") or "0"))
@@ -4261,11 +4363,18 @@ class V2Store(AppStore):
             price, option = min(exact, key=lambda value: value[0])
             face = Decimal(str(option.get("face_value") or "0"))
             contents = self._purchase_contents_label(option, 1)
-            return (
+            reply = (
                 f"{self._format_number(target)}元消费的话，可以购买"
                 f"{contents}，售价{self._format_number(price)}元，"
                 f"可抵扣{self._format_number(face)}元。"
             )
+            if include_final_cost:
+                savings = target - price
+                reply += (
+                    f"合计实际支出{self._format_number(price)}元，"
+                    f"共优惠{self._format_number(savings)}元。"
+                )
+            return reply
 
         candidates = []
         for option in options:
@@ -4326,6 +4435,13 @@ class V2Store(AppStore):
                     paragraphs.append(f"当前同面额代金券每次最多使用{coupon_count}张。")
                 else:
                     paragraphs.append("当前资料仅能确认以上使用方式，更多张能否同时使用暂未明确。")
+        if include_final_cost:
+            actual_total = total_price + remainder
+            savings = target - actual_total
+            paragraphs.append(
+                f"合计实际支出{self._format_number(actual_total)}元，"
+                f"共优惠{self._format_number(savings)}元。"
+            )
         return "\n\n".join(paragraphs)
 
     def _calculated_denomination_reply(self, product: Dict, requested_value: object) -> str:
@@ -5881,6 +5997,8 @@ class V2Store(AppStore):
         matched = []
         for sku in skus:
             option = by_key.get(sku["sku_key"], {})
+            if not slots.get("audience_types") and (sku.get("audience_types") or []):
+                continue
             if requested_amount:
                 face = self._format_number(option.get("face_value"))
                 name_has_amount = bool(re.search(
@@ -6173,6 +6291,21 @@ class V2Store(AppStore):
             context.get("pending_store_candidates") or context.get("matches") or []
         )
 
+        if context.get("status") in {"unavailable", "unconfigured", "area_fallback"} and re.fullmatch(
+            r"(?:这家(?:店)?|这个店|该店|那里|刚才那家|那家店)?"
+            r"(?:可以|能|可不可以|能不能)?(?:买|购买|拍|下单|用|使用)"
+            r"(?:吗|嘛|么|不|否)?",
+            compact,
+        ):
+            query = str(context.get("pending_store_query") or context.get("query") or "该门店").strip()
+            return {
+                "reply": f"目前尚未确认“{query}”属于可用门店，暂不建议按该门店需求购买。",
+                "source": "上一轮门店查询尚未确认",
+                "decision": "deny", "kind": "stores",
+                "store_matches": [], "store_query": query,
+                "store_status": str(context.get("status") or "unavailable"),
+            }
+
         # A short area answer such as “武汉的” narrows the stores returned by
         # the immediately preceding query. Do not discard that candidate set and
         # start a fresh literal search for the meaningless suffix “的”.
@@ -6360,6 +6493,18 @@ class V2Store(AppStore):
         )
         if clarification:
             return clarification
+        if result.get("status") == "area_fallback":
+            matches = list(result.get("matches") or [])
+            matrix = self._store_sku_matrix(item_id, matches, scope)
+            return {
+                "reply": self.format_store_area_fallback(
+                    result, resolved_query, message,
+                ),
+                "source": "具体门店未匹配，返回所提市区的全部可用门店及规格",
+                "decision": "allow", "kind": "stores_sku_recommendation",
+                "store_matches": matches, "store_query": resolved_query,
+                "store_status": "area_fallback", "store_sku_matrix": matrix,
+            }
         if result.get("status") != "available":
             return {
                 "reply": self.format_store_unavailable(
@@ -6645,6 +6790,10 @@ class V2Store(AppStore):
         key = cls._store_fuzzy_key(value)
         for word in sorted(STORE_QUERY_NEUTRAL_WORDS, key=len, reverse=True):
             key = key.replace(cls._store_fuzzy_key(word), "")
+        # Some earlier cleanup paths remove “有吗” from “还有吗” first.  The
+        # remaining sentence-final “还” is conversational filler, never part of
+        # the grounded branch name.
+        key = re.sub(r"还$", "", key)
         return key.strip()
 
     @classmethod
@@ -7052,6 +7201,8 @@ class V2Store(AppStore):
             "city": {
                 cls._admin_key(value) for value in KNOWN_CITY_NAMES
             } | {
+                cls._admin_key(value) for value in KNOWN_SUBCITY_TO_CITY
+            } | {
                 cls._admin_key(row.get("city")) for row in rows if row.get("city")
             },
             "district": {
@@ -7099,6 +7250,7 @@ class V2Store(AppStore):
 
         province = last_hit("province")
         city = last_hit("city")
+        city = KNOWN_SUBCITY_TO_CITY.get(city, city)
         district = last_hit("district")
         chars = list(query_key)
         for start, end in removable:
@@ -7282,6 +7434,11 @@ class V2Store(AppStore):
             rows = [row for row in rows if self._admin_key(row.get("city")) == city_scope]
         if district_scope:
             rows = [row for row in rows if self._admin_key(row.get("district")) == district_scope]
+        # Keep the buyer's grounded city/district scope before applying any
+        # brand or branch filters. If the concrete branch cannot be found we
+        # can still offer every configured branch in that exact area without
+        # turning the failed branch lookup into a false availability claim.
+        area_rows = list(rows)
         if entities["brand"]:
             rows = [
                 row for row in rows
@@ -7413,6 +7570,45 @@ class V2Store(AppStore):
                 "candidate_count": len(matches),
             }
         if not matches:
+            fallback_area = district_scope or city_scope
+            if fallback_area and search_term and area_rows:
+                fallback_matches = []
+                fallback_seen = set()
+                for item in sorted(
+                    area_rows,
+                    key=lambda value: (
+                        value.get("province") or "", value.get("city") or "",
+                        value.get("district") or "",
+                        value.get("branch") or value.get("brand") or "",
+                    ),
+                ):
+                    key = self._physical_store_key(item)
+                    if key in fallback_seen:
+                        continue
+                    fallback_seen.add(key)
+                    enriched = dict(item)
+                    enriched["score"] = 1.0
+                    enriched["match_score"] = 100
+                    enriched["match_quality"] = "area_fallback"
+                    enriched["match_evidence"] = [{
+                        "type": "district" if district_scope else "city",
+                        "value": fallback_area,
+                        "score": 100,
+                    }]
+                    enriched["unresolved_terms"] = []
+                    fallback_matches.append(enriched)
+                if fallback_matches:
+                    area_query = "".join(filter(None, (
+                        city_scope if district_scope else "", fallback_area,
+                    )))
+                    return {
+                        "status": "area_fallback", "matches": fallback_matches,
+                        "province": province_scope, "city": city_scope,
+                        "district": district_scope, "search_term": search_term,
+                        "resolved_query": output_query, "specific_query": scoped_query,
+                        "fallback_area_query": area_query or fallback_area,
+                        "sku_key": sku_key, "mode": mode,
+                    }
             return {
                 "status": "unavailable", "matches": [], "province": province_scope,
                 "city": city_scope, "district": district_scope, "search_term": search_term,
@@ -7523,11 +7719,26 @@ class V2Store(AppStore):
         return f"可以用，根据“{query_value}”查询到可用门店：{'、'.join(dict.fromkeys(displays))}。"
 
     @classmethod
+    def format_store_area_fallback(cls, result: Dict, query: str, message: str = "") -> str:
+        """List area alternatives while making clear the requested branch was not verified."""
+        area = str(result.get("fallback_area_query") or result.get("district")
+                   or result.get("city") or "该地区").strip()
+        matches = list(result.get("matches") or [])
+        listing = cls.format_store_matches(matches, area, message)
+        marker = f"可以用，根据“{area}”查询到可用门店："
+        if listing.startswith(marker):
+            listing = f"以下为{area}的所有可用门店：" + listing[len(marker):]
+        value = str(query or "该门店").strip(" \t\r\n，,。！？!?~～") or "该门店"
+        return f"根据“{value}”未查询到可用门店。\n{listing}"
+
+    @classmethod
     def format_store_unavailable(cls, query: str, area_only: bool = False) -> str:
         value = str(query or "该关键词").strip(" \t\r\n，,。！？!?~～") or "该关键词"
+        if area_only:
+            return f"根据“{value}”未查询到可用门店。当前商品在该地区暂无已配置的可用门店。"
         return (
             f"根据“{value}”未查询到可用门店。\n"
-            "该门店不可用，或请更换关键词查询。"
+            "请补充所在城市或区县，我为您查询该地区的所有可用门店。"
         )
 
     @classmethod
@@ -7580,7 +7791,7 @@ class V2Store(AppStore):
             compact_message,
         ):
             return True
-        if re.fullmatch(r"\d+(?:\.\d+)?(?:元)?", query_key):
+        if re.fullmatch(r"\d+(?:\.\d+)?(?:元)?", raw_query):
             return False
         if re.search(
             r"多重|重量|几斤|多少斤|多少克|口味|味道|辣不辣|有什么菜|"
@@ -7750,7 +7961,12 @@ class V2Store(AppStore):
             r"(?:能|可以)?(?:使用|用|核销)",
             text,
         ))
-        if not (redemption_now or instant_after_buy):
+        colloquial_now = bool(re.fullmatch(
+            r"(?:现在|当前|这会儿|此刻)(?:团|囤|买|拍|购买|下单)?"
+            r"(?:可以|能|行)(?:吗|嘛|么|不)?[？?。！!]*",
+            re.sub(r"\s+", "", text),
+        ))
+        if not (redemption_now or instant_after_buy or colloquial_now):
             return None
 
         knowledge = "\n".join((str(product.get("raw_text") or ""), str(product.get("ai_summary") or "")))
@@ -7846,11 +8062,8 @@ class V2Store(AppStore):
             }
         if not current_matches:
             return {
-                "reply": (
-                    "当前商品资料暂未明确具体使用时段，暂时无法准确确认现在是否可用。"
-                    "请告诉我想查询工作日、周末、午市还是晚市，我再按商品资料为您核对。"
-                ),
-                "source": "缺少可核验的当前可用SKU",
+                "reply": "门店营业时段可用就可以了。",
+                "source": "当前商品未配置额外的实时使用时段限制",
                 "decision": "allow", "kind": "time",
             }
 
@@ -7864,13 +8077,9 @@ class V2Store(AppStore):
                 "decision": "allow", "kind": "time_clarify",
             }
 
-        names = "、".join(dict.fromkeys(str(item.get("name") or "当前规格") for item in current_matches))
         return {
-            "reply": (
-                f"{issuance}今天有适用的有货规格：{names}。"
-                f"当前资料未配置精确营业时段，是否能在此刻核销还需以适用门店营业时间和商品不可用日期为准。"
-            ),
-            "source": "当前商品现有有货SKU、日期条件与发券规则",
+            "reply": "门店营业时段可用就可以了。",
+            "source": "当前商品当日有可用规格且未配置额外实时限制",
             "decision": "allow", "kind": "time",
         }
 
@@ -8027,6 +8236,14 @@ class V2Store(AppStore):
                 "store_matches": result["matches"], "store_query": query,
                 "store_status": "available",
             }
+        if result.get("status") == "area_fallback":
+            return {
+                "reply": self.format_store_area_fallback(result, query, text),
+                "source": "否定追问重新核验后返回所提市区的全部可用门店",
+                "decision": "allow", "kind": "stores",
+                "store_matches": list(result.get("matches") or []),
+                "store_query": query, "store_status": "area_fallback",
+            }
         if result.get("status") == "unavailable":
             return {
                 "reply": prefix + self.format_store_unavailable(
@@ -8102,7 +8319,16 @@ class V2Store(AppStore):
         matched_group = next((group for group in alias_groups if any(alias in text for alias in group[1])), None)
         subject = matched_group[0] if matched_group else ""
         aliases = matched_group[1] if matched_group else ()
-        if not subject or not re.search(r"可以|能|可用|使用|支持|不可以|不能", str(message or "")):
+        asks_coverage = bool(
+            re.search(r"可以|能|可用|使用|支持|不可以|不能|包括|包含|抵扣", text)
+        ) or any(
+            re.fullmatch(
+                rf"{re.escape(alias)}(?:呢|吗|嘛|么)?[？?。！!]*",
+                text.strip(),
+            )
+            for alias in aliases
+        )
+        if not subject or not asks_coverage:
             return None
         message_key = normalize_text(message)
         known_areas = {
@@ -8246,7 +8472,9 @@ class V2Store(AppStore):
             r"门店|店铺|总店|旗舰店|分店|商场|商圈|购物中心|广场|天虹|万达|万象城|万象汇|"
             r"壹方城|壹方天地|万科里|天街|银泰|吾悦|大悦城|来福士|"
             r"太古里|印象城|奥特莱斯|IFS|MALL|"
-            r"[\u4e00-\u9fffA-Za-z0-9]{2,24}店(?=多少|多钱|价格|售价|几元|几块|[？?]|$)",
+            r"[\u4e00-\u9fffA-Za-z0-9]{2,24}店(?="
+            r"还有吗|还有么|还有嘛|还有没有|有货吗|有没有|有吗|"
+            r"能用吗|可以用吗|多少|多钱|价格|售价|几元|几块|[？?]|$)",
             text,
             re.I,
         )
@@ -8336,12 +8564,29 @@ class V2Store(AppStore):
                 r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?",
                 text,
             ):
-                sku_question_match = re.search(
-                    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元)?"
-                    r"(?!\s*(?:年|月|日|号|点|个|人|位|张|桌|份))"
+                numeric_candidates = list(re.finditer(
+                    r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])\s*(?:元)?"
+                    r"(?!\s*(?:年|月|日|号|点|个|人|位|张|桌|份|门店|分店|店))"
                     r"(?=[^。！？]{0,12}(?:可以|能|可)(?:使用|用))",
                     text,
-                )
+                ))
+                # Numbers are valid parts of many branch names (33小镇、壹方城
+                # 3号店). They are not voucher amounts unless the buyer writes
+                # an explicit currency/coupon marker. Skip such grounded branch
+                # numbers and keep looking for a separate amount in the sentence.
+                grounded_store_numbers = set()
+                for match_row in (store_probe or {}).get("matches") or []:
+                    for field in ("branch", "address"):
+                        grounded_store_numbers.update(re.findall(
+                            r"\d+(?:\.\d+)?", str(match_row.get(field) or "")
+                        ))
+                sku_question_match = next((
+                    candidate for candidate in numeric_candidates
+                    if not (
+                        candidate.group(1) in grounded_store_numbers
+                        and not re.search(r"元|代金券|券", candidate.group(0))
+                    )
+                ), None)
             sku_is_store_applicability = bool(
                 multi_store_scope.get("stores_differ")
                 and not re.search(r"有(?:没有|吗|么)|卖不卖|什么规格|哪些规格", text)
@@ -8349,6 +8594,7 @@ class V2Store(AppStore):
             if (
                 sku_question_match and not value_match and not purchase_reply
                 and not sku_is_store_applicability
+                and (store_probe or {}).get("status") != "area_fallback"
             ):
                 requested_value = self._format_number(
                     sku_question_match.group(1) if sku_question_match.lastindex
@@ -8370,16 +8616,36 @@ class V2Store(AppStore):
             if date_child and date_match:
                 add_task("date", "使用日期", date_match, date_child)
 
+            current_time_match = re.search(r"现在|当前|此刻|这会儿", text)
+            current_time_child = (
+                self.current_use_reply(item_id, product, text)
+                if current_time_match else None
+            )
+            if current_time_child:
+                add_task(
+                    "current_time", "使用时间", current_time_match,
+                    current_time_child,
+                )
+
             condition_match = re.search(
-                r"周末|工作日|平日|节假日|早餐|中午|午餐|晚餐|晚市|"
+                r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
+                r"今天|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市|"
                 r"\d+\s*(?:人|位)|[一二两三四五六七八九十]+\s*(?:个)?(?:人|位)",
                 text,
             )
             conditional_child = (
                 self.conditional_sale_reply(product, text, {}) if condition_match else None
             )
-            if conditional_child:
-                add_task("conditions", "使用条件", condition_match, conditional_child)
+            condition_is_price = bool(re.search(
+                r"多少钱|多钱|价格|售价|几元|几块", text,
+            ))
+            if conditional_child and (not date_child or condition_is_price):
+                add_task(
+                    "conditions",
+                    "商品价格" if condition_is_price else "使用条件",
+                    condition_match,
+                    conditional_child,
+                )
             elif not date_child:
                 day_child = self.day_availability_reply(product, text)
                 if day_child and condition_match:
@@ -8418,8 +8684,17 @@ class V2Store(AppStore):
                 for key in ("selected_sku_key", "selected_sku_name"):
                     if selected_context.get(key):
                         child_store_context[key] = selected_context[key]
+            # The selected SKU is carried as structured context.  Do not prefix
+            # its name to the synthetic store question: words such as “全天双人”
+            # would be parsed a second time and could inject today's day type,
+            # producing a contradictory condition reply instead of a store result.
+            if sku_text and not child_store_context.get("selected_sku_key"):
+                explicit_skus = self.match_message_skus(item_id, sku_text, product)
+                if len(explicit_skus) == 1:
+                    child_store_context["selected_sku_key"] = explicit_skus[0]["sku_key"]
+                    child_store_context["selected_sku_name"] = explicit_skus[0].get("sku_name", "")
             store_child_cache = self.resolve_deterministic(
-                item_id, f"{sku_text}{store_query_value}可以用吗", actual_paid_amount,
+                item_id, f"{store_query_value}可以用吗", actual_paid_amount,
                 child_store_context or None, order_context, _allow_multi=False,
             )
 
@@ -8457,7 +8732,7 @@ class V2Store(AppStore):
                 reply = self.usage_restrictions_reply(product)
             elif kind in {"purchase", "purchase_timing"}:
                 reply = str(payload or "")
-            elif kind in {"date", "day", "conditions"}:
+            elif kind in {"date", "day", "conditions", "current_time"}:
                 child = dict(payload or {})
                 reply = str(child.get("reply") or "").strip()
             elif kind == "price":
@@ -8480,7 +8755,7 @@ class V2Store(AppStore):
             kind for _, kind, _, _ in ordered_tasks
         } and {
             kind for _, kind, _, _ in ordered_tasks
-        }.issubset({"store", "date", "day", "conditions"})
+        }.issubset({"store", "date", "day", "conditions", "current_time"})
         result = {
             "reply": "\n\n".join(
                 reply if compact_store_condition else f"{index}. {label}：{reply}"
@@ -9898,6 +10173,20 @@ class V2Store(AppStore):
                     "source": "规格门店资料均未配置",
                     "decision": "review", "kind": "stores",
                 }
+            if store_result.get("status") == "area_fallback":
+                return {
+                    "reply": self.format_store_area_fallback(
+                        store_result, query, message,
+                    ),
+                    "source": "具体门店未匹配，返回所提市区的全部可用门店",
+                    "decision": "allow", "kind": "stores",
+                    "store_matches": list(store_result.get("matches") or []),
+                    "store_query": query, "store_status": "area_fallback",
+                    "query_context_update": ({
+                        "selected_sku_key": selected_sku["sku_key"],
+                        "selected_sku_name": selected_sku["sku_name"],
+                    } if selected_sku else {}),
+                }
             if store_result["status"] == "available":
                 prefix = f"{self._sku_public_label(selected_sku)}：" if selected_sku else ""
                 # When store applicability differs and the buyer did not name a
@@ -10204,7 +10493,8 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "可以用吗", "可以吗", "能用吗", "可用吗", "支持吗", "行吗",
         "可以用", "可以", "能用", "可用", "支持", "适用",
         "适用吗", "能不能用", "可以使用吗", "是否可用", "哪些门店", "哪个门店", "门店",
-        "有没有", "没有", "有吗", "查一下", "帮我查", "请问", "附近", "吗", "嘛", "么", "呀", "呢", "吧", "？", "?",
+        "还有没有", "还有吗", "还有么", "还有嘛", "有没有", "没有", "有吗",
+        "查一下", "帮我查", "请问", "附近", "吗", "嘛", "么", "呀", "呢", "吧", "？", "?",
         "适用门店问题", "门店问题", "适用问题", "相关问题", "问题", "查询", "咨询",
         "地址在哪里", "地址", "位置", "在哪里", "在哪儿", "在哪", "怎么走",
         "联系电话", "联系方式", "电话", "号码", "营业时间", "几点开门", "几点关门",
@@ -10237,6 +10527,15 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         }
         for token in sorted(product_latin_tokens, key=len, reverse=True):
             text = re.sub(re.escape(token), " ", text, flags=re.I)
+        # Category words from the current product title are not branch names.
+        # Removing only grounded categories keeps queries such as
+        # “石家庄聚宝源涮肉东尚店” focused on 石家庄 + 东尚店.
+        for category in (
+            "椰子鸡", "涮肉", "羊肉火锅", "火锅", "活鱼烤鱼", "烤鱼",
+            "自助餐", "自助", "餐饮", "美食",
+        ):
+            if category in product_text:
+                text = text.replace(category, " ")
     # The deterministic product parser may also know a Chinese merchant brand.
     # Remove that exact, product-grounded literal only; never guess arbitrary
     # Chinese words as brands because they may be part of a real mall/branch.
@@ -10256,7 +10555,8 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         " ", text,
     )
     text = re.sub(
-        r"周末|工作日|平日|节假日|法定假日|今天|明天|中午|午餐|晚上|晚餐|"
+        r"本周末|周末|工作日|平日|节假日|法定假日|今天|明天|后天|"
+        r"早餐|中午|午餐|晚上|晚餐|"
         r"成人|大人|儿童|小孩|学生|老人|女士|"
         r"代金券|现金券|抵扣券|套餐券|团购券|电子券|美团券|卡券|券",
         " ", text,

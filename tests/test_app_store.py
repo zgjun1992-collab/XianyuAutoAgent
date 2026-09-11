@@ -240,6 +240,14 @@ class AppStoreTests(unittest.TestCase):
         api = XianyuApis(interactive=False)
         self.assertFalse(api.interactive)
 
+    def test_discounted_total_question_is_not_treated_as_bargaining(self):
+        decision = PolicyEngine(DEFAULT_POLICIES).evaluate("273优惠完多少", "正常凑单答复")
+        self.assertEqual("allow", decision.action)
+
+    def test_real_bargaining_still_uses_price_fallback(self):
+        decision = PolicyEngine(DEFAULT_POLICIES).evaluate("还能再优惠一点吗", "")
+        self.assertEqual("replace", decision.action)
+
 
 if __name__ == "__main__":
     unittest.main()

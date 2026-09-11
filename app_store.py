@@ -187,6 +187,13 @@ class PolicyEngine:
             draft, self.policies.get("forbidden_phrases")
         )
         risk_source = re.sub(r"优惠券|代金券|优惠规则|优惠活动|优惠叠加", "", user_message)
+        informational_discount_question = bool(re.search(
+            r"(?:\d+(?:\.\d+)?\s*(?:元|块)?\s*)?"
+            r"(?:优惠完|优惠后|打折后)[^。！？]{0,8}(?:多少|多少钱)|"
+            r"(?:实际|最后|合计|总共)[^。！？]{0,8}(?:花|付|支付)[^。！？]{0,4}多少|"
+            r"(?:能|可以)?省多少",
+            user_message,
+        ))
         refund_terms = ("退款", "退货", "退钱", "退一下", "申请退")
         refund_mentioned = any(word in risk_source for word in refund_terms)
         refund_review_patterns = (
@@ -200,6 +207,7 @@ class PolicyEngine:
         risk_hits = [
             p for p in self.policies["risk_keywords"]
             if p in risk_source and p not in {"退款", "退货"}
+            and not (p == "优惠" and informational_discount_question)
         ]
         if refund_needs_review:
             risk_hits.insert(0, "需要核验的退款事项")

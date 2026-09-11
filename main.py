@@ -111,6 +111,8 @@ class XianyuLive:
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
+        self.cookie_revision = 0
+        self.last_token_error = ""
         
         # 人工接管相关配置
         self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
@@ -448,22 +450,50 @@ class XianyuLive:
         """刷新token"""
         try:
             logger.info("开始刷新token...")
-            
-            # 获取新token（如果Cookie失效，get_token会直接退出程序）
-            token_result = self.xianyu.get_token(self.device_id)
+
+            # requests 是同步库，绝不能在 WebSocket event loop 中直接调用。
+            # 否则网络异常会让状态永久停在 starting，连 stop/reconnect 都无法执行。
+            cookie_revision = getattr(self, "cookie_revision", 0)
+            token_result = await asyncio.wait_for(
+                asyncio.to_thread(self.xianyu.get_token, self.device_id),
+                timeout=45,
+            )
+            if cookie_revision != getattr(self, "cookie_revision", 0):
+                logger.info("Cookie 已更新，丢弃旧 Cookie 获取到的 Token")
+                return None
             if 'data' in token_result and 'accessToken' in token_result['data']:
                 new_token = token_result['data']['accessToken']
                 self.current_token = new_token
                 self.last_token_refresh_time = time.time()
+                self.last_token_error = ""
                 logger.info("Token刷新成功")
                 return new_token
             else:
                 logger.error(f"Token刷新失败: {token_result}")
+                self.last_token_error = "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
                 return None
                 
         except Exception as e:
             logger.error(f"Token刷新异常: {str(e)}")
+            self.last_token_error = str(e) or "闲鱼消息Token获取失败"
             return None
+
+    def update_cookie(self, cookie_text):
+        """Hot-swap credentials and reconnect without keeping a stale startup."""
+        cookie_text = str(cookie_text or "").strip()
+        if not cookie_text or cookie_text == getattr(self, "cookies_str", ""):
+            return False
+        self.cookies_str = cookie_text
+        self.cookies = trans_cookies(cookie_text)
+        self.xianyu.session.cookies.clear()
+        self.xianyu.session.cookies.update(self.cookies)
+        self.cookie_revision = getattr(self, "cookie_revision", 0) + 1
+        self.current_token = None
+        self.last_token_refresh_time = 0
+        self.connection_restart_flag = True
+        if self.loop and self.ws:
+            asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
+        return True
 
     async def token_refresh_loop(self):
         """Token刷新循环"""
@@ -654,7 +684,10 @@ class XianyuLive:
         
         if not self.current_token:
             logger.error("无法获取有效token，初始化失败")
-            raise Exception("Token获取失败")
+            raise RuntimeError(
+                self.last_token_error
+                or "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
+            )
             
         msg = {
             "lwp": "/reg",
@@ -1073,26 +1106,8 @@ class XianyuLive:
 
     @staticmethod
     def should_suppress_first_reply_for_question(product, message):
-        """Do not stack a product introduction before a concrete buyer answer."""
-        if str((product or {}).get("coupon_type") or "").strip() == "purchase_order":
-            return False
-        text = str(message or "").strip()
-        compact = re.sub(r"[\s，,。.!！?？~～]+", "", text)
-        if compact in {
-            "怎么下单", "如何下单", "购买流程", "怎么买", "如何购买", "拍哪个",
-            "哪里买", "在哪里买", "在哪买", "哪里购买", "在哪购买",
-            "购买入口在哪", "购买入口在哪里", "从哪里下单", "在哪下单",
-        }:
-            return True
-        has_store_entity = bool(re.search(
-            r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|商圈|商场|广场|"
-            r"购物中心|门店|分店|旗舰店|总店|店)", text,
-        ))
-        asks_store_use = bool(re.search(
-            r"(?:可以|能|可不可以|能不能|是否)(?:使用|用)|(?:支持|适用)(?:吗|么|嘛)?",
-            compact,
-        ))
-        return has_store_entity and asks_store_use
+        """The enabled first reply is mandatory for every real first buyer message."""
+        return False
 
     async def send_required_first_reply(
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,

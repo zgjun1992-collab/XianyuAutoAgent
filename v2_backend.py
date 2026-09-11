@@ -118,6 +118,7 @@ class BackendState:
 
     def configure(self, payload):
         with self.lock:
+            previous_cookie = self.runtime["cookie"]
             for key in ("api_key", "cookie", "base_url", "model"):
                 if key in payload and payload[key] is not None:
                     self.runtime[key] = str(payload[key]).strip()
@@ -129,6 +130,18 @@ class BackendState:
             ):
                 if value:
                     os.environ[env_key] = value
+            if (
+                self.live
+                and self.runtime["cookie"]
+                and self.runtime["cookie"] != previous_cookie
+            ):
+                previous = trans_cookies(previous_cookie)
+                current = trans_cookies(self.runtime["cookie"])
+                auth_keys = ("unb", "_m_h5_tk", "_m_h5_tk_enc", "cookie2")
+                if any(previous.get(key) != current.get(key) for key in auth_keys):
+                    self.live.update_cookie(self.runtime["cookie"])
+                    self.service_status = "reconnecting"
+                    self.service_message = "检测到新的闲鱼登录凭据，正在重新连接"
         return self.config_status()
 
     def config_status(self):
@@ -279,6 +292,8 @@ class BackendState:
             raise ValueError("请先保存百炼API Key，才能根据商品文案生成初始知识")
         api = XianyuApis(interactive=False)
         cookies = trans_cookies(self.runtime["cookie"])
+        if not cookies.get("_m_h5_tk"):
+            raise ValueError("闲鱼登录状态已失效，请在内置闲鱼页面重新登录后再同步商品")
         api.session.cookies.update(cookies)
         user_id = cookies.get("unb")
         if not user_id:
