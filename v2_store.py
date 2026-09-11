@@ -70,7 +70,7 @@ STORE_LANDMARK_WORDS = (
     "门店", "店里", "店能", "店可", "商场", "商圈", "广场", "购物中心", "万达", "万象城",
     "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里", "印象城", "奥特莱斯",
     "天虹", "总店", "旗舰店", "分店", "ifs", "mall", "地址", "位置", "在哪", "电话", "号码",
-    "营业", "开门", "打烊", "使用嘛", "用嘛",
+    "营业", "开门", "打烊",
 )
 
 GENERIC_STORE_LANDMARKS = (
@@ -1672,7 +1672,7 @@ class V2Store(AppStore):
             result.append("breakfast")
         if re.search(r"午餐|午市|中午|午间|午饭|中餐", text):
             result.append("lunch")
-        if re.search(r"晚餐|晚市|晚上|夜间|夜宵|晚饭", text):
+        if re.search(r"今晚|晚餐|晚市|晚上|夜间|夜宵|晚饭", text):
             result.append("dinner")
         if re.search(r"下午茶|茶歇|午后茶", text):
             result.append("afternoon_tea")
@@ -1867,7 +1867,7 @@ class V2Store(AppStore):
         people = cls._people_counts(text)
         day_types = cls._day_types(text)
         meal_periods = cls._meal_periods(text)
-        if "今天" in text or "今日" in text:
+        if re.search(r"今天|今日|今晚|今早|今晨|今中午", text):
             day_types = ["weekend" if datetime.now(CHINA_TZ).weekday() >= 5 else "weekday"]
         elif "明天" in text or "明日" in text:
             tomorrow = datetime.now(CHINA_TZ) + timedelta(days=1)
@@ -1890,7 +1890,7 @@ class V2Store(AppStore):
             "meal_period": meal_periods[-1] if meal_periods else "",
             "meal_periods": meal_periods,
             "date_label": (
-                "今天" if re.search(r"今天|今日", text)
+                "今天" if re.search(r"今天|今日|今晚|今早|今晨|今中午", text)
                 else "明天" if re.search(r"明天|明日", text)
                 else f"{target_date.month}月{target_date.day}日" if target_date else ""
             ),
@@ -2003,7 +2003,7 @@ class V2Store(AppStore):
     def _query_date(cls, value: object) -> Optional[datetime]:
         text = str(value or "")
         now = datetime.now(CHINA_TZ)
-        if re.search(r"今天|今日", text):
+        if re.search(r"今天|今日|今晚|今早|今晨|今中午", text):
             return now
         if re.search(r"明天|明日", text):
             return now + timedelta(days=1)
@@ -2095,6 +2095,10 @@ class V2Store(AppStore):
         target = self._query_date(text)
         holiday_name = next((name for name in ("中秋", "国庆", "春节", "元旦", "劳动节") if name in text), "")
         if not use_intent or (not target and not holiday_name):
+            return None
+        # A concrete meal period is more specific than a date-only question.
+        # Let the condition resolver evaluate both dimensions together.
+        if any(period != "any" for period in self._meal_periods(text)):
             return None
         knowledge = self._product_rule_knowledge(product)
         holiday_unavailable = False
@@ -2725,6 +2729,23 @@ class V2Store(AppStore):
             ):
                 continue
             matched.append(option)
+
+        if (
+            effective_intent == "availability"
+            and matched
+            and (slots.get("date_label") or slots.get("day_type") or slots.get("meal_period"))
+            and any(
+                (not (option.get("day_types") or []) or "any" in (option.get("day_types") or []))
+                and (not (option.get("meal_periods") or []) or "any" in (option.get("meal_periods") or []))
+                for option in matched
+            )
+        ):
+            return {
+                "reply": "门店营业时段可用就可以了。",
+                "source": "当前商品未配置额外日期或餐段限制",
+                "decision": "allow", "kind": "time",
+                "query_context_update": context_update,
+            }
 
         # A condition-specific price overrides a broader “all week/all day”
         # option. Keep the general option only when no specific one exists.
@@ -8454,10 +8475,16 @@ class V2Store(AppStore):
             add_task("purchase_timing", "购买时机", timing_match, timing_reply)
 
         purchase_match = re.search(
-            r"直接(?:拍|买)|(?:可以|能|可不可以|能不能)(?:直接)?(?:拍|买|购买)",
+            r"直接(?:拍|买)|(?:可以|能|可不可以|能不能)(?:直接|直)?(?:拍|买|购买)|"
+            r"(?:现在|当前)(?:就)?(?:拍|买|购买|下单)",
             text,
         )
         purchase_reply = self.direct_coupon_purchase_reply(product, text) if purchase_match else ""
+        if purchase_match and not purchase_reply:
+            purchase_reply = (
+                "可以现在拍下。" if re.search(r"(?:现在|当前)(?:就)?(?:拍|买|购买|下单)", text)
+                else "可以直接拍下。"
+            )
         if purchase_reply:
             add_task("purchase", "购买", purchase_match, purchase_reply)
 
@@ -8526,6 +8553,25 @@ class V2Store(AppStore):
             resolved_store_query = str(
                 (store_probe or {}).get("resolved_query") or store_query
             ).strip()
+            # A long sentence may contain one exact configured branch plus SKU
+            # words that remain after phrase stripping. Prefer that real branch
+            # entity over feeding the whole sentence back into store routing.
+            contained_branches = []
+            for match_row in (store_probe or {}).get("matches") or []:
+                branch = str(match_row.get("branch") or "").strip()
+                branch_key = self._store_fuzzy_key(branch)
+                if branch_key and branch_key in self._store_fuzzy_key(text):
+                    contained_branches.append(branch)
+            contained_branches = list(dict.fromkeys(contained_branches))
+            has_unresolved_store_terms = any(
+                match_row.get("unresolved_terms")
+                for match_row in (store_probe or {}).get("matches") or []
+            )
+            if len(contained_branches) == 1 and (
+                (store_probe or {}).get("status") == "needs_confirmation"
+                or has_unresolved_store_terms
+            ):
+                resolved_store_query = contained_branches[0]
             if self.is_explicit_store_query(text, resolved_store_query, store_probe):
                 explicit_store_skus = self._explicit_store_skus(item_id, text, product)
                 explicit_store_sku_text = (
@@ -8629,10 +8675,21 @@ class V2Store(AppStore):
 
             condition_match = re.search(
                 r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
-                r"今天|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市|"
+                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市|"
                 r"\d+\s*(?:人|位)|[一二两三四五六七八九十]+\s*(?:个)?(?:人|位)",
                 text,
             )
+            explicit_calendar_or_meal = bool(re.search(
+                r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
+                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
+                text,
+            ))
+            # “单人满贯全天” can be the exact SKU name. When the buyer asks to
+            # purchase that SKU at a named store, do not reinterpret “全天” as
+            # a separate today/meal constraint and accidentally inject today's
+            # weekday into the answer.
+            if purchase_reply and not explicit_calendar_or_meal:
+                condition_match = None
             conditional_child = (
                 self.conditional_sale_reply(product, text, {}) if condition_match else None
             )
@@ -8650,6 +8707,21 @@ class V2Store(AppStore):
                 day_child = self.day_availability_reply(product, text)
                 if day_child and condition_match:
                     add_task("day", "使用日期", condition_match, day_child)
+
+        # A purchase-time sentence may also contain a usage-time question but
+        # no location at all, e.g. “我现在拍，今晚能用吗”. Resolve its time
+        # condition here so it can combine with the purchase answer, without
+        # ever manufacturing a store query or asking for a city.
+        if purchase_reply and not has_store_task:
+            condition_match = re.search(
+                r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
+                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
+                text,
+            )
+            if condition_match:
+                conditional_child = self.conditional_sale_reply(product, text, {})
+                if conditional_child:
+                    add_task("conditions", "使用时间", condition_match, conditional_child)
 
         price_match = re.search(
             r"多少钱|多钱|什么价格|价格多少|价钱|售价|什么价|啥价|怎么卖|几元|几块|"
@@ -8688,7 +8760,10 @@ class V2Store(AppStore):
             # its name to the synthetic store question: words such as “全天双人”
             # would be parsed a second time and could inject today's day type,
             # producing a contradictory condition reply instead of a store result.
-            if sku_text and not child_store_context.get("selected_sku_key"):
+            if (
+                sku_text and multi_store_scope.get("stores_differ")
+                and not child_store_context.get("selected_sku_key")
+            ):
                 explicit_skus = self.match_message_skus(item_id, sku_text, product)
                 if len(explicit_skus) == 1:
                     child_store_context["selected_sku_key"] = explicit_skus[0]["sku_key"]

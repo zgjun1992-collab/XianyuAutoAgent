@@ -4370,6 +4370,55 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("可以", allowed["reply"])
         self.assertRegex(blocked["reply"], r"不可以|不能使用|没有符合")
 
+    def test_direct_purchase_with_named_store_does_not_invent_today_condition(self):
+        self.store.save_v2_product(
+            "10001", "作作烧肉单人满贯全天自助",
+            "单人满贯全天自助：208元（仅限工作日）\n双人满贯全天自助：416元（仅限工作日）",
+        )
+        self.store.import_store_text(
+            "【北京市】\n【北京】西单大悦城店", "作作北京门店", ["10001"],
+        )
+        result = self.store.resolve_deterministic(
+            "10001", "您好 可以直拍吧 西单大悦城店 单人满贯全天 😍",
+        )
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertIn("可以直接拍下", result["reply"])
+        self.assertIn("西单大悦城店", result["reply"])
+        self.assertNotIn("没有符合", result["reply"])
+        self.assertNotIn("今天是", result["reply"])
+
+    def test_now_purchase_and_tonight_use_without_store_checks_only_time(self):
+        self.store.save_v2_product(
+            "10001", "全天单人自助", "全天单人自助：88元。",
+        )
+        result = self.store.resolve_deterministic("10001", "我现在拍 今晚能用嘛？")
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertIn("可以现在拍下", result["reply"])
+        self.assertIn("门店营业时段可用就可以了", result["reply"])
+        self.assertNotIn("补充所在城市", result["reply"])
+        self.assertNotIn("未查询到可用门店", result["reply"])
+        self.assertNotIn("store", result["resolved_intents"])
+
+    def test_bare_can_use_question_never_becomes_store_query(self):
+        self.store.save_v2_product(
+            "10001", "全天单人自助", "全天单人自助：88元。",
+        )
+        for message in ("能用吗", "可以用吗", "能用嘛"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertFalse(result and result.get("kind") == "stores")
+                self.assertNotIn("补充所在城市", str((result or {}).get("reply") or ""))
+
+    def test_tonight_obeys_explicit_weekday_and_weekend_labels(self):
+        self.store.save_v2_product(
+            "10001", "日期限制自助",
+            "工作日单人自助：88元（仅限工作日）\n周末单人自助：99元（仅限周末）",
+        )
+        result = self.store.resolve_deterministic("10001", "今晚单人能用吗")
+        self.assertNotEqual("stores", result["kind"])
+        self.assertIn("周末单人自助", result["reply"])
+        self.assertNotIn("工作日单人自助", result["reply"])
+
 
 if __name__ == "__main__":
     unittest.main()
