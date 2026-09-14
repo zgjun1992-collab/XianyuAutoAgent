@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.5",
+  "version": "0.11.6",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -53,8 +53,8 @@
         "to": "docs/阿里云百炼APIKey获取图文教程.pdf"
       },
       {
-        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.5.pdf",
-        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.5.pdf"
+        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.6.pdf",
+        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.6.pdf"
       }
     ],
     "publish": [
@@ -64,7 +64,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.5：新增回复分段耗时诊断，运行记录可查看消息解析、商品核对、规则判断、模型调用、发送及总耗时；不改变现有回复逻辑。"
+      "releaseNotes": "0.11.6：新增 Windows 系统托盘，可查看本地后台 PID 和客服状态，并可启动、停止、重启后台或完全退出；保留回复分段耗时诊断。"
     },
     "win": {
       "target": [

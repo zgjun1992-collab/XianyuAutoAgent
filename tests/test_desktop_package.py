@@ -13,7 +13,7 @@ class DesktopPackageTests(unittest.TestCase):
         resources = package["build"]["extraResources"]
         expected = {
             "docs/阿里云百炼APIKey获取图文教程.pdf",
-            "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.5.pdf",
+            "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.6.pdf",
         }
         packaged = {entry["from"] for entry in resources}
         self.assertTrue(expected.issubset(packaged))
@@ -24,13 +24,13 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_auto_update_channel_is_configured(self):
         package = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.11.5", package["version"])
+        self.assertEqual("0.11.6", package["version"])
         self.assertIn("electron-updater", package["dependencies"])
         self.assertEqual(
             [{"provider": "generic", "url": "https://download.yituan123.com/v3.6"}],
             package["build"]["publish"],
         )
-        self.assertIn("回复分段耗时诊断", package["build"]["releaseInfo"]["releaseNotes"])
+        self.assertIn("Windows 系统托盘", package["build"]["releaseInfo"]["releaseNotes"])
         self.assertIn("esbuild electron/updater-entry.cjs", package["scripts"]["build:updater"])
         self.assertTrue((DESKTOP / "electron" / "updater-entry.cjs").is_file())
         self.assertTrue((DESKTOP / "electron" / "update-policy.cjs").is_file())
