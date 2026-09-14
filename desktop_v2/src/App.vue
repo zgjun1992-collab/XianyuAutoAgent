@@ -14,12 +14,12 @@ const snapshot = reactive({
   products: [], store_lists: [], reviews: [], service: { status: 'stopped', message: '' },
   conversations: [], config: {}, policies: {}
 })
-const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '', order_notice_enabled: true })
+const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
 const licenseDraft = reactive({ server_url: 'https://api.yituan123.com', username: '', password: '' })
 const license = reactive({ active: false, logged_in: false, mode: '', user: null, entitlement: null, error: '', device_id: '', server_url: '' })
 const updater = reactive({ status: 'idle', currentVersion: '', availableVersion: '', progress: 0, releaseNotes: '', error: '', forced: false, checkedAt: '' })
-const policyDraft = reactive({ reply_mode: 'review', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
+const policyDraft = reactive({ reply_mode: 'auto', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
 const imageDraft = reactive({ id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
 const imagePreviews = reactive({})
@@ -129,7 +129,7 @@ function applySnapshot(data) {
   if (!testDraft.item_id && data.products.length) testDraft.item_id = data.products[0].item_id
   if (!policiesLoaded && data.policies) {
     policiesLoaded = true
-    policyDraft.reply_mode = data.policies.reply_mode || 'review'
+    policyDraft.reply_mode = data.policies.reply_mode || 'auto'
     policyDraft.global_system_prompt = data.policies.global_system_prompt || ''
     policyDraft.max_reply_rounds = Number(data.policies.max_reply_rounds || 25)
     policyDraft.conversation_reset_hours = Number(data.policies.conversation_reset_hours || 24)
@@ -137,7 +137,6 @@ function applySnapshot(data) {
     policyDraft.manual_review_notice = data.policies.manual_review_notice || ''
     policyDraft.price_fallback = data.policies.price_fallback || ''
     policyDraft.refund_fallback = data.policies.refund_fallback || ''
-    policyDraft.order_payment_notice_enabled = data.policies.order_payment_notice_enabled !== false
     policyDraft.aftersale_policy_raw = data.policies.aftersale_policy_raw || ''
     policyDraft.aftersale_policy_summary = data.policies.aftersale_policy_summary || ''
     policyDraft.forbidden_phrases_text = (data.policies.forbidden_phrases || []).join('\n')
@@ -183,7 +182,6 @@ function selectProduct(product) {
     custom_policy_enabled: Boolean(product.custom_policy_enabled),
     custom_policy_raw: product.custom_policy_raw || '',
     custom_policy_summary: product.custom_policy_summary || '',
-    order_notice_enabled: product.order_notice_enabled !== false && product.order_notice_enabled !== 0
   })
   const selected = (product.skus || []).find((item) => item.sku_key === selectedStoreSkuKey.value) || (product.skus || [])[0]
   selectStoreSku(selected)
@@ -198,7 +196,7 @@ function openProductKnowledge(product) {
 }
 
 function newProduct() {
-  Object.assign(productDraft, { item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '', order_notice_enabled: true })
+  Object.assign(productDraft, { item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
   selectStoreSku(null)
   resetImageDraft()
   productTab.value = 'knowledge'
@@ -337,8 +335,7 @@ async function saveProduct() {
     coupon_instructions: productDraft.coupon_instructions,
     custom_policy_enabled: productDraft.custom_policy_enabled,
     custom_policy_raw: productDraft.custom_policy_raw,
-    custom_policy_summary: productDraft.custom_policy_summary,
-    order_notice_enabled: productDraft.order_notice_enabled
+    custom_policy_summary: productDraft.custom_policy_summary
   })
   selectProduct(product)
   await refresh()
@@ -455,7 +452,6 @@ async function savePolicies() {
     manual_review_notice: policyDraft.manual_review_notice,
     price_fallback: policyDraft.price_fallback,
     refund_fallback: policyDraft.refund_fallback,
-    order_payment_notice_enabled: policyDraft.order_payment_notice_enabled,
     aftersale_policy_raw: policyDraft.aftersale_policy_raw,
     aftersale_policy_summary: policyDraft.aftersale_policy_summary,
     forbidden_phrases: policyDraft.forbidden_phrases_text.split('\n').map((value) => value.trim()).filter(Boolean)
@@ -473,7 +469,6 @@ async function summarizeDefaultPolicy() {
 
 async function saveAfterSalePolicy() {
   await call('POST', '/policies', {
-    order_payment_notice_enabled: policyDraft.order_payment_notice_enabled,
     aftersale_policy_raw: policyDraft.aftersale_policy_raw,
     aftersale_policy_summary: policyDraft.aftersale_policy_summary
   })
@@ -803,7 +798,6 @@ onBeforeUnmount(() => {
         </div>
         <article class="panel form-panel policy-editor">
           <div class="knowledge-head"><div><span class="number">默</span><div><strong>全店默认发货与退款政策</strong><small>用于退款、有效期、当天使用、自动发货等售后问题</small></div></div><span class="authority">默认生效</span></div>
-          <label class="check-line"><input v-model="policyDraft.order_payment_notice_enabled" type="checkbox" />买家拍下未付款时，自动发送“商品信息＋使用规则＋发货与退换货政策”</label>
           <label>你的原始政策描述<textarea v-model="policyDraft.aftersale_policy_raw" rows="8" placeholder="直接用自然语言填写政策，不需要整理成固定模板。"></textarea><small>原文永久保留，不会被AI覆盖。</small></label>
           <div class="button-row end"><button @click="summarizeDefaultPolicy">✦ 让AI归纳</button></div>
           <label>当前生效的政策摘要<textarea v-model="policyDraft.aftersale_policy_summary" rows="10" placeholder="AI归纳后可继续人工修改；客服按这里回答。"></textarea></label>
@@ -813,7 +807,6 @@ onBeforeUnmount(() => {
         <article class="panel form-panel policy-editor">
           <label>选择商品<select v-model="aftersaleProductId" @change="selectAftersaleProduct(aftersaleProductId)"><option value="">请选择商品</option><option v-for="product in snapshot.products" :key="product.item_id" :value="product.item_id">{{ product.title || product.item_id }}</option></select></label>
           <template v-if="productDraft.item_id">
-            <label class="check-line"><input v-model="productDraft.order_notice_enabled" type="checkbox" />当前商品启用“拍下未付款”自动提醒</label>
             <label class="check-line"><input v-model="productDraft.custom_policy_enabled" type="checkbox" />当前商品使用独立的发货与退款政策</label>
             <template v-if="productDraft.custom_policy_enabled">
               <label>当前商品特殊政策原文<textarea v-model="productDraft.custom_policy_raw" rows="7" placeholder="只填写与默认政策不同或需要特别说明的内容。"></textarea></label>

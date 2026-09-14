@@ -142,7 +142,6 @@ class XianyuLive:
         self._media_notice_times = {}
         self._seen_messages = set()
         self._review_notified_scopes = set()
-        self._order_notice_scopes = set()
         self._buyer_routes = {}
         self._order_routes = {}
         self._store_contexts = {}
@@ -1396,38 +1395,10 @@ class XianyuLive:
                     pause(scope_id, "aftersale_pending")
             self.emit_event("refund_order", message=status, item_id=item_id, order_id=order_id)
             return True
-        if status != "等待买家付款":
+        if status == "等待买家付款":
+            logger.info("买家拍下待付款状态已记录，不发送自动提示")
+        else:
             logger.info(f"订单状态：{status}")
-            return True
-
-        if not (user_id and chat_id and item_id):
-            logger.warning("检测到买家拍下，但订单消息缺少会话、买家或商品ID，未发送付款前提示")
-            return True
-        scope_id = self.scope_key(chat_id, item_id)
-        product_getter = getattr(self.app_store, "get_v2_product", None)
-        product = product_getter(item_id) if product_getter else None
-        if str((product or {}).get("coupon_type") or "").strip() == "purchase_order":
-            logger.info(f"代买单待付款卡片保持静默 (商品: {item_id})")
-            return True
-        if product and product.get("item_status") != "offline" and not bool(product.get("enabled", 1)):
-            logger.info(f"商品 {item_id} 已关闭AI客服，跳过付款前自动提示")
-            return True
-        notice_key = order_id or scope_id
-        if notice_key in self._order_notice_scopes:
-            return True
-        notice_getter = getattr(self.app_store, "order_payment_notice", None)
-        notice = notice_getter(item_id) if notice_getter else (
-            "温馨提示：本商品卡券必须当天购买、当天使用。"
-            "非卡券质量问题的退款需收取5%手续费。付款后会自动发货，介意请勿付款。"
-        )
-        if not str(notice or "").strip():
-            logger.info(f"当前商品已关闭付款前提醒 (商品: {item_id})")
-            return True
-        await self.send_msg(websocket, chat_id, user_id, notice)
-        self._order_notice_scopes.add(notice_key)
-        self.context_manager.add_message_by_chat(scope_id, self.myid, item_id, "assistant", notice)
-        logger.info(f"买家拍下后付款前提示已发送 (商品: {item_id}, 会话: {chat_id})")
-        self.emit_event("order_payment_notice", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
         return True
 
     async def handle_message(self, message_data, websocket, send_ack=True):

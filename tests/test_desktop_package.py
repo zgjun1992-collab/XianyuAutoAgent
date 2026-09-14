@@ -13,7 +13,7 @@ class DesktopPackageTests(unittest.TestCase):
         resources = package["build"]["extraResources"]
         expected = {
             "docs/阿里云百炼APIKey获取图文教程.pdf",
-            "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.3.pdf",
+            "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.4.pdf",
         }
         packaged = {entry["from"] for entry in resources}
         self.assertTrue(expected.issubset(packaged))
@@ -24,13 +24,13 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_auto_update_channel_is_configured(self):
         package = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.11.3", package["version"])
+        self.assertEqual("0.11.4", package["version"])
         self.assertIn("electron-updater", package["dependencies"])
         self.assertEqual(
             [{"provider": "generic", "url": "https://download.yituan123.com/v3.6"}],
             package["build"]["publish"],
         )
-        self.assertIn("引导更新版", package["build"]["releaseInfo"]["releaseNotes"])
+        self.assertIn("回复模式与 V3.5 保持一致", package["build"]["releaseInfo"]["releaseNotes"])
         self.assertIn("esbuild electron/updater-entry.cjs", package["scripts"]["build:updater"])
         self.assertTrue((DESKTOP / "electron" / "updater-entry.cjs").is_file())
         self.assertTrue((DESKTOP / "electron" / "update-policy.cjs").is_file())
@@ -43,6 +43,12 @@ class DesktopPackageTests(unittest.TestCase):
         self.assertLess(installer, blockmap)
         self.assertLess(blockmap, latest)
         self.assertIn('CacheControl = "no-store, max-age=0"', script)
+
+    def test_v36_ui_has_no_waiting_payment_auto_notice_rule(self):
+        source = (DESKTOP / "src" / "App.vue").read_text(encoding="utf-8")
+        self.assertNotIn("order_payment_notice_enabled", source)
+        self.assertNotIn("order_notice_enabled", source)
+        self.assertNotIn("拍下未付款", source)
 
 
 if __name__ == "__main__":

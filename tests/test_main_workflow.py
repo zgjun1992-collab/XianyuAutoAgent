@@ -15,14 +15,6 @@ class _Store:
         self.reply_scopes = []
         self.first_reply_scopes = set()
 
-    @staticmethod
-    def order_payment_notice(item_id):
-        return (
-            f"【商品信息】\n半秋山100元代金券：售价66.8元，发100元券1张\n"
-            "【发货提醒】\n付款后会自动发货。\n"
-            "【退换货政策】\n非卡券质量问题的退款需扣除5%手续费。"
-        )
-
     def update_audit(self, audit_id, status, final_reply=""):
         self.audit_updates.append((audit_id, status, final_reply))
 
@@ -67,7 +59,6 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.app_store = _Store()
         live.context_manager = _Context()
         live.event_callback = None
-        live._order_notice_scopes = set()
         live._buyer_routes = {"buyer-1": ("chat-1", "item-1")}
         live._first_reply_locks = {}
         live.manual_mode_conversations = set()
@@ -143,20 +134,12 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIs(source, await live.refresh_current_listing_status("item-1", source))
 
-    async def test_waiting_payment_uses_known_buyer_route_and_sends_once(self):
+    async def test_waiting_payment_records_state_without_sending_message(self):
         live = self.make_live()
         event = {"1": "buyer-1@goofish", "3": {"redReminder": "等待买家付款"}}
         self.assertTrue(await live.handle_order_reminder(event, object()))
-        live.send_msg.assert_awaited_once()
-        args = live.send_msg.await_args.args
-        self.assertEqual(("chat-1", "buyer-1"), args[1:3])
-        self.assertIn("半秋山100元代金券", args[3])
-        self.assertIn("非卡券质量问题的退款", args[3])
-        self.assertIn("付款后会自动发货", args[3])
+        live.send_msg.assert_not_awaited()
         self.assertEqual("等待买家付款", live._order_routes["seller:chat-1:item-1"]["status"])
-
-        self.assertTrue(await live.handle_order_reminder(event, object()))
-        self.assertEqual(1, live.send_msg.await_count)
 
     async def test_paid_order_status_is_saved_without_sending_payment_notice(self):
         live = self.make_live()
@@ -169,7 +152,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live = self.make_live()
         event = {"1": "buyer-1@goofish", "3": {"reminderContent": "我已拍下，待付款"}}
         self.assertTrue(await live.handle_order_reminder(event, object()))
-        live.send_msg.assert_awaited_once()
+        live.send_msg.assert_not_awaited()
 
     async def test_waiting_payment_card_text_overrides_generic_red_reminder(self):
         live = self.make_live()
@@ -181,7 +164,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         self.assertTrue(await live.handle_order_reminder(event, object()))
-        live.send_msg.assert_awaited_once()
+        live.send_msg.assert_not_awaited()
 
     async def test_purchase_order_waiting_payment_card_stays_silent(self):
         live = self.make_live()

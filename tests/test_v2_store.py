@@ -1551,16 +1551,6 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("华熙五棵松店", followup["reply"])
         self.assertNotIn("请发送具体", followup["reply"])
 
-    def test_order_notice_uses_brand_actual_price_and_effective_policy(self):
-        self.store.save_v2_product(
-            "10001", "半秋山西餐厅60代100", "66.8元购100元代金券（工作日可用）"
-        )
-        notice = self.store.order_payment_notice("10001")
-        self.assertIn("半秋山100元代金券", notice)
-        self.assertIn("售价66.8元", notice)
-        self.assertIn("付款后系统会自动发货", notice)
-        self.assertIn("非卡券质量问题", notice)
-
     def test_refund_order_records_and_calculates_95_percent(self):
         record = self.store.upsert_refund_order({
             "order_id": "ORDER-1", "scope_id": "scope-1", "item_id": "10001",

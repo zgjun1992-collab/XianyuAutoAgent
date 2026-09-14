@@ -4921,53 +4921,6 @@ class V2Store(AppStore):
                 break
         return "；".join(preferred or items[:3])
 
-    def order_payment_notice(self, item_id: str = "") -> str:
-        product = self.get_v2_product(item_id) if item_id else None
-        if not product:
-            return (
-                "【发货提醒】\n付款后系统会自动发货，请确认商品信息和使用规则无误后再付款。\n"
-                "【退换货政策】\n请确认当天需要使用后再购买；非卡券质量问题退款需扣除5%手续费；"
-                "卡券质量问题请申请仅退款并等待人工核实。"
-            )
-        if not product.get("order_notice_enabled", 1):
-            return ""
-        brand = self.extract_brand(product)
-        options = self.extract_product_options(product)
-        product_lines = [self.format_product_option(option, brand) for option in options]
-        if not product_lines:
-            product_lines = [brand + "电子券" if brand else (product.get("title") or "当前商品")]
-        rules = []
-        use_time = self._use_time_text(product)
-        if use_time:
-            rules.append(use_time.rstrip("。") + "。")
-        use_rule = self._use_rule_text(product)
-        if use_rule:
-            rules.append(use_rule.rstrip("。") + "。")
-        policy = self.effective_aftersale_policy(item_id)
-        if not policy:
-            policy = (
-                "请确认当天到店使用后再付款，卡券须当天购买、当天使用。"
-                "未及时使用导致过期不退不补；非卡券质量问题退款需扣除5%手续费；"
-                "卡券质量问题请申请仅退款，转人工在72小时内核实处理。"
-            )
-        policy = policy.replace("【购买与发货】", "")
-        policy = policy.replace("【非卡券质量问题退款】", "非卡券质量问题退款：")
-        policy = policy.replace("【卡券质量问题退款】", "卡券质量问题退款：")
-        policy = policy.replace("【过期与收货】", "过期与收货：")
-        policy = re.sub(r"【([^】]+)】\s*", r"\1：", policy)
-        policy = re.sub(r"付款后(?:系统)?(?:会)?自动发货[，。；;]?", "", policy)
-        policy = re.sub(r"\s*\n\s*", "；", policy).strip("； ")
-        return "\n".join([
-            "【商品信息】",
-            *product_lines,
-            "【使用规则】",
-            *(rules or ["具体使用规则以当前商品知识库为准。"]),
-            "【发货提醒】",
-            "付款后系统会自动发货，请确认商品信息和使用规则无误后再付款。",
-            "【退换货政策】",
-            policy,
-        ])
-
     @classmethod
     def _sku_stack_limits(cls, options: List[Dict]) -> Dict[str, int]:
         limits = {}

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -110,6 +111,21 @@ class AppStoreTests(unittest.TestCase):
         self.store.set_setting("manual_review_notice", "这是人工自定义审核话术")
         reopened = AppStore(self.store.db_path)
         self.assertEqual("这是人工自定义审核话术", reopened.get_policies()["manual_review_notice"])
+
+    def test_v36_reply_mode_defaults_to_auto_and_legacy_review_migrates_once(self):
+        self.assertEqual("auto", self.store.get_policies()["reply_mode"])
+        with self.store._connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key='v36_reply_mode_auto_migrated'")
+            conn.execute(
+                "UPDATE settings SET value=? WHERE key='reply_mode'",
+                (json.dumps("review"),),
+            )
+        migrated = AppStore(self.store.db_path)
+        self.assertEqual("auto", migrated.get_policies()["reply_mode"])
+
+        migrated.set_setting("reply_mode", "review")
+        reopened = AppStore(self.store.db_path)
+        self.assertEqual("review", reopened.get_policies()["reply_mode"])
 
     def test_old_builtin_global_prompt_migrates_but_custom_prompt_is_preserved(self):
         self.store.set_setting("global_system_prompt", LEGACY_GLOBAL_SYSTEM_PROMPT)

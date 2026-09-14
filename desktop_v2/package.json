@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -53,8 +53,8 @@
         "to": "docs/阿里云百炼APIKey获取图文教程.pdf"
       },
       {
-        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.3.pdf",
-        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.3.pdf"
+        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.4.pdf",
+        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.4.pdf"
       }
     ],
     "publish": [
@@ -64,7 +64,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.3 引导更新版：新增启动检查、手动检查、下载进度、失败重试、更新日志和安全重启安装。"
+      "releaseNotes": "0.11.4：回复模式与 V3.5 保持一致；移除买家拍下待付款后的自动消息；保留自动更新、安全重启安装和失败重试。"
     },
     "win": {
       "target": [

@@ -40,7 +40,7 @@ LEGACY_AFTERSALE_POLICY_SUMMARY = (
 
 
 DEFAULT_POLICIES = {
-    "reply_mode": "review",
+    "reply_mode": "auto",
     "global_system_prompt": (
         LEGACY_GLOBAL_SYSTEM_PROMPT
         + "不同平台的卡券不得混用；商品资料未明确允许时，代金券不得与套餐、团购或其他优惠一起使用；"
@@ -52,7 +52,6 @@ DEFAULT_POLICIES = {
     "manual_review_notice": "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。",
     "price_fallback": "您好，当前商品暂不支持议价，实际售价以当前商品资料中的规格价格为准，感谢您的理解。",
     "refund_fallback": "这个退款问题需要人工核实，已经为您记录并转交人工处理，请稍等。",
-    "order_payment_notice_enabled": True,
     "aftersale_policy_raw": (
         "建议在确认适用门店、使用时间和商品规则后再购买，卡券仍需当天购买、当天使用。\n"
         "如果卡券尚未核销且仍在有效期内，因个人原因需要取消，可以按照当前商品规则申请退款。"
@@ -328,6 +327,23 @@ class AppStore:
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
                     (key, json.dumps(value, ensure_ascii=False), self._now()),
+                )
+            # V3.6 originally created new profiles in full-review mode, while
+            # V3.5 production profiles use automatic replies for safe answers.
+            # Migrate once so existing V3.6 users get the same reply behavior;
+            # after this marker is written, an explicit user choice is kept.
+            reply_mode_migration = "v36_reply_mode_auto_migrated"
+            migrated = conn.execute(
+                "SELECT 1 FROM settings WHERE key=?", (reply_mode_migration,)
+            ).fetchone()
+            if not migrated:
+                conn.execute(
+                    "UPDATE settings SET value=?,updated_at=? WHERE key=?",
+                    (json.dumps("auto"), self._now(), "reply_mode"),
+                )
+                conn.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES (?,?,?)",
+                    (reply_mode_migration, json.dumps(True), self._now()),
                 )
             # Upgrade only former built-in notices. User-authored notices remain
             # untouched, so installing a new version never overwrites a custom
