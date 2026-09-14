@@ -27,7 +27,7 @@ def main():
 
     grant = sub.add_parser("grant", help="开通或续费")
     grant.add_argument("user_id", type=int)
-    grant.add_argument("plan", choices=["trial", "monthly", "yearly"])
+    grant.add_argument("plan", choices=["trial", "weekly", "monthly", "quarterly", "yearly"])
     grant.add_argument("--days", type=int)
     grant.add_argument("--note", default="")
 

@@ -51,7 +51,7 @@ class UserCreate(BaseModel):
 
 
 class SubscriptionGrant(BaseModel):
-    plan_code: str = Field(pattern="^(trial|monthly|yearly)$")
+    plan_code: str = Field(pattern="^(trial|weekly|monthly|quarterly|yearly)$")
     days: int | None = Field(default=None, ge=1, le=3660)
     note: str = Field(default="", max_length=500)
 

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 
 from cloud_license.store import LicenseError, LicenseStore
 
@@ -30,6 +31,23 @@ class CloudLicenseTests(unittest.TestCase):
         first = self.store.grant_subscription(self.user["id"], "monthly")
         second = self.store.grant_subscription(self.user["id"], "monthly")
         self.assertGreater(second["expires_at"], first["expires_at"])
+
+    def test_sale_plans_have_expected_names_and_durations(self):
+        expected = {
+            "weekly": ("周卡", 7),
+            "monthly": ("月卡", 30),
+            "quarterly": ("季卡", 90),
+            "yearly": ("年卡", 365),
+        }
+        for index, (code, (name, days)) in enumerate(expected.items(), start=1):
+            user = self.store.create_user(
+                f"plan-{index}@example.com", "strong-pass-123", name
+            )
+            entitlement = self.store.grant_subscription(user["id"], code)
+            starts_at = datetime.fromisoformat(entitlement["starts_at"])
+            expires_at = datetime.fromisoformat(entitlement["expires_at"])
+            self.assertEqual(name, entitlement["name"])
+            self.assertEqual(days, (expires_at - starts_at).days)
 
     def test_device_limit_and_admin_revoke(self):
         self.store.grant_subscription(self.user["id"], "monthly")

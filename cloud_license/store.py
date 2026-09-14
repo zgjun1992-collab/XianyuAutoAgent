@@ -167,7 +167,9 @@ class LicenseStore:
                 "INSERT OR IGNORE INTO plans(code,name,duration_days,max_devices,max_xianyu_accounts) VALUES(?,?,?,?,?)",
                 [
                     ("trial", "3天体验版", 3, 1, 1),
+                    ("weekly", "周卡", 7, 1, 1),
                     ("monthly", "月卡", 30, 1, 1),
+                    ("quarterly", "季卡", 90, 1, 1),
                     ("yearly", "年卡", 365, 1, 1),
                 ],
             )

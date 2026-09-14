@@ -4,6 +4,7 @@ let selectedUserId = null
 const byId = (id) => document.getElementById(id)
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))
 const formatTime = (value) => value ? new Date(value).toLocaleString('zh-CN', {hour12:false}) : '—'
+const planNames = {trial:'3天体验版', weekly:'周卡', monthly:'月卡', quarterly:'季卡', yearly:'年卡'}
 
 function message(text, ok=true) {
   const node = byId('message')
@@ -79,11 +80,11 @@ async function createUser(event) {
 
 async function loadUsers() {
   const rows = await api('GET', '/v1/admin/users')
-  byId('users').innerHTML = rows.map((user) => `<tr><td>${user.id}</td><td><b>${escapeHtml(user.display_name || user.username)}</b><br><small>${escapeHtml(user.username)}</small></td><td class="status-${escapeHtml(user.status)}">${escapeHtml(user.status)}</td><td>${escapeHtml(user.plan_code || '未开通')}</td><td>${escapeHtml(formatTime(user.expires_at))}</td><td><div class="actions"><button data-action="grant" data-id="${user.id}" data-plan="trial">体验</button><button data-action="grant" data-id="${user.id}" data-plan="monthly">月卡</button><button data-action="grant" data-id="${user.id}" data-plan="yearly">年卡</button><button class="secondary" data-action="devices" data-id="${user.id}" data-name="${escapeHtml(user.display_name || user.username)}">设备</button><button class="danger" data-action="status" data-id="${user.id}" data-status="${user.status === 'active' ? 'frozen' : 'active'}">${user.status === 'active' ? '冻结' : '恢复'}</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted">暂无客户</td></tr>'
+  byId('users').innerHTML = rows.map((user) => `<tr><td>${user.id}</td><td><b>${escapeHtml(user.display_name || user.username)}</b><br><small>${escapeHtml(user.username)}</small></td><td class="status-${escapeHtml(user.status)}">${escapeHtml(user.status)}</td><td>${escapeHtml(planNames[user.plan_code] || user.plan_code || '未开通')}</td><td>${escapeHtml(formatTime(user.expires_at))}</td><td><div class="actions"><button data-action="grant" data-id="${user.id}" data-plan="trial">体验</button><button data-action="grant" data-id="${user.id}" data-plan="weekly">周卡</button><button data-action="grant" data-id="${user.id}" data-plan="monthly">月卡</button><button data-action="grant" data-id="${user.id}" data-plan="quarterly">季卡</button><button data-action="grant" data-id="${user.id}" data-plan="yearly">年卡</button><button class="secondary" data-action="devices" data-id="${user.id}" data-name="${escapeHtml(user.display_name || user.username)}">设备</button><button class="danger" data-action="status" data-id="${user.id}" data-status="${user.status === 'active' ? 'frozen' : 'active'}">${user.status === 'active' ? '冻结' : '恢复'}</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted">暂无客户</td></tr>'
 }
 
 async function grant(userId, plan) {
-  if (!window.confirm(`确认开通或续费 ${plan} 套餐？`)) return
+  if (!window.confirm(`确认开通或续费${planNames[plan] || plan}？`)) return
   await api('POST', `/v1/admin/users/${userId}/subscription`, {plan_code:plan})
   await Promise.all([loadUsers(), loadAudit()])
   message('订阅开通或续费成功')
