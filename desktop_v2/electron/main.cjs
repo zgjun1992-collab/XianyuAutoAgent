@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage, dialog, Notification, shell, Menu } = require('electron')
+const { app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage, dialog, Notification, shell, Menu, Tray, nativeImage } = require('electron')
 const { spawn } = require('child_process')
 const fs = require('fs')
 const net = require('net')
@@ -7,6 +7,7 @@ const path = require('path')
 const crypto = require('crypto')
 const { autoUpdater } = require('./generated-updater.cjs')
 const { normalizeReleaseNotes, isForcedUpdate, publicUpdateState } = require('./update-policy.cjs')
+const { normalizeServiceStatus, isRecordedBackend } = require('./tray-policy.cjs')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -60,6 +61,11 @@ let goofishSession = null
 let updateCheckWasManual = false
 let promptedUpdateVersion = ''
 let promptedInstallVersion = ''
+let tray = null
+let trayStatusTimer = null
+let trayServiceStatus = 'stopped'
+let isQuitting = false
+let trayNoticeShown = false
 
 const updaterState = {
   status: 'idle',
@@ -94,6 +100,148 @@ function readSettings() {
 function writeSettings(value) {
   fs.mkdirSync(path.dirname(settingsPath()), { recursive: true })
   fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), 'utf8')
+}
+
+function saveManagedBackendRecord(child, port) {
+  if (!child?.pid || !port) return
+  const saved = readSettings()
+  saved.managed_backend = {
+    pid: child.pid,
+    port,
+    edition: 'V3.6',
+    version: app.getVersion(),
+    started_at: new Date().toISOString()
+  }
+  writeSettings(saved)
+}
+
+function clearManagedBackendRecord(pid = 0) {
+  const saved = readSettings()
+  if (!saved.managed_backend) return
+  if (pid && Number(saved.managed_backend.pid) !== Number(pid)) return
+  delete saved.managed_backend
+  writeSettings(saved)
+}
+
+async function cleanupRecordedBackend() {
+  const saved = readSettings()
+  const record = saved.managed_backend
+  if (!record) return false
+  try {
+    const response = await fetch(`http://127.0.0.1:${Number(record.port)}/health`)
+    const payload = response.ok ? await response.json() : null
+    if (!isRecordedBackend(record, payload?.data)) {
+      clearManagedBackendRecord(Number(record.pid))
+      return false
+    }
+    try {
+      await fetch(`http://127.0.0.1:${Number(record.port)}/service/stop`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+      })
+    } catch (_error) {}
+    try {
+      process.kill(Number(record.pid))
+      console.error(`V3 tray: cleaned recorded backend PID ${record.pid}`)
+    } catch (_error) {}
+    clearManagedBackendRecord(Number(record.pid))
+    return true
+  } catch (_error) {
+    clearManagedBackendRecord(Number(record.pid))
+    return false
+  }
+}
+
+function showMainWindow() {
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function trayIcon() {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#ffd600"/><circle cx="16" cy="16" r="10" fill="#171a17"/><text x="16" y="20" text-anchor="middle" font-family="Arial" font-size="11" font-weight="700" fill="#ffd600">AI</text></svg>'
+  const icon = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`)
+  const fallback = nativeImage.createFromPath(process.execPath)
+  return (icon.isEmpty() ? fallback : icon).resize({ width: 16, height: 16 })
+}
+
+function notifyTray(title, body) {
+  if (Notification.isSupported()) new Notification({ title, body }).show()
+}
+
+async function refreshTrayStatus() {
+  if (!backendReady) {
+    trayServiceStatus = backendProcess && !backendProcess.killed ? 'starting' : 'stopped'
+    updateTrayMenu()
+    return
+  }
+  try {
+    const status = await requestBackend('GET', '/service/status')
+    trayServiceStatus = status?.status || 'stopped'
+  } catch (_error) {
+    trayServiceStatus = 'error'
+  }
+  updateTrayMenu()
+}
+
+async function runTrayAction(title, action) {
+  try {
+    await action()
+    await refreshTrayStatus()
+  } catch (error) {
+    notifyTray(title, error?.message || String(error))
+  }
+}
+
+function updateTrayMenu() {
+  if (!tray || tray.isDestroyed()) return
+  const pid = backendProcess && !backendProcess.killed ? backendProcess.pid : 0
+  tray.setToolTip(`闲鱼卡券AI客服 V3.6 - ${normalizeServiceStatus(trayServiceStatus)}`)
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '打开主界面', click: showMainWindow },
+    { type: 'separator' },
+    { label: `本地后台：${pid ? `PID ${pid}` : '未运行'}`, enabled: false },
+    { label: `客服状态：${normalizeServiceStatus(trayServiceStatus)}`, enabled: false },
+    { type: 'separator' },
+    {
+      label: '启动自动客服', enabled: backendReady && trayServiceStatus !== 'connected',
+      click: () => runTrayAction('启动客服失败', () => requestBackend('POST', '/service/start', {}))
+    },
+    {
+      label: '停止自动客服', enabled: backendReady && trayServiceStatus !== 'stopped',
+      click: () => runTrayAction('停止客服失败', () => requestBackend('POST', '/service/stop', {}))
+    },
+    {
+      label: '重启本地后台',
+      click: () => runTrayAction('重启后台失败', async () => {
+        await stopManagedBackend('tray restart')
+        await startBackend()
+        notifyTray('本地后台已重启', `后台 PID ${backendProcess?.pid || '-'}`)
+      })
+    },
+    { type: 'separator' },
+    { label: '完全退出程序', click: () => quitFromTray() }
+  ]))
+}
+
+function createTray() {
+  if (tray && !tray.isDestroyed()) return
+  tray = new Tray(trayIcon())
+  tray.on('click', showMainWindow)
+  updateTrayMenu()
+  trayStatusTimer = setInterval(() => refreshTrayStatus().catch(() => {}), 5000)
+}
+
+async function quitFromTray() {
+  if (isQuitting) return
+  isQuitting = true
+  updateTrayMenu()
+  await stopManagedBackend('application exit')
+  if (trayStatusTimer) clearInterval(trayStatusTimer)
+  trayStatusTimer = null
+  if (tray && !tray.isDestroyed()) tray.destroy()
+  tray = null
+  app.quit()
 }
 
 function appendUpdateLog(level, message, detail = '') {
@@ -244,17 +392,25 @@ async function downloadAppUpdate() {
   return publicUpdateState(updaterState)
 }
 
-async function stopBackendForUpdate() {
+async function stopManagedBackend(reason = 'shutdown') {
   if (backendReady) {
     try {
       await requestBackend('POST', '/service/stop', {})
-      appendUpdateLog('INFO', 'customer service stopped before update')
+      console.error(`V3 backend: customer service stopped for ${reason}`)
     } catch (error) {
-      appendUpdateLog('WARN', 'failed to stop service gracefully', error?.message || error)
+      console.error(`V3 backend: graceful service stop failed for ${reason}`, error?.message || error)
     }
   }
-  if (!backendProcess || backendProcess.killed) return
+  if (!backendProcess || backendProcess.killed) {
+    backendReady = false
+    backendIdentity = null
+    backendProcess = null
+    clearManagedBackendRecord()
+    updateTrayMenu()
+    return
+  }
   const processToStop = backendProcess
+  const stoppedPid = processToStop.pid
   await new Promise((resolve) => {
     let settled = false
     const finish = () => {
@@ -270,7 +426,15 @@ async function stopBackendForUpdate() {
   backendReady = false
   backendIdentity = null
   backendProcess = null
-  appendUpdateLog('INFO', 'backend process stopped before update')
+  clearManagedBackendRecord(stoppedPid)
+  trayServiceStatus = 'stopped'
+  updateTrayMenu()
+  console.error(`V3 backend: PID ${stoppedPid} stopped for ${reason}`)
+}
+
+async function stopBackendForUpdate() {
+  await stopManagedBackend('software update')
+  appendUpdateLog('INFO', 'customer service and backend stopped before update')
 }
 
 async function installDownloadedUpdate() {
@@ -533,25 +697,35 @@ async function startBackend() {
     executable = path.join(process.resourcesPath, 'backend', 'xianyu-cloud-preview-backend.exe')
     args = ['--port', String(backendPort), '--data-dir', dataDir]
   }
-  backendProcess = spawn(executable, args, {
+  const child = spawn(executable, args, {
     cwd: isDev ? projectRoot : path.dirname(executable),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
   })
-  backendProcess.stdout.on('data', (chunk) => {
+  backendProcess = child
+  saveManagedBackendRecord(child, backendPort)
+  updateTrayMenu()
+  child.stdout.on('data', (chunk) => {
     const text = chunk.toString()
     if (text.includes('"ready": true')) backendReady = true
   })
-  backendProcess.stderr.on('data', (chunk) => {
+  child.stderr.on('data', (chunk) => {
     mainWindow?.webContents.send('app:event', { type: 'backend-log', message: chunk.toString() })
   })
-  backendProcess.on('exit', (code) => {
-    backendReady = false
-    backendIdentity = null
-    mainWindow?.webContents.send('app:event', { type: 'backend-exit', code })
+  child.on('exit', (code) => {
+    clearManagedBackendRecord(child.pid)
+    if (backendProcess === child) {
+      backendReady = false
+      backendIdentity = null
+      backendProcess = null
+      trayServiceStatus = 'stopped'
+      updateTrayMenu()
+      mainWindow?.webContents.send('app:event', { type: 'backend-exit', code })
+    }
   })
   await waitForBackend()
   await pushRuntimeConfig()
+  await refreshTrayStatus()
 }
 
 async function pushRuntimeConfig() {
@@ -634,6 +808,15 @@ async function createWindow() {
   if (isDev) await mainWindow.loadURL('http://127.0.0.1:5173')
   else await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   await createGoofishView()
+  mainWindow.on('close', (event) => {
+    if (isQuitting) return
+    event.preventDefault()
+    mainWindow.hide()
+    if (!trayNoticeShown) {
+      trayNoticeShown = true
+      notifyTray('程序仍在后台运行', '可在系统托盘查看后台 PID、控制客服或完全退出。')
+    }
+  })
   mainWindow.on('closed', () => {
     if (goofishView && !goofishView.webContents.isDestroyed()) goofishView.webContents.close()
     goofishView = null
@@ -746,10 +929,12 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     console.error('V3 stage: app ready')
     registerIpc()
     registerUpdater()
+    createTray()
     console.error('V3 stage: IPC ready')
     goofishSession = session.fromPartition('persist:xianyu-main')
     await configureGoofishProxy(goofishSession)
     console.error('V3 stage: network route ready')
+    await cleanupRecordedBackend()
     await startBackend()
     console.error('V3 stage: backend ready')
     await createWindow()
@@ -758,7 +943,8 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     setInterval(() => syncGoofishCookie().catch(() => {}), 30000)
     setInterval(monitorReviews, 2500)
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      if (!mainWindow) createWindow()
+      else showMainWindow()
     })
   } catch (error) {
     console.error('V3 startup failed:', error)
@@ -768,16 +954,18 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
 })
 
 app.on('second-instance', () => {
-  if (!mainWindow) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
+  showMainWindow()
 })
 
 app.on('before-quit', () => {
+  isQuitting = true
+  if (trayStatusTimer) clearInterval(trayStatusTimer)
+  trayStatusTimer = null
+  if (tray && !tray.isDestroyed()) tray.destroy()
+  tray = null
   if (backendProcess && !backendProcess.killed) backendProcess.kill()
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform === 'darwin' && isQuitting) app.quit()
 })

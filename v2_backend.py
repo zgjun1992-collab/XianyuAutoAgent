@@ -696,6 +696,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "edition": APP_EDITION,
                     "version": APP_VERSION,
                     "build_commit": BUILD_COMMIT,
+                    "pid": os.getpid(),
                 })
             if path == "/snapshot":
                 return self._ok({
