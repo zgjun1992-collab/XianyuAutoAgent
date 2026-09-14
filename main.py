@@ -158,6 +158,22 @@ class XianyuLive:
             except Exception as exc:
                 logger.debug(f"界面事件回调失败: {exc}")
 
+    def emit_reply_timing(self, scope_id, reply_path, started_at, timings, **payload):
+        """Persist one buyer-visible reply latency breakdown for field diagnosis."""
+        normalized = {
+            str(name): round(max(0.0, float(value)), 1)
+            for name, value in (timings or {}).items()
+        }
+        total_ms = round(max(0.0, (time.perf_counter() - started_at) * 1000), 1)
+        normalized["总计"] = total_ms
+        detail = "，".join(f"{name} {value:.1f}ms" for name, value in normalized.items())
+        message = f"回复耗时｜路径 {reply_path}｜{detail}"
+        logger.info(f"{message} (会话: {scope_id})")
+        self.emit_event(
+            "reply_timing", message=message, scope_id=scope_id,
+            reply_path=reply_path, timings=normalized, **payload,
+        )
+
     def scope_key(self, chat_id, item_id):
         """Isolate state by seller account, Xianyu conversation and item."""
         return f"{self.myid}:{chat_id}:{item_id}"
@@ -1403,6 +1419,10 @@ class XianyuLive:
 
     async def handle_message(self, message_data, websocket, send_ack=True):
         """处理所有类型的消息"""
+        reply_started_at = time.perf_counter()
+        reply_timings = {}
+        reply_path = "未判定"
+        timing_scope_id = ""
         try:
 
             try:
@@ -1486,6 +1506,8 @@ class XianyuLive:
                 logger.warning("无法获取商品ID")
                 return
             scope_id = self.scope_key(chat_id, item_id)
+            timing_scope_id = scope_id
+            reply_timings["接收解析"] = (time.perf_counter() - reply_started_at) * 1000
 
             if send_user_id != self.myid:
                 self._buyer_routes[str(send_user_id)] = (str(chat_id), str(item_id))
@@ -1585,12 +1607,15 @@ class XianyuLive:
                 if self.media_marker(send_message) or self.is_media_dependent_text(send_message)
                 else self.message_bundle_delay
             )
+            bundle_started_at = time.perf_counter()
             await asyncio.sleep(delay)
+            reply_timings["消息合并"] = (time.perf_counter() - bundle_started_at) * 1000
             if self._message_generations.get(scope_id) != generation:
                 logger.debug(f"会话 {chat_id} 收到更新消息，旧草稿任务已取消")
                 return
             send_message = "\n".join(self._message_buffers.pop(scope_id, []))
 
+            local_data_started_at = time.perf_counter()
             product_getter = getattr(self.app_store, "get_v2_product", None)
             current_product = product_getter(item_id) if product_getter else None
             policies = self.app_store.get_policies()
@@ -1606,6 +1631,7 @@ class XianyuLive:
                 getattr(self, "_recent_buyer_locations", {}).pop(scope_id, None)
                 self._media_notice_times.pop(scope_id, None)
                 self.emit_event("conversation_reset", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
+            reply_timings["本地数据"] = (time.perf_counter() - local_data_started_at) * 1000
 
             # Chat-shaped platform notices are not buyer consultations and must
             # never consume the mandatory first-reply flag.
@@ -1619,6 +1645,7 @@ class XianyuLive:
             # Product state is a hard gate and must be fresh before the welcome.
             # A stale two-day-old local sync must not let an offline listing send
             # its old first reply, keyword rule or model answer.
+            listing_started_at = time.perf_counter()
             if current_product:
                 try:
                     current_product = await self.refresh_current_listing_status(
@@ -1626,6 +1653,7 @@ class XianyuLive:
                     )
                 except Exception as exc:
                     logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+            reply_timings["商品核对"] = (time.perf_counter() - listing_started_at) * 1000
 
             # 代买单与普通卡券完全隔离：首次消息只发已配置的首次回复；
             # 后续只处理纯寒暄，其余问题不进入业务规则、AI、审核或售后。
@@ -1747,6 +1775,7 @@ class XianyuLive:
                 return
             # 极速路径：先跑本地安全、门店、时间和套餐图片规则。
             # 命中后不读取商品页面、不调用模型，直接生成可审核/发送的答复。
+            routing_started_at = time.perf_counter()
             deterministic = None
             image_match = None
             image_asset = None
@@ -1784,12 +1813,14 @@ class XianyuLive:
             semantic_mode_getter = getattr(self.bot, "semantic_router_mode", None)
             semantic_mode = semantic_mode_getter() if semantic_mode_getter else "on"
             semantic_analysis = None
+            reply_timings["语义模型"] = 0.0
             if (
                 not product_offline and not image_match
                 and predecision.action != "replace" and semantic_checker
                 and semantic_parser and semantic_resolver
                 and semantic_checker(send_message, deterministic)
             ):
+                semantic_started_at = time.perf_counter()
                 try:
                     product_getter = getattr(self.app_store, "get_v2_product", None)
                     product = product_getter(item_id) if product_getter else None
@@ -1820,6 +1851,11 @@ class XianyuLive:
                         logger.info("语义路由处于影子模式：已记录意图，不改变当前回复")
                 except Exception as exc:
                     logger.warning(f"前置语义识别失败，继续使用原有规则：{exc}")
+                finally:
+                    reply_timings["语义模型"] = (
+                        time.perf_counter() - semantic_started_at
+                    ) * 1000
+                    reply_path = "语义规则"
 
             # Apply model structure only when the completed local result
             # is eligible. Review/silent/system answers cannot be overridden.
@@ -1899,6 +1935,11 @@ class XianyuLive:
                 "stores", "media", "media_context",
             }:
                 self._store_contexts.pop(scope_id, None)
+            reply_timings["本地规则"] = max(
+                0.0,
+                (time.perf_counter() - routing_started_at) * 1000
+                - reply_timings.get("语义模型", 0.0),
+            )
             if deterministic and deterministic.get("kind") == "offline":
                 bot_reply = deterministic["reply"]
                 logger.info("当前商品已下架，停止商品内容回复")
@@ -1930,6 +1971,8 @@ class XianyuLive:
                 logger.info(f"确定性规则命中: {deterministic.get('source', '')}")
             else:
                 # 只有固定规则无法回答时，才准备商品知识和最近对话并调用一次模型。
+                reply_path = "AI回复" if reply_path == "未判定" else "语义+AI回复"
+                knowledge_started_at = time.perf_counter()
                 item_info = self.context_manager.get_item_info(item_id)
                 if not item_info:
                     logger.info(f"从API获取商品信息: {item_id}")
@@ -1950,12 +1993,15 @@ class XianyuLive:
                     item_id, platform_summary, send_message
                 )
                 context = self.context_manager.get_context_by_chat(scope_id)
+                reply_timings["商品知识"] = (time.perf_counter() - knowledge_started_at) * 1000
+                model_started_at = time.perf_counter()
                 bot_reply = await asyncio.to_thread(
                     self.bot.generate_reply,
                     send_message,
                     item_description,
                     context,
                 )
+                reply_timings["回复模型"] = (time.perf_counter() - model_started_at) * 1000
                 grounding_issue = self.model_reply_grounding_issue(
                     send_message, item_description, context, bot_reply
                 )
@@ -2084,7 +2130,9 @@ class XianyuLive:
                 ) else notice
                 buyer_notice = self.sanitize_buyer_reply(buyer_notice)
                 if buyer_notice:
+                    send_started_at = time.perf_counter()
                     await self.send_msg(websocket, chat_id, send_user_id, buyer_notice)
+                    reply_timings["发送"] = (time.perf_counter() - send_started_at) * 1000
                     self._review_notified_scopes.add(scope_id)
                     self.context_manager.add_message_by_chat(
                         scope_id, self.myid, item_id, "assistant", buyer_notice
@@ -2096,6 +2144,10 @@ class XianyuLive:
                     f"{decision.reasons or ['当前为审核模式']}"
                 )
                 self.emit_event("pending_reply", audit_id=audit_id, chat_id=chat_id, item_id=item_id)
+                self.emit_reply_timing(
+                    scope_id, "人工审核提示", reply_started_at, reply_timings,
+                    chat_id=chat_id, item_id=item_id,
+                )
                 return
 
             # 自动模式只有通过独立规则审查的草稿才会发送。
@@ -2109,8 +2161,11 @@ class XianyuLive:
                 total_delay = min(total_delay, 10.0)
                 
                 logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
+                typing_started_at = time.perf_counter()
                 await asyncio.sleep(total_delay)
-                
+                reply_timings["模拟输入"] = (time.perf_counter() - typing_started_at) * 1000
+
+            send_started_at = time.perf_counter()
             if image_asset:
                 await self.send_message_template(
                     websocket, chat_id, send_user_id, scope_id, item_id, final_reply,
@@ -2140,9 +2195,21 @@ class XianyuLive:
                         "image_send_error", audit_id=audit_id,
                         image_asset_id=image_asset["id"], message=str(exc),
                     )
+            reply_timings["发送"] = (time.perf_counter() - send_started_at) * 1000
+            if reply_path == "未判定":
+                reply_path = "本地规则"
+            self.emit_reply_timing(
+                scope_id, reply_path, reply_started_at, reply_timings,
+                chat_id=chat_id, item_id=item_id,
+            )
 
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
+            if timing_scope_id:
+                self.emit_reply_timing(
+                    timing_scope_id, "处理失败", reply_started_at, reply_timings,
+                    error=str(e),
+                )
             logger.debug(f"原始消息: {redact_sensitive_text(message_data)}")
             # 最后一层故障兜底：解析/接口/模型异常都不能静默吞消息。
             try:

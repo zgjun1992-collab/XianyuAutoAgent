@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -52,6 +53,25 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {"type": "image", "asset_id": 7},
             {"type": "text", "content": "第三段"},
         ], parts)
+
+    def test_reply_timing_is_emitted_as_a_visible_runtime_event(self):
+        live = self.make_live()
+        events = []
+        live.event_callback = events.append
+
+        live.emit_reply_timing(
+            "seller:chat-1:item-1", "AI回复", time.perf_counter() - 0.05,
+            {"接收解析": 1.234, "回复模型": 40.567},
+            chat_id="chat-1", item_id="item-1",
+        )
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("reply_timing", events[0]["type"])
+        self.assertEqual("AI回复", events[0]["reply_path"])
+        self.assertEqual(1.2, events[0]["timings"]["接收解析"])
+        self.assertEqual(40.6, events[0]["timings"]["回复模型"])
+        self.assertGreaterEqual(events[0]["timings"]["总计"], 50.0)
+        self.assertIn("回复耗时｜路径 AI回复", events[0]["message"])
 
     def make_live(self):
         live = XianyuLive.__new__(XianyuLive)
