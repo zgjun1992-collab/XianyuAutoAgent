@@ -1,6 +1,6 @@
 # `api.yituan123.com` 部署说明
 
-备案通过前只准备文件，不开放 80/443，不把服务暴露到公网。正式服务由 Caddy 终止 HTTPS，再转发到只监听 `127.0.0.1:8787` 的 FastAPI/Uvicorn。
+备案已通过，可以进入域名解析、HTTPS 和端到端验收阶段。正式服务由 Caddy 终止 HTTPS，再转发到只监听 `127.0.0.1:8787` 的 FastAPI/Uvicorn；详细执行顺序见 `POST_ICP_CHECKLIST.md`。
 
 ## 服务器目录
 

@@ -60,6 +60,15 @@ class AppStoreTests(unittest.TestCase):
         result = PolicyEngine().evaluate("200和300可以一起用吗", "200和300不能混用。")
         self.assertEqual("allow", result.action)
 
+    def test_store_amount_usage_question_is_not_bargaining(self):
+        result = PolicyEngine().evaluate(
+            "深圳壹方城200可以用吗", "深圳宝安壹方城店可用。",
+        )
+        self.assertEqual("allow", result.action)
+
+        bargain = PolicyEngine().evaluate("80元可以吗", "不支持议价。")
+        self.assertEqual("replace", bargain.action)
+
     def test_dangerous_bargain_draft_is_blocked(self):
         result = PolicyEngine().evaluate("你好", "全新可小刀。")
         self.assertEqual("review", result.action)
@@ -144,11 +153,28 @@ class AppStoreTests(unittest.TestCase):
         self.assertEqual("sent", row["status"])
         self.assertEqual("您好", row["final_reply"])
 
+    def test_audit_redacts_order_and_voucher_credentials(self):
+        audit_id = self.store.create_audit(
+            chat_id="chat", user_id="buyer", user_name="买家", item_id="1001",
+            user_message=(
+                "3316384347100027780\n"
+                "卡号：示例-044175443178-100元代金券\n"
+                "密码：https://kms.example.invalid/xgj/private-token"
+            ),
+            draft_reply="", action="review", reasons=[], status="pending",
+        )
+        message = self.store.get_audit(audit_id)["user_message"]
+        self.assertNotIn("3316384347100027780", message)
+        self.assertNotIn("private-token", message)
+        self.assertNotIn("044175443178", message)
+        self.assertIn("已隐藏", message)
+
     def test_conversation_reply_count_resets_and_is_scoped(self):
         state = self.store.touch_conversation("seller:chat:item1", "seller", "chat", "buyer", "item1", 24)
         self.assertEqual(0, state["ai_reply_count"])
         self.store.record_ai_reply("seller:chat:item1")
         self.store.mark_first_reply_sent("seller:chat:item1")
+        self.assertTrue(self.store.is_first_reply_sent("seller:chat:item1"))
         state = self.store.touch_conversation("seller:chat:item1", "seller", "chat", "buyer", "item1", 24)
         self.assertEqual(1, state["ai_reply_count"])
         self.assertEqual(1, state["first_reply_sent"])
@@ -161,7 +187,34 @@ class AppStoreTests(unittest.TestCase):
         reset = next(item for item in self.store.list_conversations() if item["scope_id"].endswith("item1"))
         self.assertEqual(0, reset["ai_reply_count"])
         self.assertEqual(0, reset["first_reply_sent"])
+        self.assertFalse(self.store.is_first_reply_sent("seller:chat:item1"))
         self.assertEqual("active", reset["state"])
+
+    def test_manual_conversation_state_is_persistent_and_resumable(self):
+        scope_id = "seller:chat:item1"
+        self.store.touch_conversation(scope_id, "seller", "chat", "buyer", "item1", 24)
+        self.store.pause_conversation(scope_id, "manual")
+        reopened = AppStore(self.store.db_path)
+        self.assertEqual("manual", reopened.get_conversation_state(scope_id))
+        reopened.resume_conversation(scope_id)
+        self.assertEqual("active", reopened.get_conversation_state(scope_id))
+
+    def test_manual_state_survives_reply_count_and_inactivity_window(self):
+        scope_id = "seller:chat:item1"
+        self.store.touch_conversation(scope_id, "seller", "chat", "buyer", "item1", 24)
+        self.store.pause_conversation(scope_id, "manual")
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE conversation_state SET last_activity=? WHERE scope_id=?",
+                ("2020-01-01T00:00:00", scope_id),
+            )
+        state = self.store.touch_conversation(
+            scope_id, "seller", "chat", "buyer", "item1", 1,
+        )
+        self.assertFalse(state["reset"])
+        self.assertEqual("manual", state["state"])
+        self.store.record_ai_reply(scope_id)
+        self.assertEqual("manual", self.store.get_conversation_state(scope_id))
 
     def test_structured_query_context_is_persisted_and_cleared_on_reset(self):
         scope_id = "seller:chat:item1"
@@ -186,6 +239,14 @@ class AppStoreTests(unittest.TestCase):
     def test_desktop_api_mode_is_non_interactive(self):
         api = XianyuApis(interactive=False)
         self.assertFalse(api.interactive)
+
+    def test_discounted_total_question_is_not_treated_as_bargaining(self):
+        decision = PolicyEngine(DEFAULT_POLICIES).evaluate("273优惠完多少", "正常凑单答复")
+        self.assertEqual("allow", decision.action)
+
+    def test_real_bargaining_still_uses_price_fallback(self):
+        decision = PolicyEngine(DEFAULT_POLICIES).evaluate("还能再优惠一点吗", "")
+        self.assertEqual("replace", decision.action)
 
 
 if __name__ == "__main__":

@@ -71,11 +71,25 @@ class BackendSyncTests(unittest.TestCase):
         self.assertEqual(1, result["total"])
         product = self.state.store.get_v2_product("30003")
         self.assertTrue(product["raw_text"].startswith("AI生成的初始知识"))
+        self.assertIn("工作日午餐可用", product["raw_text"])
+        self.assertIn("周末不可用", product["raw_text"])
         self.assertIn("适用门店营业时间内可用", product["raw_text"])
         self.assertEqual("https://img.alicdn.com/cover.jpg", product["thumbnail_url"])
         self.assertIn("https://img.alicdn.com/detail.jpg", product["image_urls"])
         self.assertIn("工作日午餐可用", self.summary_calls[0])
         self.assertNotIn("image_url", self.summary_calls[0])
+
+    @unittest.skipUnless(os.name == "nt", "Windows named mutex only")
+    def test_only_one_live_service_can_own_the_same_data_directory(self):
+        other = BackendState(self.temp.name)
+        self.state._acquire_service_mutex()
+        try:
+            with self.assertRaisesRegex(ValueError, "已有客服实例"):
+                other._acquire_service_mutex()
+        finally:
+            self.state._release_service_mutex()
+        other._acquire_service_mutex()
+        other._release_service_mutex()
 
     @patch("v2_backend.XianyuApis", FakeXianyuApis)
     def test_resync_never_overwrites_manual_knowledge(self):
@@ -85,6 +99,45 @@ class BackendSyncTests(unittest.TestCase):
         product = self.state.store.get_v2_product("30003")
         self.assertEqual("人工修改后的最高优先级资料", product["raw_text"])
         self.assertEqual(1, product["manual_edited"])
+
+    def test_sync_without_mtop_token_shows_login_message_before_api_call(self):
+        self.state.configure({"cookie": "unb=seller-1"})
+        with self.assertRaisesRegex(ValueError, "闲鱼登录状态已失效"):
+            self.state.sync_products()
+
+    def test_new_cookie_is_applied_to_running_service_and_reconnects(self):
+        class Live:
+            def __init__(self):
+                self.updated = []
+
+            def update_cookie(self, value):
+                self.updated.append(value)
+                return True
+
+        self.state.live = Live()
+        self.state.service_status = "starting"
+        self.state.configure({"cookie": "unb=seller-1; _m_h5_tk=new-token_456"})
+        self.assertEqual(
+            ["unb=seller-1; _m_h5_tk=new-token_456"],
+            self.state.live.updated,
+        )
+        self.assertEqual("reconnecting", self.state.service_status)
+
+    def test_non_auth_cookie_change_does_not_interrupt_running_service(self):
+        class Live:
+            def __init__(self):
+                self.updated = []
+
+            def update_cookie(self, value):
+                self.updated.append(value)
+
+        self.state.live = Live()
+        self.state.service_status = "connected"
+        self.state.configure({
+            "cookie": "unb=seller-1; _m_h5_tk=testtoken_123; tracking=changed",
+        })
+        self.assertEqual([], self.state.live.updated)
+        self.assertEqual("connected", self.state.service_status)
 
 
 if __name__ == "__main__":

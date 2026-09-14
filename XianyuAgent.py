@@ -1,10 +1,12 @@
+import json
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
 import sys
 from openai import OpenAI
 from loguru import logger
 from app_store import DEFAULT_POLICIES, find_unauthorized_promises
+from privacy_guard import redact_sensitive_text
 
 
 class XianyuReplyBot:
@@ -41,17 +43,18 @@ class XianyuReplyBot:
         local_prompt_dir = os.path.join(os.getcwd(), "prompts")
         bundled_root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         bundled_prompt_dir = os.path.join(bundled_root, "prompts")
-        prompt_dir = local_prompt_dir if os.path.isdir(local_prompt_dir) else bundled_prompt_dir
         
         def load_prompt_content(name: str) -> str:
             """尝试加载提示词文件"""
-            # 优先尝试加载 target.txt
-            target_path = os.path.join(prompt_dir, f"{name}.txt")
-            if os.path.exists(target_path):
-                file_path = target_path
-            else:
-                # 尝试默认提示词 target_example.txt
-                file_path = os.path.join(prompt_dir, f"{name}_example.txt")
+            candidates = [
+                os.path.join(local_prompt_dir, f"{name}.txt"),
+                os.path.join(local_prompt_dir, f"{name}_example.txt"),
+                os.path.join(bundled_prompt_dir, f"{name}.txt"),
+                os.path.join(bundled_prompt_dir, f"{name}_example.txt"),
+            ]
+            file_path = next((path for path in candidates if os.path.exists(path)), "")
+            if not file_path:
+                raise FileNotFoundError(f"未找到{name}提示词或模板")
 
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -67,6 +70,8 @@ class XianyuReplyBot:
             self.tech_prompt = load_prompt_content("tech_prompt")
             # 加载默认提示词
             self.default_prompt = load_prompt_content("default_prompt")
+            # 语义辅助层只拆分问题和抽取原文槽位，不直接生成业务答案。
+            self.semantic_prompt = load_prompt_content("semantic_prompt")
                 
             logger.info("成功加载所有提示词")
         except Exception as e:
@@ -96,6 +101,210 @@ class XianyuReplyBot:
             f"{msg['role']}: {msg.get('content', '')}" for msg in user_assistant_msgs
         )
         return history[-max_chars:]
+
+    @staticmethod
+    def _semantic_key(value: object) -> str:
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+    @classmethod
+    def _looks_compound(cls, message: str) -> bool:
+        """Conservatively detect a likely partial multi-question rule hit."""
+        text = str(message or "")
+        families = (
+            r"门店|店铺|商场|商圈|广场|万达|万象|壹方城|大悦城|可以用|能用|适用",
+            r"多少钱|多钱|售价|价格|怎么卖|几元|几块|抵\s*\d+|代\s*\d+",
+            r"怎么用|如何使用|怎么核销|如何核销|一次.*几张|最多.*几张|叠加",
+            r"限制|条件|周末|工作日|节假日|早餐|午餐|晚餐|晚市|几个人|\d+\s*人",
+            r"直接拍|直接买|可以拍|能拍|怎么买|怎么拍|如何购买|"
+            r"(?:吃完|吃了|用餐后|消费后|结账前|买单前).{0,10}(?:再|才)?(?:买|拍|购买|下单)",
+            r"发货|发券|怎么领取|多久到账|自动发",
+            r"退款|退货|退钱|不能核销|券码无效|过期",
+        )
+        family_count = sum(bool(re.search(pattern, text, re.I)) for pattern in families)
+        question_count = len(re.findall(r"[？?]", text))
+        linked_questions = bool(re.search(
+            r"(?:还有|另外|以及|并且|顺便|然后|同时|再问|，|,|；|;).{0,30}"
+            r"(?:吗|嘛|么|呢|怎么|如何|多少|哪|能不能|可不可以)",
+            text,
+        ))
+        confirmation_boundary = bool(re.search(
+            r"(?:对吧|是吧|没错吧|对不对)[，,；;\s]*.{1,40}"
+            r"(?:吗|嘛|么|呢|多少|能不能|可不可以|可以用|能用)",
+            text,
+        ))
+        return family_count >= 2 or question_count >= 2 or linked_questions or confirmation_boundary
+
+    @staticmethod
+    def semantic_router_mode() -> str:
+        """Return the guarded semantic-router rollout mode."""
+        mode = os.getenv("AI_SEMANTIC_ROUTER_MODE", "on").strip().lower()
+        return mode if mode in {"off", "shadow", "on"} else "on"
+
+    @classmethod
+    def should_analyze_message(cls, user_msg: str, deterministic: Optional[Dict] = None) -> bool:
+        """Use semantic parsing only for unresolved or safely compound routes."""
+        if os.getenv("AI_SEMANTIC_ASSIST_ENABLED", "true").strip().lower() in {
+            "0", "false", "off", "no",
+        } or cls.semantic_router_mode() == "off":
+            return False
+        text = str(user_msg or "").strip()
+        if len(cls._semantic_key(text)) < 2:
+            return False
+        if re.search(r"\[\s*(?:图片|语音)\s*\]|发张图|发图片|看图|照片", text):
+            return False
+        if re.fullmatch(
+            r"(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey)(?:呀|啊|哦|呢|吗)?[？?。！!]*",
+            text,
+            re.I,
+        ):
+            return False
+        if not deterministic:
+            # No high-confidence local rule resolved the text. The model may
+            # now provide structure, but local rules still own every answer.
+            return True
+        if deterministic.get("decision") in {"review", "clarify", "silent", "silent_review"}:
+            return False
+        if deterministic.get("kind") in {
+            "multi_intent", "semantic_multi_intent", "manual_handoff", "offline",
+            "media", "sensitive_aftersale",
+        }:
+            return False
+        eligible_partial_kinds = {
+            "stores", "stores_sku_recommendation", "sku_availability", "price",
+            "delivery_usage", "delivery_method", "purchase_flow", "stock",
+        }
+        return (
+            deterministic.get("kind") in eligible_partial_kinds
+            and cls._looks_compound(text)
+        )
+
+    @classmethod
+    def _validate_semantic_payload(
+        cls, payload: object, user_msg: str, recent_context: str = "",
+        structured_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Accept only grounded, schema-limited interpretation output."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("questions"), list):
+            return None
+        current_key = cls._semantic_key(user_msg)
+        grounding_context = {
+            key: value for key, value in (structured_context or {}).items()
+            if key in {
+                "last_store_query", "last_store_names", "last_selected_sku",
+                "pending_store_query",
+            }
+        }
+        context_evidence = (
+            f"{recent_context}\n{json.dumps(grounding_context, ensure_ascii=False)}"
+        )
+        context_key = cls._semantic_key(context_evidence)
+        current_numbers = set(re.findall(
+            r"(?<!\d)\d+(?:\.\d+)?(?!\d)", str(user_msg or ""),
+        ))
+        context_numbers = set(re.findall(
+            r"(?<!\d)\d+(?:\.\d+)?(?!\d)", context_evidence,
+        ))
+        allowed_intents = {
+            "store", "sku", "price", "usage", "stacking", "restrictions",
+            "purchase", "date", "conditions", "delivery", "aftersale", "other",
+        }
+        questions = []
+        for raw in payload.get("questions")[:5]:
+            if not isinstance(raw, dict):
+                continue
+            intent = str(raw.get("intent") or "").strip().lower()
+            evidence = str(raw.get("evidence") or "").strip()
+            evidence_key = cls._semantic_key(evidence)
+            if intent not in allowed_intents or not evidence_key or evidence_key not in current_key:
+                continue
+            try:
+                confidence = float(raw.get("confidence", 0))
+            except (TypeError, ValueError):
+                confidence = 0
+            if confidence < 0.68:
+                continue
+            uses_context = bool(raw.get("uses_context"))
+            slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else {}
+            clean_slots = {}
+            invalid = False
+            for key in ("store_query", "sku_amount", "paid_amount", "face_value", "date_text"):
+                value = str(slots.get(key) or "").strip()
+                if not value:
+                    continue
+                value_key = cls._semantic_key(value)
+                if key == "store_query":
+                    grounded = value_key in current_key or (uses_context and value_key in context_key)
+                    if len(value_key) < 2 or not grounded:
+                        invalid = True
+                        break
+                numbers = set(re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", value))
+                allowed_numbers = current_numbers | (context_numbers if uses_context else set())
+                if numbers - allowed_numbers:
+                    invalid = True
+                    break
+                clean_slots[key] = value[:80]
+            if invalid:
+                continue
+            questions.append({
+                "intent": intent,
+                "evidence": evidence[:160],
+                "slots": clean_slots,
+                "uses_context": uses_context,
+                "confidence": confidence,
+            })
+        if not questions:
+            return None
+        return {
+            "questions": questions,
+            "needs_clarification": bool(payload.get("needs_clarification")),
+        }
+
+    def analyze_message(
+        self, user_msg: str, context: List[Dict],
+        structured_context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Ask the model for grounded structure; never ask it for a buyer reply."""
+        if not self.should_analyze_message(user_msg):
+            return None
+        recent_context = self.format_history(context)
+        safe_message = redact_sensitive_text(user_msg)
+        safe_history = redact_sensitive_text(recent_context)
+        safe_structured = {
+            str(key): value for key, value in (structured_context or {}).items()
+            if key in {
+                "product_title", "sku_names", "last_store_query", "last_store_names",
+                "last_selected_sku", "pending_store_query",
+            }
+        }
+        request = {
+            "current_message": safe_message,
+            "recent_dialogue": safe_history,
+            "known_context": safe_structured,
+        }
+        try:
+            response = self.client.chat.completions.create(
+                model=os.getenv("MODEL_NAME", "qwen-plus"),
+                messages=[
+                    {"role": "system", "content": self.semantic_prompt},
+                    {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+                ],
+                temperature=0,
+                max_tokens=max(180, int(os.getenv("AI_SEMANTIC_MAX_TOKENS", "520"))),
+                top_p=0.2,
+                timeout=max(5, float(os.getenv("AI_SEMANTIC_TIMEOUT", "10"))),
+                response_format={"type": "json_object"},
+            )
+            content = str(response.choices[0].message.content or "").strip()
+            fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.I | re.S)
+            if fenced:
+                content = fenced.group(1)
+            payload = json.loads(content)
+            return self._validate_semantic_payload(
+                payload, safe_message, safe_history, safe_structured,
+            )
+        except Exception as exc:
+            logger.warning(f"语义辅助解析失败，继续使用原有规则：{exc}")
+            return None
 
     def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
         """生成回复主流程"""

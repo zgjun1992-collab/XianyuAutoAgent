@@ -17,6 +17,23 @@ if (process.platform === 'win32') {
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   console.error('V3 compatibility: GPU sandbox disabled')
 }
+// Chromium follows the Windows Internet Settings proxy, which can retain a
+// dead local port after proxy software changes ports.  Node/Python already use
+// HTTPS_PROXY/HTTP_PROXY, so prefer that live runtime proxy for the embedded
+// Goofish page as well.  Credentials are never logged or persisted here.
+const runtimeProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+if (runtimeProxy) {
+  try {
+    const parsedProxy = new URL(runtimeProxy)
+    if (['http:', 'https:', 'socks:', 'socks5:'].includes(parsedProxy.protocol)) {
+      const proxyOrigin = `${parsedProxy.protocol}//${parsedProxy.hostname}${parsedProxy.port ? `:${parsedProxy.port}` : ''}`
+      app.commandLine.appendSwitch('proxy-server', proxyOrigin)
+      console.error(`V3 proxy: using runtime proxy ${parsedProxy.hostname}:${parsedProxy.port || 'default'}`)
+    }
+  } catch (error) {
+    console.error('V3 proxy: ignored invalid runtime proxy', error?.message || String(error))
+  }
+}
 // Only one desktop main process may own the Xianyu WebSocket/backend.  Without
 // this lock, double-clicking the shortcut twice starts two independent backend
 // processes and both of them can reply to the same buyer message.
@@ -34,8 +51,10 @@ let goofishView = null
 let backendProcess = null
 let backendPort = null
 let backendReady = false
+let backendIdentity = null
 let lastPendingCount = 0
 let cookieTimer = null
+let goofishSession = null
 
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
@@ -189,6 +208,71 @@ async function freePort() {
   })
 }
 
+function canReachProxy(host, port, timeout = 450) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port: Number(port) })
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    socket.setTimeout(timeout)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+  })
+}
+
+async function configureGoofishProxy(goofishSession) {
+  const candidates = []
+  const addCandidate = (host, port, rule, source) => {
+    if (!host || !port || candidates.some((item) => item.host === host && item.port === String(port))) return
+    candidates.push({ host, port: String(port), rule, source })
+  }
+
+  for (const value of [process.env.HTTPS_PROXY, process.env.HTTP_PROXY]) {
+    if (!value) continue
+    try {
+      const parsed = new URL(value)
+      const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+      addCandidate(parsed.hostname, port, `${parsed.protocol}//${parsed.hostname}:${port}`, 'environment')
+    } catch (_error) {}
+  }
+
+  try {
+    const resolved = await goofishSession.resolveProxy('https://www.goofish.com/im')
+    for (const match of resolved.matchAll(/(?:PROXY|HTTPS?|SOCKS5?)\s+([^:;\s]+):(\d+)/gi)) {
+      addCandidate(match[1], match[2], `http://${match[1]}:${match[2]}`, 'system')
+    }
+  } catch (error) {
+    console.error('V3 proxy: resolveProxy failed', error?.message || String(error))
+  }
+
+  // Local proxy clients commonly expose a mixed HTTP port here. Probe only
+  // loopback so this cannot redirect the embedded browser to a remote host.
+  for (const port of ['7897', '7890', '10809', '10808']) {
+    addCandidate('127.0.0.1', port, `http://127.0.0.1:${port}`, 'local-probe')
+  }
+
+  for (const candidate of candidates) {
+    if (!await canReachProxy(candidate.host, candidate.port)) continue
+    await goofishSession.setProxy({ mode: 'fixed_servers', proxyRules: candidate.rule })
+    // The Python receiver must use the same reachable route as the embedded
+    // workbench.  Set this before spawning it so token and WebSocket traffic
+    // does not hang on a dead system proxy or an unavailable direct route.
+    process.env.HTTP_PROXY = candidate.rule
+    process.env.HTTPS_PROXY = candidate.rule
+    console.error(`V3 proxy: embedded workbench uses ${candidate.host}:${candidate.port} (${candidate.source})`)
+    return candidate
+  }
+
+  await goofishSession.setProxy({ mode: 'direct' })
+  console.error('V3 proxy: no reachable proxy found; embedded workbench uses direct connection')
+  return null
+}
+
 async function requestBackend(method, requestPath, body) {
   if (!backendReady) await waitForBackend()
   if (method === 'POST' && requestPath === '/service/start') {
@@ -211,10 +295,23 @@ async function waitForBackend() {
     try {
       const response = await fetch(`http://127.0.0.1:${backendPort}/health`)
       if (response.ok) {
+        const payload = await response.json()
+        const identity = payload?.data || {}
+        const expectedVersion = app.getVersion()
+        if (identity.edition !== 'V3.6' || identity.version !== expectedVersion) {
+          throw new Error(
+            `前后端版本不一致：桌面端 V3.6/${expectedVersion}，` +
+            `后台 ${identity.edition || '未知版本'}/${identity.version || '未知版本'}。` +
+            '请关闭旧程序后重新安装当前版本。'
+          )
+        }
+        backendIdentity = identity
         backendReady = true
         return
       }
-    } catch (_error) {}
+    } catch (error) {
+      if (String(error?.message || error).includes('前后端版本不一致')) throw error
+    }
     await new Promise((resolve) => setTimeout(resolve, 250))
   }
   throw new Error('本地AI服务启动超时')
@@ -246,6 +343,7 @@ async function startBackend() {
   })
   backendProcess.on('exit', (code) => {
     backendReady = false
+    backendIdentity = null
     mainWindow?.webContents.send('app:event', { type: 'backend-exit', code })
   })
   await waitForBackend()
@@ -280,8 +378,7 @@ async function syncGoofishCookie() {
   return { saved: true, count: relevant.length, at: saved.cookie_updated_at }
 }
 
-function createGoofishView() {
-  const goofishSession = session.fromPartition('persist:xianyu-main')
+async function createGoofishView() {
   goofishView = new WebContentsView({
     webPreferences: {
       session: goofishSession,
@@ -332,7 +429,7 @@ async function createWindow() {
   })
   if (isDev) await mainWindow.loadURL('http://127.0.0.1:5173')
   else await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
-  createGoofishView()
+  await createGoofishView()
   mainWindow.on('closed', () => {
     if (goofishView && !goofishView.webContents.isDestroyed()) goofishView.webContents.close()
     goofishView = null
@@ -345,6 +442,12 @@ function registerIpc() {
   ipcMain.handle('license:login', (_event, payload) => licenseLogin(payload || {}))
   ipcMain.handle('license:status', () => licenseStatus())
   ipcMain.handle('license:logout', () => licenseLogout())
+  ipcMain.handle('app:version', () => ({
+    edition: 'V3.6',
+    frontend_version: app.getVersion(),
+    backend_version: backendIdentity?.version || '',
+    build_commit: backendIdentity?.build_commit || ''
+  }))
   ipcMain.on('browser:set-bounds', (_event, bounds) => {
     if (!goofishView) return
     const safe = {
@@ -435,6 +538,9 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     console.error('V3 stage: app ready')
     registerIpc()
     console.error('V3 stage: IPC ready')
+    goofishSession = session.fromPartition('persist:xianyu-main')
+    await configureGoofishProxy(goofishSession)
+    console.error('V3 stage: network route ready')
     await startBackend()
     console.error('V3 stage: backend ready')
     await createWindow()

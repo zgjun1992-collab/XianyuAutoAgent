@@ -16,9 +16,70 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from app_store import AppStore, PolicyEngine, DEFAULT_POLICIES, find_unauthorized_promises
+from privacy_guard import redact_sensitive_text
 
 
 class XianyuLive:
+    TEMPLATE_SEGMENT_TOKEN = "{$分段符}"
+    TEMPLATE_IMAGE_PATTERN = re.compile(r"\{\$图片:(\d+)\}")
+    AFTERSALE_FOLLOWUP_NOTICE = "您的售后问题已记录并提交人工核实，通常会在72小时内处理，请耐心等待。"
+    PURCHASE_ORDER_GREETING_REPLY = "您好，请问有什么可以帮您？"
+
+    @staticmethod
+    def decode_sync_message(data):
+        """Decode both plaintext-base64 and encrypted sync payloads."""
+        try:
+            decoded = base64.b64decode(data).decode("utf-8")
+            return json.loads(decoded)
+        except Exception:
+            return json.loads(decrypt(data))
+
+    @classmethod
+    def parse_message_template(cls, text):
+        """Parse opt-in templates without changing ordinary reply behavior."""
+        source = str(text or "")
+        parts = []
+        cursor = 0
+        for match in cls.TEMPLATE_IMAGE_PATTERN.finditer(source):
+            before = source[cursor:match.start()]
+            for value in before.split(cls.TEMPLATE_SEGMENT_TOKEN):
+                value = value.strip()
+                if value:
+                    parts.append({"type": "text", "content": value})
+            parts.append({"type": "image", "asset_id": int(match.group(1))})
+            cursor = match.end()
+        for value in source[cursor:].split(cls.TEMPLATE_SEGMENT_TOKEN):
+            value = value.strip()
+            if value:
+                parts.append({"type": "text", "content": value})
+        return parts[:8]
+
+    async def send_message_template(self, ws, cid, toid, scope_id, item_id, text, *, sanitize=True):
+        """Send a saved first-reply/keyword template in order; ordinary replies never enter here."""
+        sent_text = []
+        parts = self.parse_message_template(text)
+        if not parts:
+            raise ValueError("首次回复没有可发送的文字或图片")
+        assets = {}
+        # Validate the whole template before the first WebSocket write. A stale
+        # image placeholder must not leave a partially delivered first reply.
+        for part in parts:
+            if part["type"] != "image":
+                continue
+            asset = self.app_store.get_image_asset(part["asset_id"])
+            if not asset or str(asset.get("item_id")) != str(item_id) or not asset.get("file_path"):
+                raise ValueError(f"首次回复引用的图片 #{part['asset_id']} 不存在或不属于当前商品")
+            assets[part["asset_id"]] = asset
+        for index, part in enumerate(parts):
+            if part["type"] == "text":
+                value = self.sanitize_buyer_reply(part["content"]) if sanitize else part["content"]
+                await self.send_msg(ws, cid, toid, value, sanitize=False)
+                sent_text.append(value)
+            else:
+                await self.send_image_asset(ws, cid, toid, scope_id, assets[part["asset_id"]])
+            if index + 1 < len(parts):
+                await asyncio.sleep(0.35)
+        return "\n\n".join(sent_text)
     def __init__(self, cookies_str, bot_instance=None, app_store=None, event_callback=None, interactive=True):
         self.xianyu = XianyuApis(interactive=interactive)
         self.base_url = 'wss://wss-goofish.dingtalk.com/'
@@ -50,11 +111,14 @@ class XianyuLive:
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
+        self.cookie_revision = 0
+        self.last_token_error = ""
         
         # 人工接管相关配置
         self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
         self.manual_mode_timeout = int(os.getenv("MANUAL_MODE_TIMEOUT", "3600"))  # 人工接管超时时间，默认1小时
         self.manual_mode_timestamps = {}  # 记录进入人工模式的时间
+        self._first_reply_locks = {}
         
         # 消息过期时间配置
         self.message_expire_time = int(os.getenv("MESSAGE_EXPIRE_TIME", "300000"))  # 消息过期时间，默认5分钟
@@ -74,6 +138,7 @@ class XianyuLive:
         self._message_generations = {}
         self._message_buffers = {}
         self._recent_buyer_media = {}
+        self._recent_buyer_locations = {}
         self._media_notice_times = {}
         self._seen_messages = set()
         self._review_notified_scopes = set()
@@ -82,6 +147,10 @@ class XianyuLive:
         self._order_routes = {}
         self._store_contexts = {}
         self._query_contexts = {}
+        self._listing_status_cache = None
+        self.listing_status_ttl = max(
+            10.0, float(os.getenv("LISTING_STATUS_TTL", "60"))
+        )
 
     def emit_event(self, event_type, **payload):
         if self.event_callback:
@@ -153,6 +222,38 @@ class XianyuLive:
         return "当前商品资料暂时无法准确回答这个问题，请补充具体想查询的商品、门店或使用条件。"
 
     @staticmethod
+    def model_reply_operational_issue(reply, order_context=None):
+        """Reject model claims about actions or order state the process did not verify."""
+        value = str(reply or "")
+        order_status = str((order_context or {}).get("status") or "")
+        unverified_actions = (
+            r"订单号(?:已经|已)?(?:查询|查到|核实)",
+            r"(?:已经|已)(?:收到|查到|核实)(?:您的)?(?:退款|售后)申请",
+            r"(?:我|我们|这边)(?:已经|已)?(?:帮您|帮你)?(?:处理|提交|登记)(?:退款|售后)",
+            r"(?:已经|已)(?:为您|为你)?(?:转接|转交)(?:给)?人工",
+        )
+        for pattern in unverified_actions:
+            if re.search(pattern, value):
+                return "模型草稿声称执行了系统未完成的订单或人工操作"
+        if re.search(r"订单(?:尚未|还未|没有)付款|订单未付款", value):
+            if not any(word in order_status for word in ("待付款", "等待买家付款")):
+                return "模型草稿声称了未核验的未付款状态"
+        if re.search(r"订单(?:已经|已)付款|确认(?:已经|已)付款", value):
+            if not any(word in order_status for word in ("已付款", "待发货", "等待卖家发货", "已发货")):
+                return "模型草稿声称了未核验的已付款状态"
+        return ""
+
+    @staticmethod
+    def operational_fallback_reply(user_message):
+        """Acknowledge buyer-provided state without pretending it was queried."""
+        text = re.sub(r"\s+", "", str(user_message or ""))
+        if re.search(r"(?:已经|已)付款", text):
+            return "已了解您反馈订单已经付款。当前无法直接核验订单状态；请说明是要咨询发券、核销还是退款。"
+        if re.search(r"(?:已经|已)(?:申请|提交)", text):
+            return "已了解您反馈已经提交申请。当前无法直接核验申请状态；如需人工处理，请回复“人工”。"
+        return "当前无法直接核验订单或售后状态；请说明具体问题，如需人工处理请回复“人工”。"
+
+    @staticmethod
     def media_marker(text):
         value = str(text or "")
         if re.search(r"(?:\[\s*图片\s*\]|图片消息|买家发送了一张图片)", value):
@@ -205,6 +306,63 @@ class XianyuLive:
         return ""
 
     @staticmethod
+    def inbound_location_card(payload):
+        """Extract a buyer-shared store name from a platform location card."""
+        if not isinstance(payload, (dict, list)):
+            return ""
+        values = []
+        stack = [payload]
+        visited = 0
+        location_hint = False
+        location_value_keys = {
+            "poiname", "placename", "locationname", "address",
+            "poiaddress", "locationaddress",
+        }
+        generic_value_keys = {"title", "name", "remindercontent"}
+        while stack and visited < 160:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, list):
+                stack.extend(current[:40])
+                continue
+            if not isinstance(current, dict):
+                continue
+            for key, value in current.items():
+                key_norm = re.sub(r"[^a-z]", "", str(key).lower())
+                if key_norm in {"contenttype", "messagetype", "msgtype", "cardtype", "type"}:
+                    location_hint = location_hint or bool(re.search(
+                        r"location|poi|map|place|地址|位置|地图", str(value), re.I
+                    ))
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+                elif isinstance(value, str) and key_norm in location_value_keys | generic_value_keys:
+                    text = value.strip()
+                    if text:
+                        # Only platform location fields or an explicit location
+                        # card type establish card identity.  A normal text
+                        # message is also carried in reminderContent and may be
+                        # exactly "和平店"/"汕头"; inferring a card from those
+                        # words silently drops a valid store query upstream.
+                        if key_norm in location_value_keys:
+                            location_hint = True
+                            priority = 0 if key_norm in {
+                                "poiname", "placename", "locationname",
+                            } else 2
+                        else:
+                            priority = 1
+                        values.append((priority, text))
+        if not location_hint:
+            return ""
+        for _, value in sorted(values, key=lambda item: item[0]):
+            inner = re.search(r"[（(]([^（）()\n]{2,36}(?:店|商场|广场|MALL|Mall|mall))[）)]", value)
+            if inner:
+                return inner.group(1).strip()
+            match = re.search(r"([^\n，,。]{2,40}(?:店|商场|广场|MALL|Mall|mall))", value)
+            if match:
+                return match.group(1).strip("()（）[]【】 ")
+        return ""
+
+    @staticmethod
     def is_media_dependent_text(text):
         """Detect short follow-ups whose missing object can only be in nearby media."""
         value = re.sub(r"[\s，,。.!！?？~～]+", "", str(text or "")).lower()
@@ -240,8 +398,14 @@ class XianyuLive:
 
     async def _send_approved(self, audit, final_reply, resume_ai=True):
         final_reply = self.sanitize_buyer_reply(final_reply)
-        await self.send_msg(self.ws, audit["chat_id"], audit["user_id"], final_reply)
         scope_id = audit.get("scope_id") or self.scope_key(audit["chat_id"], audit["item_id"])
+        if audit.get("image_asset_id"):
+            await self.send_message_template(
+                self.ws, audit["chat_id"], audit["user_id"], scope_id,
+                audit["item_id"], final_reply,
+            )
+        else:
+            await self.send_msg(self.ws, audit["chat_id"], audit["user_id"], final_reply)
         self.context_manager.add_message_by_chat(
             scope_id, self.myid, audit["item_id"], "assistant", final_reply
         )
@@ -286,22 +450,50 @@ class XianyuLive:
         """刷新token"""
         try:
             logger.info("开始刷新token...")
-            
-            # 获取新token（如果Cookie失效，get_token会直接退出程序）
-            token_result = self.xianyu.get_token(self.device_id)
+
+            # requests 是同步库，绝不能在 WebSocket event loop 中直接调用。
+            # 否则网络异常会让状态永久停在 starting，连 stop/reconnect 都无法执行。
+            cookie_revision = getattr(self, "cookie_revision", 0)
+            token_result = await asyncio.wait_for(
+                asyncio.to_thread(self.xianyu.get_token, self.device_id),
+                timeout=45,
+            )
+            if cookie_revision != getattr(self, "cookie_revision", 0):
+                logger.info("Cookie 已更新，丢弃旧 Cookie 获取到的 Token")
+                return None
             if 'data' in token_result and 'accessToken' in token_result['data']:
                 new_token = token_result['data']['accessToken']
                 self.current_token = new_token
                 self.last_token_refresh_time = time.time()
+                self.last_token_error = ""
                 logger.info("Token刷新成功")
                 return new_token
             else:
                 logger.error(f"Token刷新失败: {token_result}")
+                self.last_token_error = "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
                 return None
                 
         except Exception as e:
             logger.error(f"Token刷新异常: {str(e)}")
+            self.last_token_error = str(e) or "闲鱼消息Token获取失败"
             return None
+
+    def update_cookie(self, cookie_text):
+        """Hot-swap credentials and reconnect without keeping a stale startup."""
+        cookie_text = str(cookie_text or "").strip()
+        if not cookie_text or cookie_text == getattr(self, "cookies_str", ""):
+            return False
+        self.cookies_str = cookie_text
+        self.cookies = trans_cookies(cookie_text)
+        self.xianyu.session.cookies.clear()
+        self.xianyu.session.cookies.update(self.cookies)
+        self.cookie_revision = getattr(self, "cookie_revision", 0) + 1
+        self.current_token = None
+        self.last_token_refresh_time = 0
+        self.connection_restart_flag = True
+        if self.loop and self.ws:
+            asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
+        return True
 
     async def token_refresh_loop(self):
         """Token刷新循环"""
@@ -389,12 +581,20 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def _send_and_record_auto_reply(
-        self, websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply
+        self, websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply,
+        reply_parts=None,
     ):
         """Persist a reply as sent only after the WebSocket write succeeds."""
         final_reply = self.sanitize_buyer_reply(final_reply)
         try:
-            await self.send_msg(websocket, chat_id, send_user_id, final_reply)
+            parts = [str(value).strip() for value in (reply_parts or []) if str(value).strip()]
+            if parts:
+                for index, value in enumerate(parts):
+                    await self.send_msg(websocket, chat_id, send_user_id, value)
+                    if index + 1 < len(parts):
+                        await asyncio.sleep(0.35)
+            else:
+                await self.send_msg(websocket, chat_id, send_user_id, final_reply)
         except Exception:
             # Keep the draft for diagnosis/retry, but never claim delivery when
             # the transport rejected the message.
@@ -484,7 +684,10 @@ class XianyuLive:
         
         if not self.current_token:
             logger.error("无法获取有效token，初始化失败")
-            raise Exception("Token获取失败")
+            raise RuntimeError(
+                self.last_token_error
+                or "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
+            )
             
         msg = {
             "lwp": "/reg",
@@ -538,6 +741,27 @@ class XianyuLive:
             )
         except Exception:
             return False
+
+    @staticmethod
+    def split_sync_packages(message_data):
+        """Preserve every event when Xianyu batches several sync entries."""
+        try:
+            push = message_data["body"]["syncPushPackage"]
+            entries = list(push.get("data") or [])
+        except (KeyError, TypeError):
+            return [message_data]
+        if len(entries) <= 1:
+            return [message_data]
+        packages = []
+        for entry in entries:
+            package = dict(message_data)
+            body = dict(message_data.get("body") or {})
+            single_push = dict(push)
+            single_push["data"] = [entry]
+            body["syncPushPackage"] = single_push
+            package["body"] = body
+            packages.append(package)
+        return packages
 
     def is_typing_status(self, message):
         """判断是否为用户正在输入状态消息"""
@@ -630,6 +854,10 @@ class XianyuLive:
 
     def is_manual_mode(self, chat_id):
         """检查特定会话是否处于人工接管模式"""
+        state_getter = getattr(self.app_store, "get_conversation_state", None)
+        if state_getter and state_getter(chat_id) == "manual":
+            self.manual_mode_conversations.add(chat_id)
+            return True
         if chat_id not in self.manual_mode_conversations:
             return False
         
@@ -647,6 +875,9 @@ class XianyuLive:
         """进入人工接管模式"""
         self.manual_mode_conversations.add(chat_id)
         self.manual_mode_timestamps[chat_id] = time.time()
+        pause = getattr(self.app_store, "pause_conversation", None)
+        if pause:
+            pause(chat_id, "manual")
 
     @staticmethod
     def requires_persistent_manual_takeover(deterministic, user_message=""):
@@ -655,12 +886,101 @@ class XianyuLive:
         if kind in {
             "purchase_order_price", "refund_quality", "refund_dispute",
             "expiry_quality", "code_operation_review", "code_link_escalation",
+            "sensitive_aftersale", "refund_status_review", "delivery_mismatch_review",
         }:
             return True
         return bool(re.search(
             r"赔偿|补偿|投诉|平台介入|强制退款|必须退款|立即退款|马上退款",
             str(user_message or ""),
         ))
+
+    @staticmethod
+    def is_aftersale_entry_message(message="", order_context=None):
+        """Enter aftersales only after the platform confirms a paid/current order."""
+        text = re.sub(r"\s+", "", str(message or ""))
+        order_status = str((order_context or {}).get("status") or "")
+        if re.search(r"退款|退货|售后|纠纷", order_status):
+            return True
+        paid_order = bool(re.search(
+            r"已付款|买家已付款|等待卖家发货|待发货|已发货|等待买家收货|"
+            r"确认收货|交易成功|已完成",
+            order_status,
+        )) and not bool(re.search(r"待付款|等待买家付款|未付款|已取消|交易关闭", order_status))
+        if not text or not paid_order:
+            return False
+        # Questions about how to use/redeem a purchased coupon are normal
+        # pre-use consultations, not proof that an aftersales incident occurred.
+        operational_question = bool(re.search(
+            r"(?:怎么|如何|需要|要不要|是不是|可以|能否|能不能|吗|对吧).{0,10}"
+            r"(?:核销|扫码|扫几次|一起用|叠加)|"
+            r"(?:核销|扫码|扫几次|一起用|叠加).{0,10}(?:怎么|如何|需要|吗|对吧)",
+            text,
+        ))
+        if operational_question and not re.search(r"失败|不了|不能用|无效|错误|拒绝|过期|失效", text):
+            return False
+        intrinsic_fault = bool(re.search(
+            r"券码(?:无效|失效|错误|不能用|用不了)|卡券(?:无效|失效|不能用|用不了)|"
+            r"(?:但是|但|已经|现在)(?:不能用|用不了)|"
+            r"核销(?:失败|不了|不成功)|无法核销|不能核销|"
+            r"发错(?:券|码|商品)|少发|漏发|没收到(?:券|码)|未收到(?:券|码)|"
+            r"收到(?:的|了)?.{0,8}(?:过期|失效)|发来(?:的)?.{0,8}(?:过期|失效)",
+            text,
+        ))
+        completed_problem = bool(re.search(
+            r"(?:卡券|券码|这个券|这张券).{0,8}(?:已经|过期了|失效了)|"
+            r"(?:退款|退货|售后)(?:申请)?(?:已提交|提交了|申请了|处理中|不到账|金额不对)",
+            text,
+        ))
+        explicit_refund = bool(re.search(
+            r"我要退款|申请退款|已经申请退款|退款不到账|退款金额不对|退货|售后申请",
+            text,
+        ))
+        return intrinsic_fault or completed_problem or explicit_refund
+
+    async def send_aftersale_state_reply(
+        self, websocket, chat_id, send_user_id, send_user_name, scope_id,
+        item_id, user_message, policies, url_info="", *, first=False,
+    ):
+        """Send the live configured policy once, then a fixed human-processing receipt."""
+        if first:
+            reply = str(
+                policies.get("aftersale_policy_summary")
+                or policies.get("aftersale_policy_raw")
+                or DEFAULT_POLICIES.get("aftersale_policy_summary")
+                or ""
+            ).strip()
+        else:
+            reply = self.AFTERSALE_FOLLOWUP_NOTICE
+
+        self.context_manager.add_message_by_chat(
+            scope_id, send_user_id, item_id, "user", user_message
+        )
+        creator = getattr(self.app_store, "create_audit", None)
+        audit_id = None
+        if creator:
+            order_route = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            audit_id = creator(
+                scope_id=scope_id, chat_id=chat_id, user_id=send_user_id,
+                user_name=send_user_name, item_id=item_id,
+                user_message=user_message, draft_reply=reply, final_reply=reply,
+                action="review", reasons=["售后会话已提交人工处理"], status="pending",
+                order_id=order_route.get("order_id", ""), conversation_url=url_info,
+                order_url=order_route.get("order_url", ""),
+            )
+        if reply:
+            await self.send_msg(websocket, chat_id, send_user_id, reply, sanitize=False)
+            self.context_manager.add_message_by_chat(
+                scope_id, self.myid, item_id, "assistant", reply
+            )
+        if first:
+            pause = getattr(self.app_store, "pause_conversation", None)
+            if pause:
+                pause(scope_id, "aftersale")
+        self.emit_event(
+            "aftersale_started" if first else "aftersale_followup",
+            audit_id=audit_id, chat_id=chat_id, item_id=item_id, scope_id=scope_id,
+        )
+        return reply
 
     @staticmethod
     def should_silence_disabled_purchase_order_greeting(product, message=""):
@@ -712,13 +1032,67 @@ class XianyuLive:
 
     @staticmethod
     def should_attach_first_reply(enabled, first_reply, deterministic_kind=""):
-        """Honor the product-card switch on the first normal buyer message."""
-        excluded = {
-            "media", "offline", "refund_quality", "refund_process",
-            "refund_dispute", "expiry_quality", "coupon_type",
+        """Return whether this product has an enabled greeting available."""
+        return bool(enabled and str(first_reply or "").strip())
+
+    @staticmethod
+    def is_product_offline(product):
+        return str((product or {}).get("item_status") or "").strip().lower() in {
+            "offline", "off_shelf", "offshelf", "deleted", "下架",
         }
-        return bool(enabled and str(first_reply or "").strip()
-                    and str(deterministic_kind or "") not in excluded)
+
+    @staticmethod
+    def _listing_card_identity(card):
+        """Return ``(item_id, is_onsale)`` from one marketplace list card."""
+        data = card.get("cardData") if isinstance(card, dict) else None
+        data = data if isinstance(data, dict) else (card if isinstance(card, dict) else {})
+        detail = data.get("detailParams") or {}
+        item_id = str(detail.get("itemId") or data.get("id") or "").strip()
+        raw_status = str(data.get("itemStatus", "")).strip().lower()
+        return item_id, raw_status in {"0", "onsale", "on_sale", "selling"}
+
+    async def refresh_current_listing_status(self, item_id, product):
+        """Refresh the listing gate before any first reply or business reply.
+
+        The complete seller list is cached briefly per live account.  A missing
+        product is considered offline only when pagination explicitly completed;
+        API failures preserve the last local state and are logged by the caller.
+        """
+        product = product or None
+        if not product or str(product.get("source_type") or "") != "goofish":
+            return product
+        now = time.monotonic()
+        cache = getattr(self, "_listing_status_cache", None)
+        ttl = float(getattr(self, "listing_status_ttl", 60.0))
+        if not cache or now - float(cache.get("checked_at") or 0) >= ttl:
+            cards = await asyncio.to_thread(self.xianyu.get_all_user_items, self.myid)
+            statuses = {}
+            for card in cards or []:
+                card_item_id, is_onsale = self._listing_card_identity(card)
+                if card_item_id:
+                    statuses[card_item_id] = is_onsale
+            cache = {
+                "checked_at": now,
+                "statuses": statuses,
+                "complete": bool(getattr(self.xianyu, "last_item_list_complete", False)),
+            }
+            self._listing_status_cache = cache
+
+        statuses = cache.get("statuses") or {}
+        remote_state = statuses.get(str(item_id))
+        if remote_state is None and not cache.get("complete"):
+            return product
+        normalized = "onsale" if remote_state else "offline"
+        if normalized == "offline" or normalized != str(product.get("item_status") or "").lower():
+            setter = getattr(self.app_store, "set_product_listing_status", None)
+            updated = setter(item_id, normalized) if setter else None
+            if updated:
+                return updated
+            product = dict(product)
+            product["item_status"] = normalized
+            if normalized == "offline":
+                product["enabled"] = 0
+        return product
 
     def prepare_product_first_reply(self, product):
         """Preserve an explicitly saved welcome; sanitize automatic drafts."""
@@ -730,12 +1104,116 @@ class XianyuLive:
             return text
         return self.sanitize_buyer_reply(text)
 
+    @staticmethod
+    def should_suppress_first_reply_for_question(product, message):
+        """The enabled first reply is mandatory for every real first buyer message."""
+        return False
+
+    async def send_required_first_reply(
+        self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
+        message="",
+    ):
+        """Send the configured product introduction once before a normal first answer."""
+        if (
+            self.is_product_offline(product)
+            or int((conversation or {}).get("first_reply_sent", 0))
+            or not self.should_attach_first_reply(
+                bool((product or {}).get("first_reply_enabled", True)),
+                (product or {}).get("first_reply_text"),
+            )
+        ):
+            return False
+
+        lock_map = getattr(self, "_first_reply_locks", None)
+        if lock_map is None:
+            lock_map = self._first_reply_locks = {}
+        lock = lock_map.setdefault(scope_id, asyncio.Lock())
+        async with lock:
+            durable_getter = getattr(self.app_store, "is_first_reply_sent", None)
+            if durable_getter and durable_getter(scope_id):
+                return False
+            if self.should_suppress_first_reply_for_question(product, message):
+                self.app_store.mark_first_reply_sent(scope_id)
+                self.emit_event(
+                    "product_first_reply_suppressed", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message="买家首条为明确业务问题，仅发送对应答案",
+                )
+                return False
+            reply = self.prepare_product_first_reply(product)
+            if not reply:
+                return False
+            await self.send_message_template(
+                websocket, chat_id, send_user_id, scope_id, item_id,
+                reply, sanitize=False,
+            )
+            self.context_manager.add_message_by_chat(
+                scope_id, self.myid, item_id, "assistant", reply
+            )
+            self.app_store.mark_first_reply_sent(scope_id)
+            self.emit_event(
+                "product_first_reply", chat_id=chat_id, item_id=item_id,
+                scope_id=scope_id, message="商品首次回复已在问题答案前发送",
+            )
+            return True
+
+    async def handle_purchase_order_buyer_message(
+        self, websocket, chat_id, send_user_id, scope_id, item_id,
+        product, conversation, message,
+    ):
+        """Keep purchase-order products out of every normal business route."""
+        product = product or {}
+        if str(product.get("coupon_type") or "").strip() != "purchase_order":
+            return False
+        product_offline = self.is_product_offline(product)
+        first_reply_sent_now = False
+        if not product_offline:
+            try:
+                first_reply_sent_now = await self.send_required_first_reply(
+                    websocket, chat_id, send_user_id, scope_id, item_id,
+                    product, conversation, message,
+                )
+            except Exception as exc:
+                logger.error(f"代买单首次回复发送失败: {exc}")
+                self.emit_event(
+                    "product_first_reply_error", chat_id=chat_id,
+                    item_id=item_id, scope_id=scope_id, message=str(exc),
+                )
+                return True
+        self.context_manager.add_message_by_chat(
+            scope_id, send_user_id, item_id, "user", message
+        )
+        if first_reply_sent_now:
+            logger.info(f"代买单仅发送商品首次回复 (会话: {chat_id})")
+            return True
+        if (
+            product_offline
+            or not bool(product.get("enabled", 1))
+            or self.is_manual_mode(scope_id)
+            or self.should_silence_disabled_purchase_order_greeting(product, message)
+            or not self.should_send_first_reply(message)
+        ):
+            logger.info(f"代买单非寒暄消息保持静默 (会话: {chat_id})")
+            return True
+        reply = self.PURCHASE_ORDER_GREETING_REPLY
+        await self.send_msg(websocket, chat_id, send_user_id, reply)
+        self.context_manager.add_message_by_chat(
+            scope_id, self.myid, item_id, "assistant", reply
+        )
+        self.emit_event(
+            "purchase_order_greeting", chat_id=chat_id, item_id=item_id,
+            scope_id=scope_id,
+        )
+        return True
+
     def exit_manual_mode(self, chat_id):
         """退出人工接管模式"""
         self.manual_mode_conversations.discard(chat_id)
         if chat_id in self.manual_mode_timestamps:
             del self.manual_mode_timestamps[chat_id]
         self._review_notified_scopes.discard(chat_id)
+        resume = getattr(self.app_store, "resume_conversation", None)
+        if resume:
+            resume(chat_id)
 
     def toggle_manual_mode(self, chat_id):
         """切换人工接管模式"""
@@ -805,11 +1283,25 @@ class XianyuLive:
         reminder = reminder if isinstance(reminder, dict) else {}
         status = str(reminder.get("redReminder") or "").strip()
         serialized = json.dumps(message, ensure_ascii=False)
-        if not status:
-            if re.search(r"我已拍下\s*[,，]?\s*待付款|等待买家付款|已拍下[^\n]{0,12}待付款", serialized):
-                status = "等待买家付款"
-            elif re.search(r"(?:买家已申请|退款申请|退货退款申请|等待卖家处理|售后申请)", serialized):
-                status = "退款申请"
+        # This card is generated by Xianyu after the seller changes an order
+        # price.  It is not a buyer consultation and must never enter the price
+        # or manual-review routes.
+        if reminder and re.search(
+            r"我已(?:修改|调整)价格[，,、 ]*(?:等待|请等)(?:你|买家)付款|"
+            r"请确认价格与协商一致[，,、 ]*并在\d+小时内付款",
+            serialized,
+        ):
+            logger.info("检测到卖家改价后的平台待付款卡片，跳过自动回复")
+            return True
+        # Some waiting-payment cards contain a non-empty generic redReminder
+        # such as “请双方沟通及时确认价格”.  The explicit card state must win.
+        if re.search(r"我已拍下\s*[,，]?\s*待付款|等待买家付款|已拍下[^\n]{0,12}待付款", serialized):
+            status = "等待买家付款"
+        elif not status and re.search(
+            r"(?:买家已申请|退款申请|退货退款申请|等待卖家处理|售后申请)",
+            serialized,
+        ):
+            status = "退款申请"
         refund_status = any(word in status for word in ("退款", "退货", "售后", "纠纷"))
         ordinary_order_status = any(word in status for word in (
             "等待买家付款", "待付款", "等待卖家发货", "待发货", "已付款",
@@ -898,6 +1390,10 @@ class XianyuLive:
                     "order_url": url_info,
                 })
             logger.info(f"退款订单状态：{status}")
+            if scope_id:
+                pause = getattr(self.app_store, "pause_conversation", None)
+                if pause:
+                    pause(scope_id, "aftersale_pending")
             self.emit_event("refund_order", message=status, item_id=item_id, order_id=order_id)
             return True
         if status != "等待买家付款":
@@ -910,6 +1406,9 @@ class XianyuLive:
         scope_id = self.scope_key(chat_id, item_id)
         product_getter = getattr(self.app_store, "get_v2_product", None)
         product = product_getter(item_id) if product_getter else None
+        if str((product or {}).get("coupon_type") or "").strip() == "purchase_order":
+            logger.info(f"代买单待付款卡片保持静默 (商品: {item_id})")
+            return True
         if product and product.get("item_status") != "offline" and not bool(product.get("enabled", 1)):
             logger.info(f"商品 {item_id} 已关闭AI客服，跳过付款前自动提示")
             return True
@@ -931,7 +1430,7 @@ class XianyuLive:
         self.emit_event("order_payment_notice", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
         return True
 
-    async def handle_message(self, message_data, websocket):
+    async def handle_message(self, message_data, websocket, send_ack=True):
         """处理所有类型的消息"""
         try:
 
@@ -950,7 +1449,8 @@ class XianyuLive:
                     ack["headers"]["ua"] = message["headers"]["ua"]
                 if 'dt' in message["headers"]:
                     ack["headers"]["dt"] = message["headers"]["dt"]
-                await websocket.send(json.dumps(ack))
+                if send_ack:
+                    await websocket.send(json.dumps(ack))
             except Exception as e:
                 pass
 
@@ -969,15 +1469,9 @@ class XianyuLive:
             # 解密数据
             try:
                 data = sync_data["data"]
-                try:
-                    data = base64.b64decode(data).decode("utf-8")
-                    data = json.loads(data)
-                    # logger.info(f"无需解密 message: {data}")
-                    return
-                except Exception as e:
-                    # logger.info(f'加密数据: {data}')
-                    decrypted_data = decrypt(data)
-                    message = json.loads(decrypted_data)
+                # Plain base64 JSON is a valid buyer event too.  The old branch
+                # returned here and silently discarded that entire message.
+                message = self.decode_sync_message(data)
             except Exception as e:
                 logger.error(f"消息解密失败: {e}")
                 return
@@ -1000,6 +1494,7 @@ class XianyuLive:
             send_user_name = reminder["reminderTitle"]
             send_user_id = reminder["senderUserId"]
             send_message = str(reminder.get("reminderContent") or "").strip()
+            location_card = self.inbound_location_card(reminder)
             payload_marker = self.inbound_media_marker(reminder)
             if payload_marker and not self.media_marker(send_message):
                 send_message = (
@@ -1023,6 +1518,16 @@ class XianyuLive:
 
             if send_user_id != self.myid:
                 self._buyer_routes[str(send_user_id)] = (str(chat_id), str(item_id))
+                if location_card:
+                    locations = getattr(self, "_recent_buyer_locations", None)
+                    if locations is None:
+                        self._recent_buyer_locations = locations = {}
+                    locations[scope_id] = (time.monotonic(), location_card)
+                    # A shared POI card supplies context rather than a complete
+                    # question. Wait for the buyer's following “可以用吗”.
+                    if not re.search(r"(?:可以|能|可)(?:使用|用)|支持吗|适用吗", send_message):
+                        logger.info(f"已记录买家发送的门店位置卡：{location_card}")
+                        return
 
             if self.is_recall_message(send_message):
                 self._message_generations[scope_id] = self._message_generations.get(scope_id, 0) + 1
@@ -1049,8 +1554,22 @@ class XianyuLive:
                 self._seen_messages.clear()
 
             if send_user_id != self.myid:
+                self.emit_event(
+                    "buyer_message_received", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message_id=message_id,
+                    message=redact_sensitive_text(send_message),
+                )
+
+            if send_user_id != self.myid:
                 marker = self.media_marker(send_message)
                 now_monotonic = time.monotonic()
+                recent_location = getattr(self, "_recent_buyer_locations", {}).get(scope_id)
+                if (
+                    not location_card and recent_location
+                    and now_monotonic - recent_location[0] <= 1800
+                    and self.is_media_dependent_text(send_message)
+                ):
+                    send_message = f"{recent_location[1]}{send_message}"
                 if marker:
                     self._recent_buyer_media[scope_id] = (now_monotonic, marker)
                 else:
@@ -1113,35 +1632,91 @@ class XianyuLive:
                 self._store_contexts.pop(scope_id, None)
                 self._query_contexts.pop(scope_id, None)
                 self._recent_buyer_media.pop(scope_id, None)
+                getattr(self, "_recent_buyer_locations", {}).pop(scope_id, None)
                 self._media_notice_times.pop(scope_id, None)
                 self.emit_event("conversation_reset", chat_id=chat_id, item_id=item_id, scope_id=scope_id)
-            if current_product and not bool(current_product.get("enabled", 1)):
-                first_reply = str(current_product.get("first_reply_text") or "").strip()
-                first_reply_enabled = bool(current_product.get("first_reply_enabled", True))
-                product_online = current_product.get("item_status") != "offline"
-                if (product_online and first_reply_enabled and first_reply
-                        and not int(conversation.get("first_reply_sent", 0))):
-                    reply = self.prepare_product_first_reply(current_product)
-                    try:
-                        await self.send_msg(
-                            websocket, chat_id, send_user_id, reply, sanitize=False
-                        )
-                    except Exception as exc:
-                        # AI-off products must not fall through to the global
-                        # exception reply when their one welcome message fails.
-                        logger.error(f"商品首次回复发送失败，保持静默: {exc}")
-                        self.emit_event(
-                            "product_first_reply_error", chat_id=chat_id,
-                            item_id=item_id, scope_id=scope_id, message=str(exc),
-                        )
-                        return
-                    self.context_manager.add_message_by_chat(
-                        scope_id, send_user_id, item_id, "user", send_message
+
+            # Chat-shaped platform notices are not buyer consultations and must
+            # never consume the mandatory first-reply flag.
+            if self.is_bracket_system_message(send_message):
+                logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
+                return
+            if self.is_system_message(message):
+                logger.debug("系统消息，跳过处理")
+                return
+
+            # Product state is a hard gate and must be fresh before the welcome.
+            # A stale two-day-old local sync must not let an offline listing send
+            # its old first reply, keyword rule or model answer.
+            if current_product:
+                try:
+                    current_product = await self.refresh_current_listing_status(
+                        item_id, current_product
                     )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", reply
+                except Exception as exc:
+                    logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+
+            # 代买单与普通卡券完全隔离：首次消息只发已配置的首次回复；
+            # 后续只处理纯寒暄，其余问题不进入业务规则、AI、审核或售后。
+            if await self.handle_purchase_order_buyer_message(
+                websocket, chat_id, send_user_id, scope_id, item_id,
+                current_product, conversation, send_message,
+            ):
+                return
+
+            # Aftersales owns the conversation before the normal product welcome.
+            # The first entry sends the policy currently saved in the backend;
+            # later buyer messages receive only the human-processing receipt.
+            conversation_state = str(
+                conversation.get("state")
+                or (getattr(self.app_store, "get_conversation_state", lambda _scope: "")(scope_id))
+                or ""
+            )
+            if conversation_state == "aftersale":
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=False,
+                )
+                return
+            if conversation_state == "aftersale_pending":
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=True,
+                )
+                return
+            order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            if self.is_aftersale_entry_message(send_message, order_context):
+                await self.send_aftersale_state_reply(
+                    websocket, chat_id, send_user_id, send_user_name, scope_id,
+                    item_id, send_message, policies, url_info, first=True,
+                )
+                return
+
+            product_offline = self.is_product_offline(current_product)
+            first_reply_sent_now = False
+            if current_product and not product_offline:
+                try:
+                    first_reply_sent_now = await self.send_required_first_reply(
+                        websocket, chat_id, send_user_id, scope_id, item_id,
+                        current_product, conversation, send_message,
                     )
-                    self.app_store.mark_first_reply_sent(scope_id)
+                    if first_reply_sent_now:
+                        await asyncio.sleep(0.25)
+                except Exception as exc:
+                    # A question answer must never overtake a required welcome.
+                    # Keep the durable flag unset so the next delivery can retry.
+                    logger.error(f"商品首次回复发送失败，暂不发送问题答案: {exc}")
+                    self.emit_event(
+                        "product_first_reply_error", chat_id=chat_id,
+                        item_id=item_id, scope_id=scope_id, message=str(exc),
+                    )
+                    return
+
+            if current_product and not bool(current_product.get("enabled", 1)) and not product_offline:
+                self.context_manager.add_message_by_chat(
+                    scope_id, send_user_id, item_id, "user", send_message
+                )
+                if first_reply_sent_now:
                     self.emit_event(
                         "product_first_reply_only", chat_id=chat_id, item_id=item_id,
                         scope_id=scope_id, message="AI客服关闭，仅发送商品首次回复",
@@ -1154,20 +1729,23 @@ class XianyuLive:
                     scope_id=scope_id, message="当前商品已关闭AI客服",
                 )
                 return
-            if self.should_silence_disabled_purchase_order_greeting(
+            if not product_offline and self.should_silence_disabled_purchase_order_greeting(
                 current_product, send_message
             ):
                 logger.info(f"代买单商品已关闭首次回复，纯问候保持静默 (会话: {chat_id})")
                 return
             
-            logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
+            logger.info(
+                f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, "
+                f"会话: {chat_id}, 消息: {redact_sensitive_text(send_message)}"
+            )
             
             
             prompt_setter = getattr(self.bot, "set_global_system_prompt", None)
             if prompt_setter:
                 prompt_setter(policies.get("global_system_prompt", ""))
             max_rounds = int(policies.get("max_reply_rounds", 25))
-            if int(conversation.get("ai_reply_count", 0)) >= max_rounds:
+            if not product_offline and int(conversation.get("ai_reply_count", 0)) >= max_rounds:
                 self.enter_manual_mode(scope_id)
                 self.app_store.pause_conversation(scope_id)
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
@@ -1186,58 +1764,15 @@ class XianyuLive:
                 )
                 return
 
-            # 人工接管期间不能让买家消息石沉大海。每条有效买家消息都即时
-            # 回执“正在人工审核”，但不让AI擅自处理风险事项。
-            if self.is_manual_mode(scope_id):
-                # A greeting is not a risky aftersales action.  Keep the
-                # takeover state for the real case, but never answer “你好”
-                # with a 72-hour manual-review notice.
-                if self.should_send_first_reply(send_message):
-                    first_reply = str((current_product or {}).get("first_reply_text") or "").strip()
-                    first_reply_enabled = bool(
-                        (current_product or {}).get("first_reply_enabled", True)
-                    )
-                    greeting_reply = (
-                        self.prepare_product_first_reply(current_product)
-                        if first_reply_enabled and first_reply
-                        else "您好，请问想咨询当前商品的使用规则、适用门店还是发货问题？"
-                    )
-                    if not (first_reply_enabled and first_reply):
-                        greeting_reply = self.sanitize_buyer_reply(greeting_reply)
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, greeting_reply,
-                        sanitize=not bool(first_reply_enabled and first_reply),
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, send_user_id, item_id, "user", send_message
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", greeting_reply
-                    )
-                    if first_reply_enabled and first_reply:
-                        self.app_store.mark_first_reply_sent(scope_id)
-                    logger.info(f"人工接管期间纯问候已使用正常问候回复 (会话: {chat_id})")
-                    return
-                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，发送人工审核回执")
+            # 人工接管是持久且静默的：记录买家后续消息供人工查看，禁止
+            # 自动问候、重复回执或任何模型回复打断人工处理。
+            if not product_offline and self.is_manual_mode(scope_id):
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
-                notice = str(policies.get("manual_review_notice") or "").strip()
-                if not notice:
-                    notice = "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。"
-                await self.send_msg(websocket, chat_id, send_user_id, notice)
-                self.context_manager.add_message_by_chat(
-                    scope_id, self.myid, item_id, "assistant", notice
-                )
                 self.emit_event(
-                    "manual_review_notice", chat_id=chat_id, item_id=item_id,
-                    scope_id=scope_id, message="人工接管期间已向买家发送审核回执",
+                    "manual_message_queued", chat_id=chat_id, item_id=item_id,
+                    scope_id=scope_id, message="人工接管期间收到买家新消息",
                 )
-                return
-            # 检查是否为带中括号的系统消息
-            if self.is_bracket_system_message(send_message):
-                logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
-                return
-            if self.is_system_message(message):
-                logger.debug("系统消息，跳过处理")
+                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，买家消息已静默留给人工")
                 return
             # 极速路径：先跑本地安全、门店、时间和套餐图片规则。
             # 命中后不读取商品页面、不调用模型，直接生成可审核/发送的答复。
@@ -1246,11 +1781,20 @@ class XianyuLive:
             image_asset = None
             actual_paid_amount = self.extract_actual_paid_amount(message)
             predecision = PolicyEngine(policies).evaluate(send_message, "")
+            # Product keyword rules are an exclusive local fast path. Resolve
+            # them before any semantic/model work, but never above offline.
+            image_resolver = getattr(self.app_store, "resolve_image_asset", None)
+            if image_resolver and not product_offline:
+                image_match = image_resolver(item_id, send_message, scope_id)
             resolver = getattr(self.app_store, "resolve_deterministic", None)
-            if resolver:
-                query_context = dict(conversation.get("query_context") or {})
-                query_context.update(self._query_contexts.get(scope_id) or {})
-                query_context.update(self._store_contexts.get(scope_id) or {})
+            query_context = dict(conversation.get("query_context") or {})
+            query_context.update(self._query_contexts.get(scope_id) or {})
+            query_context.update(self._store_contexts.get(scope_id) or {})
+
+            # Resolve high-confidence business questions locally first.  The
+            # model is only an intent/slot parser for unresolved or genuinely
+            # compound messages; it never writes the final business answer.
+            if resolver and not image_match:
                 try:
                     deterministic = resolver(
                         item_id, send_message, actual_paid_amount,
@@ -1259,6 +1803,73 @@ class XianyuLive:
                     )
                 except TypeError:
                     deterministic = resolver(item_id, send_message)
+
+            # For the small uncertain remainder, interpret buyer language into
+            # validated structure. Existing local rules still own every fact,
+            # decision, formatting rule and buyer-visible reply.
+            semantic_checker = getattr(self.bot, "should_analyze_message", None)
+            semantic_parser = getattr(self.bot, "analyze_message", None)
+            semantic_resolver = getattr(self.app_store, "resolve_semantic_analysis", None)
+            semantic_mode_getter = getattr(self.bot, "semantic_router_mode", None)
+            semantic_mode = semantic_mode_getter() if semantic_mode_getter else "on"
+            semantic_analysis = None
+            if (
+                not product_offline and not image_match
+                and predecision.action != "replace" and semantic_checker
+                and semantic_parser and semantic_resolver
+                and semantic_checker(send_message, deterministic)
+            ):
+                try:
+                    product_getter = getattr(self.app_store, "get_v2_product", None)
+                    product = product_getter(item_id) if product_getter else None
+                    sku_getter = getattr(self.app_store, "list_product_skus", None)
+                    sku_names = []
+                    if sku_getter and product:
+                        sku_names = [
+                            str(sku.get("sku_name") or "")
+                            for sku in sku_getter(item_id, product)
+                            if sku.get("sku_name")
+                        ]
+                    semantic_context = {
+                        "product_title": str((product or {}).get("title") or ""),
+                        "sku_names": sku_names[:30],
+                        "last_store_query": str(query_context.get("query") or ""),
+                        "last_store_names": [
+                            str(store.get("branch") or store.get("brand") or "")
+                            for store in list(query_context.get("matches") or [])[:3]
+                        ],
+                        "last_selected_sku": str(query_context.get("selected_sku_name") or ""),
+                        "pending_store_query": str(query_context.get("pending_store_query") or ""),
+                    }
+                    semantic_history = self.context_manager.get_context_by_chat(scope_id)
+                    semantic_analysis = await asyncio.to_thread(
+                        semantic_parser, send_message, semantic_history, semantic_context,
+                    )
+                    if semantic_mode == "shadow" and semantic_analysis:
+                        logger.info("语义路由处于影子模式：已记录意图，不改变当前回复")
+                except Exception as exc:
+                    logger.warning(f"前置语义识别失败，继续使用原有规则：{exc}")
+
+            # Apply model structure only when the completed local result
+            # is eligible. Review/silent/system answers cannot be overridden.
+            if (
+                semantic_mode == "on" and semantic_analysis
+                and not image_match and predecision.action != "replace"
+                and semantic_checker and semantic_resolver
+                and semantic_checker(send_message, deterministic)
+            ):
+                try:
+                    enhanced = semantic_resolver(
+                        item_id, send_message, semantic_analysis, actual_paid_amount,
+                        query_context or None,
+                        getattr(self, "_order_routes", {}).get(scope_id) or None,
+                        deterministic,
+                    )
+                    if enhanced:
+                        deterministic = enhanced
+                        logger.info("语义辅助仅完成问题拆分，答案已由本地规则重新核验")
+                except Exception as exc:
+                    logger.warning(f"语义辅助失败，保留原有命中结果：{exc}")
             if deterministic and deterministic.get("query_context_update"):
                 stored_context = dict(conversation.get("query_context") or {})
                 for key, value in deterministic["query_context_update"].items():
@@ -1281,35 +1892,57 @@ class XianyuLive:
                     if context_updater:
                         context_updater(scope_id, stored_context)
             if deterministic and "store_matches" in deterministic:
-                self._store_contexts[scope_id] = {
+                store_status = deterministic.get("store_status", "available")
+                store_matches = deterministic.get("store_matches", [])
+                trusted_qualities = {"exact", "contained", "area", "phonetic", "alias", "reordered"}
+                verified_store_context = bool(
+                    store_status == "unavailable"
+                    or (
+                        store_status == "available" and store_matches
+                        and all(
+                            match.get("match_quality") in trusted_qualities
+                            and (
+                                match.get("match_quality") != "phonetic"
+                                or float(match.get("score") or 0) >= 0.94
+                            )
+                            for match in store_matches
+                        )
+                    )
+                )
+                next_store_context = {
                     "query": deterministic.get("store_query", ""),
-                    "matches": deterministic.get("store_matches", []),
-                    "status": deterministic.get("store_status", "available"),
+                    "matches": store_matches,
+                    "status": store_status,
+                    "verified": verified_store_context,
+                    "store_sku_matrix": deterministic.get("store_sku_matrix", []),
                     "selected_sku_key": deterministic.get("query_context_update", {}).get(
                         "selected_sku_key", query_context.get("selected_sku_key", "")
                     ),
+                    "selected_sku_name": deterministic.get("query_context_update", {}).get(
+                        "selected_sku_name", query_context.get("selected_sku_name", "")
+                    ),
                 }
-            elif not deterministic or deterministic.get("kind") not in {"stores"}:
+                next_store_context.update(deterministic.get("store_context_update") or {})
+                self._store_contexts[scope_id] = next_store_context
+            elif not deterministic or deterministic.get("kind") not in {
+                "stores", "media", "media_context",
+            }:
                 self._store_contexts.pop(scope_id, None)
-            image_resolver = getattr(self.app_store, "resolve_image_asset", None)
-            if image_resolver:
-                image_match = image_resolver(item_id, send_message, scope_id)
             if deterministic and deterministic.get("kind") == "offline":
                 bot_reply = deterministic["reply"]
                 logger.info("当前商品已下架，停止商品内容回复")
-            elif predecision.action == "replace":
-                bot_reply = predecision.suggested_reply
-                logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif image_match and image_match.get("status") in {"allow", "review"}:
-                image_asset = image_match["asset"]
-                bot_reply = image_asset.get("reply_text") or "可以的，给您发一下对应的套餐图片。"
+                matched_asset = image_match["asset"]
+                image_asset = matched_asset if matched_asset.get("file_path") else None
+                bot_reply = matched_asset.get("reply_text") or "可以的，给您发一下对应的套餐图片。"
                 deterministic = {
                     "reply": bot_reply,
-                    "source": f"当前商品套餐图片：{image_asset.get('name', '')}",
+                    "source": f"当前商品关键词规则：{matched_asset.get('name', '')}",
                     "decision": image_match["status"],
+                    "kind": "keyword_rule",
                 }
                 logger.info(
-                    f"套餐图片命中: {image_asset.get('name')} ({image_match.get('status')})"
+                    f"关键词规则命中: {matched_asset.get('name')} ({image_match.get('status')})"
                 )
             elif image_match and image_match.get("status") == "cooldown":
                 bot_reply = "这张图片刚刚已经发过了，如需我可以继续帮您核对套餐信息。"
@@ -1318,6 +1951,9 @@ class XianyuLive:
                     "source": "套餐图片30分钟防重复规则",
                     "decision": "allow",
                 }
+            elif predecision.action == "replace":
+                bot_reply = predecision.suggested_reply
+                logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif deterministic:
                 bot_reply = deterministic["reply"]
                 logger.info(f"确定性规则命中: {deterministic.get('source', '')}")
@@ -1368,26 +2004,19 @@ class XianyuLive:
                         "kind": "model_grounding_guard",
                     }
                     logger.warning(grounding_issue)
-
-            # 每个“买家 + 当前商品”会话窗口只发送一次商品首次回复，
-            # 且首次回复与问题答案始终分两条发送，方便买家阅读。
-            first_reply_used = False
-            first_reply_to_send = ""
-            if not int(conversation.get("first_reply_sent", 0)):
-                product_getter = getattr(self.app_store, "get_v2_product", None)
-                product = product_getter(item_id) if product_getter else None
-                first_reply = str((product or {}).get("first_reply_text") or "").strip()
-                enabled = bool((product or {}).get("first_reply_enabled", True))
-                deterministic_kind = (deterministic or {}).get("kind")
-                # The product-card switch controls the welcome message: when
-                # enabled, send it on the buyer's first normal message even if
-                # that message already contains a concrete question.  The
-                # exclusions below remain reserved for media/offline/risky
-                # aftersales cases where a sales introduction is unsuitable.
-                if self.should_attach_first_reply(enabled, first_reply, deterministic_kind):
-                    if first_reply not in bot_reply:
-                        first_reply_to_send = self.prepare_product_first_reply(product)
-                    first_reply_used = True
+                else:
+                    operational_issue = self.model_reply_operational_issue(
+                        bot_reply, self._order_routes.get(scope_id)
+                    )
+                    if operational_issue:
+                        bot_reply = self.operational_fallback_reply(send_message)
+                        deterministic = {
+                            "reply": bot_reply,
+                            "source": operational_issue,
+                            "decision": "allow",
+                            "kind": "model_operational_guard",
+                        }
+                        logger.warning(operational_issue)
 
             # If a newer buyer message arrived while the model was working, do
             # not audit or send this now-stale reply.
@@ -1398,18 +2027,6 @@ class XianyuLive:
                 self.context_manager.add_message_by_chat(
                     scope_id, send_user_id, item_id, "user", send_message
                 )
-                first_reply_sent = False
-                if first_reply_to_send:
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, first_reply_to_send,
-                        sanitize=False,
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", first_reply_to_send
-                    )
-                    first_reply_sent = True
-                if first_reply_used and (first_reply_sent or not first_reply_to_send):
-                    self.app_store.mark_first_reply_sent(scope_id)
                 if deterministic.get("decision") == "silent":
                     logger.info(f"当前商品规则要求静默等待后续可处理问题 (会话: {chat_id})")
                     return
@@ -1477,6 +2094,9 @@ class XianyuLive:
                 order_url=(self._order_routes.get(scope_id) or {}).get("order_url", ""),
             )
 
+            if deterministic and deterministic.get("kind") == "manual_handoff":
+                self.enter_manual_mode(scope_id)
+
             if requires_review:
                 persistent_takeover = self.requires_persistent_manual_takeover(
                     deterministic, send_message
@@ -1508,20 +2128,6 @@ class XianyuLive:
                 return
 
             # 自动模式只有通过独立规则审查的草稿才会发送。
-            first_reply_sent = False
-            if first_reply_to_send:
-                try:
-                    await self.send_msg(
-                        websocket, chat_id, send_user_id, first_reply_to_send,
-                        sanitize=False,
-                    )
-                    self.context_manager.add_message_by_chat(
-                        scope_id, self.myid, item_id, "assistant", first_reply_to_send
-                    )
-                    first_reply_sent = True
-                    await asyncio.sleep(0.25)
-                except Exception as exc:
-                    logger.error(f"首次回复发送失败，继续发送问题答案: {exc}")
             # 模拟人工输入延迟
             if self.simulate_human_typing:
                 # 基础延迟 0-1秒 + 每字 0.1-0.3秒
@@ -1534,9 +2140,21 @@ class XianyuLive:
                 logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
                 await asyncio.sleep(total_delay)
                 
-            await self._send_and_record_auto_reply(
-                websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply
-            )
+            if image_asset:
+                await self.send_message_template(
+                    websocket, chat_id, send_user_id, scope_id, item_id, final_reply,
+                )
+                self.context_manager.add_message_by_chat(
+                    scope_id, self.myid, item_id, "assistant", final_reply
+                )
+                self.app_store.update_audit(audit_id, "sent", final_reply)
+                self.app_store.record_ai_reply(scope_id)
+            else:
+                await self._send_and_record_auto_reply(
+                    websocket, chat_id, send_user_id, scope_id, item_id, audit_id, final_reply,
+                    ([value for value in final_reply.split(self.TEMPLATE_SEGMENT_TOKEN) if value.strip()]
+                     if image_match else (deterministic or {}).get("reply_parts")),
+                )
             if deterministic and deterministic.get("kind") == "media":
                 recent_media = self._recent_buyer_media.get(scope_id)
                 self._media_notice_times[scope_id] = recent_media[0] if recent_media else time.monotonic()
@@ -1551,12 +2169,10 @@ class XianyuLive:
                         "image_send_error", audit_id=audit_id,
                         image_asset_id=image_asset["id"], message=str(exc),
                     )
-            if first_reply_used and (first_reply_sent or not first_reply_to_send):
-                self.app_store.mark_first_reply_sent(scope_id)
-            
+
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
-            logger.debug(f"原始消息: {message_data}")
+            logger.debug(f"原始消息: {redact_sensitive_text(message_data)}")
             # 最后一层故障兜底：解析/接口/模型异常都不能静默吞消息。
             try:
                 if websocket and chat_id and send_user_id:
@@ -1689,7 +2305,10 @@ class XianyuLive:
                                 await websocket.send(json.dumps(ack))
                             
                             # 处理其他消息
-                            asyncio.create_task(self.handle_message(message_data, websocket))
+                            for sync_message in self.split_sync_packages(message_data):
+                                asyncio.create_task(
+                                    self.handle_message(sync_message, websocket, send_ack=False)
+                                )
                                 
                         except json.JSONDecodeError:
                             logger.error("消息解析失败")

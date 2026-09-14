@@ -153,7 +153,7 @@ class XianyuApis:
                 'deviceId': self.session.cookies.get('cna', '')
             }
             
-            response = self.session.post(url, params=params, data=data)
+            response = self.session.post(url, params=params, data=data, timeout=(5, 12))
             res_json = response.json()
             
             if res_json.get('content', {}).get('success'):
@@ -171,13 +171,15 @@ class XianyuApis:
             time.sleep(0.5)
             return self.hasLogin(retry_count + 1)
 
-    def get_token(self, device_id, retry_count=0):
+    def get_token(self, device_id, retry_count=0, relogin_attempted=False):
         if retry_count >= 2:  # 最多重试3次
+            if relogin_attempted:
+                raise RuntimeError("闲鱼登录凭据无法获取消息Token，请在内置闲鱼重新登录后重启客服")
             logger.warning("获取token失败，尝试重新登陆")
             # 尝试通过hasLogin重新登录
             if self.hasLogin():
                 logger.info("重新登录成功，重新尝试获取token")
-                return self.get_token(device_id, 0)  # 重置重试次数
+                return self.get_token(device_id, 0, relogin_attempted=True)
             else:
                 logger.error("重新登录失败，Cookie已失效")
                 message = "Cookie已失效，请更新Cookie后重新启动客服"
@@ -229,7 +231,10 @@ class XianyuApis:
         params['sign'] = sign
         
         try:
-            response = self.session.post('https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/', headers=headers, params=params, data=data)
+            response = self.session.post(
+                'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/',
+                headers=headers, params=params, data=data, timeout=(5, 15),
+            )
             res_json = response.json()
             
             if isinstance(res_json, dict):
@@ -266,7 +271,7 @@ class XianyuApis:
                                 self.update_env_cookies()
                                 
                                 # 立即重试
-                                return self.get_token(device_id, 0)
+                                return self.get_token(device_id, 0, relogin_attempted=True)
                             except Exception as e:
                                 logger.error(f"Cookie解析失败: {e}")
                                 sys.exit(1)
@@ -280,18 +285,18 @@ class XianyuApis:
                         logger.debug("检测到Set-Cookie，更新cookie")  # 降级为DEBUG并简化
                         self.clear_duplicate_cookies()
                     time.sleep(0.5)
-                    return self.get_token(device_id, retry_count + 1)
+                    return self.get_token(device_id, retry_count + 1, relogin_attempted)
                 else:
                     logger.info("Token获取成功")
                     return res_json
             else:
                 logger.error(f"Token API返回格式异常: {res_json}")
-                return self.get_token(device_id, retry_count + 1)
+                return self.get_token(device_id, retry_count + 1, relogin_attempted)
                 
         except Exception as e:
             logger.error(f"Token API请求异常: {str(e)}")
             time.sleep(0.5)
-            return self.get_token(device_id, retry_count + 1)
+            return self.get_token(device_id, retry_count + 1, relogin_attempted)
 
     def get_item_info(self, item_id, retry_count=0):
         """获取商品信息，自动处理token失效的情况"""
@@ -357,7 +362,7 @@ class XianyuApis:
             time.sleep(0.5)
             return self.get_item_info(item_id, retry_count + 1)
 
-    def get_user_items(self, user_id, page_number=1, page_size=20, page_state=None):
+    def get_user_items(self, user_id, page_number=1, page_size=20, page_state=None, token_retry=True):
         """Read one page of the logged-in seller's public item cards."""
         payload = {
             "needGroupInfo": page_number == 1,
@@ -398,6 +403,14 @@ class XianyuApis:
         result = response.json()
         ret = result.get("ret", []) if isinstance(result, dict) else []
         if not any("SUCCESS::调用成功" in value for value in ret):
+            token_empty = any("FAIL_SYS_TOKEN_EMPTY" in value for value in ret)
+            refreshed_token = self.session.cookies.get("_m_h5_tk", "").split("_")[0]
+            if token_empty and token_retry and refreshed_token and refreshed_token != token:
+                return self.get_user_items(
+                    user_id, page_number, page_size, page_state, token_retry=False,
+                )
+            if token_empty:
+                raise RuntimeError("闲鱼登录状态已失效，请在内置闲鱼页面重新登录后再同步商品")
             raise RuntimeError("读取闲鱼商品列表失败：" + "；".join(ret or ["返回格式异常"]))
         return result
 
@@ -405,11 +418,16 @@ class XianyuApis:
         """Aggregate all cards and let the caller filter itemStatus=0 (on sale)."""
         cards = []
         page_state = {}
+        # Consumers may only treat an absent item as offline after the complete
+        # paginated listing has been read.  Keep this explicit so a transient
+        # page-limit/network condition can never take an active product down.
+        self.last_item_list_complete = False
         for page_number in range(1, max_pages + 1):
             result = self.get_user_items(user_id, page_number, page_size, page_state)
             data = result.get("data") or {}
             cards.extend(data.get("cardList") or [])
             if not data.get("nextPage"):
+                self.last_item_list_complete = True
                 break
             page_state.update({
                 "nextPageModel": data.get("nextPageModel"),

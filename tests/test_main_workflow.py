@@ -1,7 +1,10 @@
 import base64
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from requests import Session
 
 from main import XianyuLive
 
@@ -10,6 +13,7 @@ class _Store:
     def __init__(self):
         self.audit_updates = []
         self.reply_scopes = []
+        self.first_reply_scopes = set()
 
     @staticmethod
     def order_payment_notice(item_id):
@@ -25,6 +29,12 @@ class _Store:
     def record_ai_reply(self, scope_id):
         self.reply_scopes.append(scope_id)
 
+    def is_first_reply_sent(self, scope_id):
+        return scope_id in self.first_reply_scopes
+
+    def mark_first_reply_sent(self, scope_id):
+        self.first_reply_scopes.add(scope_id)
+
 
 class _Context:
     def __init__(self):
@@ -35,6 +45,22 @@ class _Context:
 
 
 class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    def test_plain_base64_json_sync_payload_is_not_discarded(self):
+        payload = {"1": {"10": {"reminderContent": "北京安贞店，大概300，几折"}}}
+        encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        self.assertEqual(payload, XianyuLive.decode_sync_message(encoded))
+
+    def test_saved_template_parser_orders_text_and_images(self):
+        parts = XianyuLive.parse_message_template(
+            "第一段{$分段符}{$分段符}第二段{$图片:7}{$分段符}第三段"
+        )
+        self.assertEqual([
+            {"type": "text", "content": "第一段"},
+            {"type": "text", "content": "第二段"},
+            {"type": "image", "asset_id": 7},
+            {"type": "text", "content": "第三段"},
+        ], parts)
+
     def make_live(self):
         live = XianyuLive.__new__(XianyuLive)
         live.myid = "seller"
@@ -43,8 +69,79 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.event_callback = None
         live._order_notice_scopes = set()
         live._buyer_routes = {"buyer-1": ("chat-1", "item-1")}
+        live._first_reply_locks = {}
+        live.manual_mode_conversations = set()
         live.send_msg = AsyncMock()
         return live
+
+    def test_cookie_hot_swap_invalidates_token_and_requests_reconnect(self):
+        live = self.make_live()
+        live.cookies_str = "unb=seller; _m_h5_tk=old_1"
+        live.cookies = {}
+        live.xianyu = SimpleNamespace(session=Session())
+        live.current_token = "old-message-token"
+        live.last_token_refresh_time = 100
+        live.cookie_revision = 0
+        live.connection_restart_flag = False
+        live.loop = None
+        live.ws = None
+        self.assertTrue(live.update_cookie("unb=seller; _m_h5_tk=new_2"))
+        self.assertEqual("new_2", live.xianyu.session.cookies.get("_m_h5_tk"))
+        self.assertIsNone(live.current_token)
+        self.assertEqual(1, live.cookie_revision)
+        self.assertTrue(live.connection_restart_flag)
+
+    async def test_complete_live_listing_marks_absent_product_offline(self):
+        live = self.make_live()
+        live.listing_status_ttl = 60
+        live._listing_status_cache = None
+
+        class ListingApi:
+            last_item_list_complete = True
+
+            @staticmethod
+            def get_all_user_items(user_id):
+                return [{"cardData": {
+                    "id": "another-item", "itemStatus": 0,
+                    "detailParams": {"itemId": "another-item"},
+                }}]
+
+        statuses = []
+        live.xianyu = ListingApi()
+        live.app_store.set_product_listing_status = lambda item_id, status: (
+            statuses.append((item_id, status)) or {
+                "item_id": item_id, "source_type": "goofish",
+                "item_status": status, "enabled": int(status == "onsale"),
+            }
+        )
+        product = await live.refresh_current_listing_status("item-1", {
+            "item_id": "item-1", "source_type": "goofish",
+            "item_status": "onsale", "enabled": 1,
+        })
+        self.assertEqual("offline", product["item_status"])
+        self.assertEqual([("item-1", "offline")], statuses)
+
+    async def test_incomplete_live_listing_never_marks_absent_product_offline(self):
+        live = self.make_live()
+        live.listing_status_ttl = 60
+        live._listing_status_cache = None
+
+        class ListingApi:
+            last_item_list_complete = False
+
+            @staticmethod
+            def get_all_user_items(user_id):
+                return []
+
+        live.xianyu = ListingApi()
+        live.app_store.set_product_listing_status = lambda *args: self.fail(
+            "incomplete listing must not change local state"
+        )
+        source = {
+            "item_id": "item-1", "source_type": "goofish",
+            "item_status": "onsale", "enabled": 1,
+        }
+        self.assertIs(source, await live.refresh_current_listing_status("item-1", source))
 
     async def test_waiting_payment_uses_known_buyer_route_and_sends_once(self):
         live = self.make_live()
@@ -73,6 +170,43 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event = {"1": "buyer-1@goofish", "3": {"reminderContent": "我已拍下，待付款"}}
         self.assertTrue(await live.handle_order_reminder(event, object()))
         live.send_msg.assert_awaited_once()
+
+    async def test_waiting_payment_card_text_overrides_generic_red_reminder(self):
+        live = self.make_live()
+        event = {
+            "1": "buyer-1@goofish",
+            "3": {
+                "redReminder": "请双方沟通及时确认价格",
+                "reminderContent": "我已拍下，待付款",
+            },
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_awaited_once()
+
+    async def test_purchase_order_waiting_payment_card_stays_silent(self):
+        live = self.make_live()
+        live.app_store.get_v2_product = lambda item_id: {
+            "item_id": item_id, "coupon_type": "purchase_order",
+            "item_status": "onsale", "enabled": 1,
+        }
+        event = {
+            "1": "buyer-1@goofish",
+            "3": {
+                "redReminder": "请双方沟通及时确认价格",
+                "reminderContent": "我已拍下，待付款",
+            },
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_not_awaited()
+
+    async def test_seller_price_change_system_card_never_triggers_a_reply(self):
+        live = self.make_live()
+        event = {
+            "1": {"10": {"reminderContent": "我已修改价格，等待你付款"}},
+            "3": {"reminderContent": "请确认价格与协商一致，并在24小时内付款"},
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        live.send_msg.assert_not_awaited()
 
     def test_recall_and_paid_amount_helpers(self):
         self.assertTrue(XianyuLive.is_recall_message("对方撤回了一条消息"))
@@ -124,6 +258,29 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "itemImageUrl": "https://example.invalid/item.jpg",
         }
         self.assertEqual("", XianyuLive.inbound_media_marker(payload))
+
+    def test_location_card_extracts_store_without_using_address_as_query(self):
+        payload = {
+            "contentType": "location",
+            "cardData": {
+                "poiName": "半秋山(汉阳摩尔城店)",
+                "address": "王家湾龙阳大道特6号摩尔城4楼",
+            },
+        }
+        self.assertEqual("汉阳摩尔城店", XianyuLive.inbound_location_card(payload))
+
+    def test_normal_product_card_is_not_treated_as_location(self):
+        payload = {"contentType": 1, "title": "半秋山100元代金券", "price": "79.5"}
+        self.assertEqual("", XianyuLive.inbound_location_card(payload))
+
+    def test_plain_store_place_and_address_text_are_not_treated_as_location_cards(self):
+        for text in (
+            "和平店", "武汉首店", "汕头", "深圳坂田五和",
+            "腾讯园区总部", "万达广场", "深圳市南山区科技园路1号",
+        ):
+            with self.subTest(text=text):
+                payload = {"contentType": 1, "reminderContent": text}
+                self.assertEqual("", XianyuLive.inbound_location_card(payload))
 
     def test_model_number_grounding_blocks_only_unverified_facts(self):
         self.assertEqual(
@@ -178,13 +335,184 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.should_send_first_reply(message, {"kind": "stores"}))
 
-    def test_enabled_first_reply_attaches_to_first_normal_question(self):
-        for kind in ("coupon_catalog", "stores", "day_use", "price", "greeting"):
-            with self.subTest(kind=kind):
-                self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", kind))
+    def test_enabled_first_reply_can_be_sent_for_a_pure_greeting(self):
+        self.assertTrue(XianyuLive.should_attach_first_reply(True, "商品首次回复", "greeting"))
         self.assertFalse(XianyuLive.should_attach_first_reply(False, "商品首次回复", "stores"))
         self.assertFalse(XianyuLive.should_attach_first_reply(True, "", "stores"))
-        self.assertFalse(XianyuLive.should_attach_first_reply(True, "商品首次回复", "refund_quality"))
+
+    async def test_required_first_reply_sends_once_before_any_answer_kind(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock(return_value="首次第1段\n\n首次第2段")
+        product = {
+            "item_status": "onsale", "first_reply_enabled": True,
+            "first_reply_text": "首次第1段{$分段符}首次第2段", "first_reply_manual": True,
+        }
+        first = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "你好",
+        )
+        second = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "你好",
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        live.send_message_template.assert_awaited_once()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+        self.assertEqual("assistant", live.context_manager.messages[0][3])
+
+    async def test_purchase_order_first_message_sends_only_configured_welcome(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        product = {
+            "coupon_type": "purchase_order", "item_status": "onsale", "enabled": 1,
+            "first_reply_enabled": True, "first_reply_text": "代买单首次回复",
+            "first_reply_manual": True,
+        }
+        handled = await live.handle_purchase_order_buyer_message(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "390元怎么买",
+        )
+        self.assertTrue(handled)
+        live.send_message_template.assert_awaited_once()
+        live.send_msg.assert_not_awaited()
+
+    def test_sync_batch_is_split_without_dropping_later_messages(self):
+        package = {
+            "headers": {"mid": "m1"},
+            "body": {"syncPushPackage": {"data": [
+                {"data": "first"}, {"data": "second"},
+            ]}},
+        }
+        split = XianyuLive.split_sync_packages(package)
+        self.assertEqual(2, len(split))
+        self.assertEqual("first", split[0]["body"]["syncPushPackage"]["data"][0]["data"])
+        self.assertEqual("second", split[1]["body"]["syncPushPackage"]["data"][0]["data"])
+        self.assertEqual(2, len(package["body"]["syncPushPackage"]["data"]))
+
+    async def test_purchase_order_only_answers_later_pure_greetings(self):
+        product = {
+            "coupon_type": "purchase_order", "item_status": "onsale", "enabled": 1,
+            "first_reply_enabled": True, "first_reply_text": "代买单首次回复",
+            "first_reply_manual": True,
+        }
+        greeting_live = self.make_live()
+        greeting_live.app_store.first_reply_scopes.add("scope-1")
+        websocket = object()
+        self.assertTrue(await greeting_live.handle_purchase_order_buyer_message(
+            websocket, "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 1}, "你好",
+        ))
+        greeting_live.send_msg.assert_awaited_once_with(
+            websocket, "chat-1", "buyer-1", XianyuLive.PURCHASE_ORDER_GREETING_REPLY
+        )
+
+        for message in ("390元怎么买", "怎么付款", "深圳能用吗", "我要退款", "[图片]", "[语音]"):
+            with self.subTest(message=message):
+                live = self.make_live()
+                live.app_store.first_reply_scopes.add("scope-1")
+                self.assertTrue(await live.handle_purchase_order_buyer_message(
+                    object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+                    {"first_reply_sent": 1}, message,
+                ))
+                live.send_msg.assert_not_awaited()
+
+    async def test_concrete_store_question_keeps_mandatory_first_reply(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        product = {
+            "item_status": "onsale", "first_reply_enabled": True,
+            "first_reply_text": "很长的商品介绍", "first_reply_manual": True,
+        }
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "武汉凯德广场武胜路能用吗",
+        )
+        self.assertTrue(sent)
+        live.send_message_template.assert_awaited_once()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+
+    async def test_purchase_flow_question_keeps_mandatory_first_reply(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        product = {
+            "item_status": "onsale", "first_reply_enabled": True,
+            "first_reply_text": "很长的商品介绍", "first_reply_manual": True,
+        }
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "怎么下单",
+        )
+        self.assertTrue(sent)
+        live.send_message_template.assert_awaited_once()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+
+    def test_aftersale_entry_requires_actual_post_purchase_evidence(self):
+        for message in ("券码核销失败", "我已经付款了但是不能用", "发来的券已经过期"):
+            with self.subTest(message=message):
+                self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
+                self.assertTrue(XianyuLive.is_aftersale_entry_message(
+                    message, {"status": "已付款"}
+                ))
+        for message in ("可以退款吗", "退款政策是什么", "如果不能用怎么办", "锅底能用吗"):
+            with self.subTest(message=message):
+                self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
+        self.assertFalse(XianyuLive.is_aftersale_entry_message(
+            "我下单了然后买单的时候和他们说美团核销吗", {"status": "已付款"}
+        ))
+        self.assertFalse(XianyuLive.is_aftersale_entry_message(
+            "券码核销失败", {"status": "等待买家付款"}
+        ))
+        self.assertTrue(XianyuLive.is_aftersale_entry_message(
+            "进度怎么样", {"status": "退款申请处理中"}
+        ))
+
+    async def test_aftersale_first_reply_uses_live_backend_policy_then_fixed_receipt(self):
+        live = self.make_live()
+        live.app_store.pause_conversation = lambda scope, state: setattr(
+            live.app_store, "paused", (scope, state)
+        )
+        policy = "后台刚刚修改的退款政策"
+        first = await live.send_aftersale_state_reply(
+            object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
+            "券码核销失败", {"aftersale_policy_summary": policy}, first=True,
+        )
+        followup = await live.send_aftersale_state_reply(
+            object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
+            "怎么处理", {"aftersale_policy_summary": "另一个政策"}, first=False,
+        )
+        self.assertEqual(policy, first)
+        self.assertEqual(XianyuLive.AFTERSALE_FOLLOWUP_NOTICE, followup)
+        self.assertEqual(("scope-1", "aftersale"), live.app_store.paused)
+        self.assertEqual(policy, live.send_msg.await_args_list[0].args[3])
+
+    async def test_offline_product_never_sends_first_reply(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1",
+            {
+                "item_status": "offline", "first_reply_enabled": True,
+                "first_reply_text": "不应发送", "first_reply_manual": True,
+            },
+            {"first_reply_sent": 0},
+        )
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
+
+    def test_model_operational_guard_rejects_unverified_actions_and_status(self):
+        self.assertTrue(XianyuLive.model_reply_operational_issue(
+            "已为您转接人工，请稍候。", {}
+        ))
+        self.assertTrue(XianyuLive.model_reply_operational_issue(
+            "订单尚未付款，请先付款。", {}
+        ))
+        self.assertEqual("", XianyuLive.model_reply_operational_issue(
+            "订单尚未付款，请先付款。", {"status": "等待买家付款"}
+        ))
+        fallback = XianyuLive.operational_fallback_reply("我已经付款了")
+        self.assertIn("您反馈", fallback)
+        self.assertIn("无法直接核验", fallback)
 
     def test_manual_first_reply_is_not_replaced_by_commitment_filter(self):
         live = self.make_live()

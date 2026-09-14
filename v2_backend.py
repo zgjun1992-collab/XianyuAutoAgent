@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import ctypes
+import hashlib
 import json
 import os
 import re
@@ -10,6 +12,8 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
+
+from build_info import APP_EDITION, APP_VERSION, BUILD_COMMIT
 
 from openai import OpenAI
 
@@ -23,10 +27,18 @@ from v2_store import V2Store, extract_store_query
 
 SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供任意格式的原始资料。
 只能整理原文明确出现的内容，禁止补充常识、猜测门店、价格、有效期或退款承诺。
+整理的目标是调整结构和表达，不是压缩信息。原文每一条独立事实、限制、例外、提醒和咨询要求都必须保留，
+不得因为内容看似次要、重复或无法归类而删除；无法归入固定栏目时放入“其他说明”。
+生成summary前必须逐句核对原文，确认每条规则都能在summary或结构化字段中找到对应内容。
 输出一个JSON对象，字段必须为：
-summary: 适合客服快速阅读的中文分点摘要字符串，禁止输出Python对象、JSON片段或字段字典；
+summary: 适合客服快速阅读的中文分点摘要字符串；在原文有对应内容时，应完整包含商品规格、适用门店范围、
+有效期和不可用日期、使用时间、堂食/外带/外卖、预约和等位、优惠互斥、叠加与限用数量、发券核销、
+退款、发票及下单前提醒；禁止输出Python对象、JSON片段或字段字典；
 risk_fields: 需要人工确认的高风险或矛盾字段数组；
-facts: 对象，允许包含有效期、使用时间、使用规则、叠加规则、退款规则、发码方式；
+facts: 对象，按原文明确信息尽量完整提取，允许包含商品类型、有效期、适用日期、不可用日期、
+使用时间、预约要求、堂食限制、外带限制、外卖限制、包间限制、酒水限制、锅底限制、服务费限制、
+优惠同享、叠加规则、不同面额混用、单次或每桌限用数量、退款规则、发码平台、发码方式、领取方式、
+核销方式、发票规则、适用人群、人数限制和下单前提醒；原文未说明的内容不得猜测；
 products: 仅填写代金券规格数组，每个规格必须独立一项，字段为name、option_type、face_value、sale_price、applicable_time、composition、max_stack。
 sale_options: 仅填写套餐、自助餐、人数餐等非代金券商品选项数组，每项字段为name、option_type、sale_price、people_count、applicable_day、meal_period、applicable_time；
 stores: 商品文案明确列出的适用门店数组，每项字段为brand、branch、province、city、district、address、phone；
@@ -71,9 +83,42 @@ class BackendState:
         self.service_status = "stopped"
         self.service_message = ""
         self.lock = threading.RLock()
+        self._service_mutex_handle = None
+        self._service_mutex_api = None
+
+    def _acquire_service_mutex(self):
+        """Allow only one live customer-service worker per local data directory."""
+        if os.name != "nt" or self._service_mutex_handle:
+            return
+        digest = hashlib.sha256(os.path.normcase(self.data_dir).encode("utf-8")).hexdigest()[:24]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Keep a named kernel object open for the lifetime of the worker.  An
+        # event is used instead of a mutex because the worker may stop on a
+        # different thread than the HTTP request that started it.
+        kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateEventW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateEventW(None, True, False, f"Local\\XianyuCardAI-{digest}")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "无法创建客服单实例锁")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            raise ValueError("同一数据目录已有客服实例运行，请先关闭旧程序后再启动")
+        self._service_mutex_handle = handle
+        self._service_mutex_api = kernel32
+
+    def _release_service_mutex(self):
+        handle = self._service_mutex_handle
+        kernel32 = self._service_mutex_api
+        self._service_mutex_handle = None
+        self._service_mutex_api = None
+        if handle and kernel32:
+            kernel32.CloseHandle(handle)
 
     def configure(self, payload):
         with self.lock:
+            previous_cookie = self.runtime["cookie"]
             for key in ("api_key", "cookie", "base_url", "model"):
                 if key in payload and payload[key] is not None:
                     self.runtime[key] = str(payload[key]).strip()
@@ -85,6 +130,18 @@ class BackendState:
             ):
                 if value:
                     os.environ[env_key] = value
+            if (
+                self.live
+                and self.runtime["cookie"]
+                and self.runtime["cookie"] != previous_cookie
+            ):
+                previous = trans_cookies(previous_cookie)
+                current = trans_cookies(self.runtime["cookie"])
+                auth_keys = ("unb", "_m_h5_tk", "_m_h5_tk_enc", "cookie2")
+                if any(previous.get(key) != current.get(key) for key in auth_keys):
+                    self.live.update_cookie(self.runtime["cookie"])
+                    self.service_status = "reconnecting"
+                    self.service_message = "检测到新的闲鱼登录凭据，正在重新连接"
         return self.config_status()
 
     def config_status(self):
@@ -124,7 +181,7 @@ class BackendState:
                 {"role": "user", "content": source_text},
             ],
             "temperature": 0,
-            "max_tokens": 1800,
+            "max_tokens": 3200,
             "timeout": 45,
         }
         try:
@@ -235,6 +292,8 @@ class BackendState:
             raise ValueError("请先保存百炼API Key，才能根据商品文案生成初始知识")
         api = XianyuApis(interactive=False)
         cookies = trans_cookies(self.runtime["cookie"])
+        if not cookies.get("_m_h5_tk"):
+            raise ValueError("闲鱼登录状态已失效，请在内置闲鱼页面重新登录后再同步商品")
         api.session.cookies.update(cookies)
         user_id = cookies.get("unb")
         if not user_id:
@@ -279,6 +338,7 @@ class BackendState:
                 unchanged = bool(
                     old and old.get("platform_summary") == platform_summary
                     and old.get("ai_summary")
+                    and old.get("sync_status") != "summary_failed"
                 )
                 self.store.upsert_synced_product({
                     "item_id": item_id, "title": title, "platform_summary": platform_summary,
@@ -296,15 +356,37 @@ class BackendState:
                         self.store.stage_source_update(item_id, "", {}, "")
                         failed.append({"item_id": item_id, "error": "商品详情文案和规格均为空，已保留当前知识"})
                         continue
-                    summary, structured = self._generate_summary(platform_summary)
-                    if old:
-                        self.store.stage_source_update(
-                            item_id, summary, structured, str(item_do.get("desc") or "")
+                    description = str(item_do.get("desc") or "")
+                    try:
+                        summary, structured = self._generate_summary(platform_summary)
+                    except Exception as summary_exc:
+                        # Page acquisition and AI condensation are independent.
+                        # A model timeout must not discard rules/stores already
+                        # present in the complete marketplace payload.
+                        fallback = description or platform_summary
+                        has_effective_knowledge = bool(
+                            old and (str(old.get("raw_text") or "").strip()
+                                     or str(old.get("ai_summary") or "").strip())
                         )
+                        if has_effective_knowledge:
+                            self.store.stage_source_update(item_id, fallback, {}, description)
+                        else:
+                            self.store.save_synced_summary(item_id, fallback, {})
+                            self.store.sync_platform_store_list(
+                                item_id, title, description, {}
+                            )
+                            self.store.mark_summary_failed(item_id)
+                        failed.append({
+                            "item_id": item_id,
+                            "error": f"AI归纳失败，已保留完整商品页面资料：{summary_exc}",
+                        })
+                        continue
+                    if old:
+                        self.store.stage_source_update(item_id, summary, structured, description)
                     else:
                         self.store.save_synced_summary(item_id, summary, structured)
                         self.store.sync_platform_store_list(
-                            item_id, title, str(item_do.get("desc") or ""), structured
+                            item_id, title, description, structured
                         )
                     synced.append(item_id)
                 time.sleep(0.12)
@@ -321,31 +403,35 @@ class BackendState:
 
     def save_image_asset(self, payload):
         item_id = str(payload.get("item_id") or "").strip()
-        source_path = os.path.abspath(str(payload.get("source_path") or "").strip())
+        source_value = str(payload.get("source_path") or "").strip()
+        source_path = os.path.abspath(source_value) if source_value else ""
         if not item_id:
             raise ValueError("请先选择商品")
-        if not os.path.isfile(source_path):
-            raise FileNotFoundError("请选择套餐图片")
-        extension = os.path.splitext(source_path)[1].lower()
-        if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
-            raise ValueError("套餐图片仅支持 PNG、JPG、JPEG 或 WebP")
-        if os.path.getsize(source_path) > 10 * 1024 * 1024:
-            raise ValueError("单张套餐图片不能超过10MB")
+        previous = self.store.get_image_asset(int(payload["id"])) if payload.get("id") else None
+        if source_path and not os.path.isfile(source_path):
+            raise FileNotFoundError("关键词规则图片不存在")
+        if not source_path and not str(payload.get("reply_text") or "").strip():
+            raise ValueError("请至少填写一段触发后发送的文字或选择图片")
+        extension = os.path.splitext(source_path)[1].lower() if source_path else ""
+        if extension and extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("图片仅支持 PNG、JPG、JPEG 或 WebP")
+        if source_path and os.path.getsize(source_path) > 10 * 1024 * 1024:
+            raise ValueError("单张图片不能超过10MB")
         safe_item_id = re.sub(r"[^0-9A-Za-z_-]+", "_", item_id)[:80] or "product"
         asset_dir = os.path.join(self.data_dir, "product-images", safe_item_id)
         os.makedirs(asset_dir, exist_ok=True)
-        target_path = os.path.join(asset_dir, f"{uuid.uuid4().hex}{extension}")
-        shutil.copy2(source_path, target_path)
-        previous = self.store.get_image_asset(int(payload["id"])) if payload.get("id") else None
+        target_path = os.path.join(asset_dir, f"{uuid.uuid4().hex}{extension}") if source_path else str((previous or {}).get("file_path") or "")
+        if source_path and source_path != target_path:
+            shutil.copy2(source_path, target_path)
         record = dict(payload)
         record.update({
             "item_id": item_id,
             "file_path": target_path,
-            "original_name": os.path.basename(source_path),
+            "original_name": os.path.basename(source_path) if source_path else str((previous or {}).get("original_name") or ""),
         })
         try:
             saved = self.store.save_image_asset(record)
-            if previous and previous.get("file_path") != target_path:
+            if source_path and previous and previous.get("file_path") != target_path:
                 try:
                     os.remove(previous["file_path"])
                 except OSError:
@@ -353,7 +439,8 @@ class BackendState:
             return saved
         except Exception:
             try:
-                os.remove(target_path)
+                if source_path:
+                    os.remove(target_path)
             except OSError:
                 pass
             raise
@@ -498,18 +585,23 @@ class BackendState:
                 raise ValueError("请先保存API Key")
             if not self.runtime["cookie"]:
                 raise ValueError("请先在内置闲鱼登录，等待Cookie自动同步")
+            self._acquire_service_mutex()
             os.environ["API_KEY"] = self.runtime["api_key"]
             os.environ["COOKIES_STR"] = self.runtime["cookie"]
             os.environ["MODEL_BASE_URL"] = self.runtime["base_url"]
             os.environ["MODEL_NAME"] = self.runtime["model"]
             bot = XianyuReplyBot()
-            self.live = XianyuLive(
-                self.runtime["cookie"],
-                bot_instance=bot,
-                app_store=self.store,
-                event_callback=self.on_live_event,
-                interactive=False,
-            )
+            try:
+                self.live = XianyuLive(
+                    self.runtime["cookie"],
+                    bot_instance=bot,
+                    app_store=self.store,
+                    event_callback=self.on_live_event,
+                    interactive=False,
+                )
+            except Exception:
+                self._release_service_mutex()
+                raise
             self.service_status = "starting"
             self.service_message = ""
 
@@ -520,6 +612,8 @@ class BackendState:
                     self.service_status = "error"
                     self.service_message = str(exc)
                     self.store.add_event("service_error", str(exc), {})
+                finally:
+                    self._release_service_mutex()
 
             self.worker = threading.Thread(target=run, name="xianyu-v2-live", daemon=True)
             self.worker.start()
@@ -597,7 +691,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path.rstrip("/") or "/"
             if path == "/health":
-                return self._ok({"status": "ok", "version": "3.4.0"})
+                return self._ok({
+                    "status": "ok",
+                    "edition": APP_EDITION,
+                    "version": APP_VERSION,
+                    "build_commit": BUILD_COMMIT,
+                })
             if path == "/snapshot":
                 return self._ok({
                     "dashboard": self.state.store.dashboard(),

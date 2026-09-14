@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('xianyuDesktop', {
   licenseLogin: (payload) => ipcRenderer.invoke('license:login', payload),
   licenseStatus: () => ipcRenderer.invoke('license:status'),
   licenseLogout: () => ipcRenderer.invoke('license:logout'),
+  getVersion: () => ipcRenderer.invoke('app:version'),
   setBrowserBounds: (bounds) => ipcRenderer.send('browser:set-bounds', bounds),
   browser: (action) => ipcRenderer.invoke('browser:action', action),
   chooseExcel: () => ipcRenderer.invoke('dialog:choose-excel'),
