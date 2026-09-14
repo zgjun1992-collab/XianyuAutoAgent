@@ -5,6 +5,8 @@ const net = require('net')
 const os = require('os')
 const path = require('path')
 const crypto = require('crypto')
+const { autoUpdater } = require('./generated-updater.cjs')
+const { normalizeReleaseNotes, isForcedUpdate, publicUpdateState } = require('./update-policy.cjs')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -55,6 +57,20 @@ let backendIdentity = null
 let lastPendingCount = 0
 let cookieTimer = null
 let goofishSession = null
+let updateCheckWasManual = false
+let promptedUpdateVersion = ''
+let promptedInstallVersion = ''
+
+const updaterState = {
+  status: 'idle',
+  currentVersion: app.getVersion(),
+  availableVersion: '',
+  progress: 0,
+  releaseNotes: '',
+  error: '',
+  forced: false,
+  checkedAt: ''
+}
 
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
@@ -78,6 +94,193 @@ function readSettings() {
 function writeSettings(value) {
   fs.mkdirSync(path.dirname(settingsPath()), { recursive: true })
   fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), 'utf8')
+}
+
+function appendUpdateLog(level, message, detail = '') {
+  const line = `${new Date().toISOString()} [${level}] ${message}${detail ? ` ${String(detail).replace(/[\r\n]+/g, ' ')}` : ''}\n`
+  try {
+    const logDir = path.join(app.getPath('userData'), 'logs')
+    fs.mkdirSync(logDir, { recursive: true })
+    fs.appendFileSync(path.join(logDir, 'updater.log'), line, 'utf8')
+  } catch (error) {
+    console.error('V3 updater: failed to write log', error?.message || String(error))
+  }
+  console.error(`V3 updater ${level}: ${message}`, detail)
+}
+
+function setUpdaterState(status, patch = {}) {
+  Object.assign(updaterState, patch, { status })
+  mainWindow?.webContents.send('app:event', { type: 'update-state', state: publicUpdateState(updaterState) })
+  return publicUpdateState(updaterState)
+}
+
+function forceUpdatePending() {
+  return Boolean(
+    updaterState.forced &&
+    updaterState.availableVersion &&
+    ['available', 'downloading', 'downloaded', 'error'].includes(updaterState.status)
+  )
+}
+
+async function promptUpdateAvailable(info) {
+  const version = String(info?.version || '')
+  if (!mainWindow || !version || promptedUpdateVersion === version) return
+  promptedUpdateVersion = version
+  const forced = isForcedUpdate(info)
+  const buttons = forced ? ['立即下载', '退出软件'] : ['稍后更新', '立即下载']
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: forced ? 'warning' : 'info',
+    title: forced ? '发现必须安装的更新' : '发现新版本',
+    message: `发现新版本 ${version}`,
+    detail: `${normalizeReleaseNotes(info?.releaseNotes) || '本次版本包含功能改进和问题修复。'}${forced ? '\n\n这是强制更新，安装前不能启动自动客服。' : ''}`,
+    buttons,
+    defaultId: forced ? 0 : 1,
+    cancelId: forced ? 1 : 0,
+    noLink: true
+  })
+  if ((forced && result.response === 0) || (!forced && result.response === 1)) {
+    await downloadAppUpdate()
+  } else if (forced) {
+    app.quit()
+  }
+}
+
+async function promptUpdateDownloaded(info) {
+  const version = String(info?.version || updaterState.availableVersion || '')
+  if (!mainWindow || !version || promptedInstallVersion === version) return
+  promptedInstallVersion = version
+  const buttons = updaterState.forced ? ['立即重启安装', '退出软件'] : ['稍后安装', '立即重启安装']
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '更新下载完成',
+    message: `新版本 ${version} 已下载完成`,
+    detail: '立即安装会先停止自动客服和本地后台，然后关闭软件、安装更新并重新启动。',
+    buttons,
+    defaultId: updaterState.forced ? 0 : 1,
+    cancelId: updaterState.forced ? 1 : 0,
+    noLink: true
+  })
+  if ((updaterState.forced && result.response === 0) || (!updaterState.forced && result.response === 1)) {
+    await installDownloadedUpdate()
+  } else if (updaterState.forced) {
+    app.quit()
+  }
+}
+
+function registerUpdater() {
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = false
+  autoUpdater.allowPrerelease = false
+  autoUpdater.fullChangelog = true
+  autoUpdater.logger = {
+    info: (...args) => appendUpdateLog('INFO', args.join(' ')),
+    warn: (...args) => appendUpdateLog('WARN', args.join(' ')),
+    error: (...args) => appendUpdateLog('ERROR', args.join(' ')),
+    debug: (...args) => appendUpdateLog('DEBUG', args.join(' '))
+  }
+  autoUpdater.on('checking-for-update', () => {
+    setUpdaterState('checking', { error: '', progress: 0 })
+  })
+  autoUpdater.on('update-available', (info) => {
+    const releaseNotes = normalizeReleaseNotes(info?.releaseNotes)
+    const forced = isForcedUpdate(info)
+    setUpdaterState('available', {
+      availableVersion: String(info?.version || ''),
+      releaseNotes,
+      forced,
+      checkedAt: new Date().toISOString(),
+      error: ''
+    })
+    appendUpdateLog('INFO', `update available ${info?.version || ''}`, forced ? 'forced' : 'optional')
+    promptUpdateAvailable(info).catch((error) => appendUpdateLog('ERROR', 'update prompt failed', error?.message || error))
+  })
+  autoUpdater.on('update-not-available', (info) => {
+    setUpdaterState('latest', {
+      availableVersion: '',
+      releaseNotes: '',
+      forced: false,
+      checkedAt: new Date().toISOString(),
+      error: ''
+    })
+    appendUpdateLog('INFO', `already current ${info?.version || app.getVersion()}`)
+    if (updateCheckWasManual && mainWindow) {
+      dialog.showMessageBox(mainWindow, { type: 'info', title: '检查更新', message: '当前已经是最新版本。', buttons: ['确定'] })
+    }
+  })
+  autoUpdater.on('download-progress', (progress) => {
+    setUpdaterState('downloading', { progress: Number(progress?.percent || 0), error: '' })
+  })
+  autoUpdater.on('update-downloaded', (info) => {
+    setUpdaterState('downloaded', { progress: 100, error: '' })
+    appendUpdateLog('INFO', `update downloaded ${info?.version || ''}`)
+    promptUpdateDownloaded(info).catch((error) => appendUpdateLog('ERROR', 'install prompt failed', error?.message || error))
+  })
+  autoUpdater.on('error', (error) => {
+    setUpdaterState('error', { error: error?.message || String(error) })
+    appendUpdateLog('ERROR', 'update operation failed', error?.stack || error?.message || error)
+  })
+}
+
+async function checkForAppUpdate(manual = false) {
+  updateCheckWasManual = Boolean(manual)
+  if (isDev) {
+    const state = setUpdaterState('unsupported', { error: '开发模式不检查远程更新，请使用正式安装版验证。' })
+    if (manual) throw new Error(state.error)
+    return state
+  }
+  if (['checking', 'downloading', 'installing'].includes(updaterState.status)) return publicUpdateState(updaterState)
+  setUpdaterState('checking', { error: '', progress: 0 })
+  appendUpdateLog('INFO', manual ? 'manual update check started' : 'startup update check started')
+  await autoUpdater.checkForUpdates()
+  return publicUpdateState(updaterState)
+}
+
+async function downloadAppUpdate() {
+  if (isDev) throw new Error('开发模式不能下载更新')
+  if (!updaterState.availableVersion) throw new Error('当前没有可下载的新版本')
+  setUpdaterState('downloading', { progress: 0, error: '' })
+  appendUpdateLog('INFO', `update download started ${updaterState.availableVersion}`)
+  await autoUpdater.downloadUpdate()
+  return publicUpdateState(updaterState)
+}
+
+async function stopBackendForUpdate() {
+  if (backendReady) {
+    try {
+      await requestBackend('POST', '/service/stop', {})
+      appendUpdateLog('INFO', 'customer service stopped before update')
+    } catch (error) {
+      appendUpdateLog('WARN', 'failed to stop service gracefully', error?.message || error)
+    }
+  }
+  if (!backendProcess || backendProcess.killed) return
+  const processToStop = backendProcess
+  await new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(finish, 5000)
+    processToStop.once('exit', finish)
+    processToStop.kill()
+  })
+  backendReady = false
+  backendIdentity = null
+  backendProcess = null
+  appendUpdateLog('INFO', 'backend process stopped before update')
+}
+
+async function installDownloadedUpdate() {
+  if (isDev) throw new Error('开发模式不能安装更新')
+  if (updaterState.status !== 'downloaded') throw new Error('更新尚未下载完成')
+  setUpdaterState('installing', { error: '' })
+  await stopBackendForUpdate()
+  appendUpdateLog('INFO', `restarting to install ${updaterState.availableVersion}`)
+  setImmediate(() => autoUpdater.quitAndInstall(false, true))
+  return publicUpdateState(updaterState)
 }
 
 function encryptSecret(value) {
@@ -276,6 +479,7 @@ async function configureGoofishProxy(goofishSession) {
 async function requestBackend(method, requestPath, body) {
   if (!backendReady) await waitForBackend()
   if (method === 'POST' && requestPath === '/service/start') {
+    if (forceUpdatePending()) throw new Error(`必须先安装新版本 ${updaterState.availableVersion}，当前不能启动自动客服`)
     const currentLicense = await licenseStatus()
     if (!currentLicense.active) throw new Error(currentLicense.error || '请先登录并开通有效套餐')
   }
@@ -448,6 +652,10 @@ function registerIpc() {
     backend_version: backendIdentity?.version || '',
     build_commit: backendIdentity?.build_commit || ''
   }))
+  ipcMain.handle('update:state', () => publicUpdateState(updaterState))
+  ipcMain.handle('update:check', () => checkForAppUpdate(true))
+  ipcMain.handle('update:download', () => downloadAppUpdate())
+  ipcMain.handle('update:install', () => installDownloadedUpdate())
   ipcMain.on('browser:set-bounds', (_event, bounds) => {
     if (!goofishView) return
     const safe = {
@@ -537,6 +745,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
   try {
     console.error('V3 stage: app ready')
     registerIpc()
+    registerUpdater()
     console.error('V3 stage: IPC ready')
     goofishSession = session.fromPartition('persist:xianyu-main')
     await configureGoofishProxy(goofishSession)
@@ -545,6 +754,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     console.error('V3 stage: backend ready')
     await createWindow()
     console.error('V3 stage: window ready')
+    setTimeout(() => checkForAppUpdate(false).catch((error) => appendUpdateLog('ERROR', 'startup update check failed', error?.message || error)), 5000)
     setInterval(() => syncGoofishCookie().catch(() => {}), 30000)
     setInterval(monitorReviews, 2500)
     app.on('activate', () => {

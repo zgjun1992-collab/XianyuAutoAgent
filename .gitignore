@@ -21,6 +21,8 @@ desktop_v2/dist/
 desktop_v2/release/
 desktop_v2/release-cloud-test/
 desktop_v2/release-cloud-prod/
+desktop_v2/electron/generated-updater.cjs
+.wrangler/
 work/
 downloads/
 eggs/

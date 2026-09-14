@@ -80,3 +80,5 @@ sudo LICENSE_DB=/var/lib/xianyu-license/cloud-license.db \
 ```
 
 恢复脚本会校验备份、保留当前数据库安全副本、重启服务并检查健康状态。
+
+V3.6 客户端的 Cloudflare R2 自动更新发布流程见 `R2_RELEASE.md`。

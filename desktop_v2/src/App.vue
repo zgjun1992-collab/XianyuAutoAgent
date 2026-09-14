@@ -18,6 +18,7 @@ const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: t
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
 const licenseDraft = reactive({ server_url: 'https://api.yituan123.com', username: '', password: '' })
 const license = reactive({ active: false, logged_in: false, mode: '', user: null, entitlement: null, error: '', device_id: '', server_url: '' })
+const updater = reactive({ status: 'idle', currentVersion: '', availableVersion: '', progress: 0, releaseNotes: '', error: '', forced: false, checkedAt: '' })
 const policyDraft = reactive({ reply_mode: 'review', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
 const imageDraft = reactive({ id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
@@ -77,6 +78,11 @@ const firstReplyParts = computed(() => {
 })
 const serviceActive = computed(() => ['starting', 'connected', 'reconnecting', 'stopping'].includes(snapshot.service.status))
 const licenseReady = computed(() => Boolean(license.active && license.entitlement?.active))
+const updateStatusLabel = computed(() => ({
+  idle: '等待检查', checking: '正在检查', latest: '已是最新版本', available: '发现新版本',
+  downloading: '正在下载', downloaded: '等待安装', installing: '正在重启安装',
+  error: '更新失败', unsupported: '仅安装版可用'
+}[updater.status] || updater.status))
 const serviceLabel = computed(() => ({
   stopped: '客服已停止', starting: '正在启动', connected: '客服运行中', reconnecting: '正在重连', stopping: '正在停止', error: '连接异常'
 }[snapshot.service.status] || snapshot.service.status))
@@ -524,6 +530,36 @@ async function saveConfig() {
   notify('AI配置已使用 Windows 加密保存')
 }
 
+function updateErrorMessage(error) {
+  return String(error?.message || error || '更新操作失败')
+    .replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+}
+
+async function checkForUpdates() {
+  try {
+    Object.assign(updater, await desktop.checkForUpdates())
+  } catch (error) {
+    notify(updateErrorMessage(error), 'error')
+  }
+}
+
+async function downloadUpdate() {
+  try {
+    Object.assign(updater, await desktop.downloadUpdate())
+  } catch (error) {
+    notify(updateErrorMessage(error), 'error')
+  }
+}
+
+async function installUpdate() {
+  try {
+    Object.assign(updater, await desktop.installUpdate())
+  } catch (error) {
+    notify(updateErrorMessage(error), 'error')
+  }
+}
+
 function resetImageDraft() {
   Object.assign(imageDraft, { id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
 }
@@ -667,8 +703,9 @@ function syncBrowserBounds() {
 watch([route, aiPanelOpen, sidebarCollapsed], () => nextTick(syncBrowserBounds))
 
 onMounted(async () => {
-  const [, , , identity] = await Promise.all([refresh(false), getConfig(), refreshLicense(true), desktop.getVersion()])
+  const [, , , identity, currentUpdate] = await Promise.all([refresh(false), getConfig(), refreshLicense(true), desktop.getVersion(), desktop.getUpdateState()])
   Object.assign(appIdentity, identity || {})
+  Object.assign(updater, currentUpdate || {})
   resizeObserver = new ResizeObserver(syncBrowserBounds)
   resizeObserver.observe(document.body)
   if (browserStage.value) resizeObserver.observe(browserStage.value)
@@ -678,6 +715,7 @@ onMounted(async () => {
       configDraft.cookie_updated_at = event.at
     }
     if (event.type === 'backend-exit') notify('本地AI服务意外停止', 'error')
+    if (event.type === 'update-state') Object.assign(updater, event.state || {})
   })
   refreshTimer = setInterval(() => refresh(true).catch(() => {}), 2500)
   nextTick(syncBrowserBounds)
@@ -934,6 +972,23 @@ onBeforeUnmount(() => {
       <section v-else-if="route === 'settings'" class="page scroll-page narrow-page">
         <div class="page-heading"><div><span class="eyebrow">本机安全保存</span><h2>AI 与闲鱼连接</h2><p>API Key 使用 Windows DPAPI 加密；闲鱼 Cookie 从内置网页自动同步。</p></div></div>
         <article class="panel form-panel"><div class="status-grid"><div><i :class="{ good: configDraft.api_key_saved }"></i><span>API Key</span><strong>{{ configDraft.api_key_saved ? '已安全保存' : '未配置' }}</strong></div><div><i :class="{ good: configDraft.cookie_saved }"></i><span>闲鱼登录</span><strong>{{ configDraft.cookie_saved ? '已自动同步' : '等待登录' }}</strong></div></div><label>新的 API Key<input v-model="configDraft.api_key" type="password" placeholder="留空表示不修改已保存的Key" /></label><label>模型接口地址<input v-model="configDraft.base_url" /></label><label>客服与文本归纳模型<input v-model="configDraft.model" list="text-models" /><datalist id="text-models"><option value="qwen-plus"></option><option value="qwen-flash"></option><option value="qwen-max"></option></datalist><small>推荐 qwen-plus。商品知识仅根据文案归纳，商品图片和套餐图片都不会发送给AI。</small></label><div class="button-row"><button @click="saveConfig">保存配置</button><button @click="testAi">测试AI连接</button><button class="primary" @click="syncCookie">从内置闲鱼同步登录</button></div><div class="security-note">Cookie 不会显示在界面，也不会写入安装包。套餐图片仅保存在本机，触发后直接上传闲鱼发送。</div></article>
+        <div class="page-heading sub"><div><span class="eyebrow">安全更新通道</span><h2>软件更新</h2><p>启动后自动检查，也可以手动检查。安装更新前会先停止自动客服和本地后台。</p></div></div>
+        <article class="panel form-panel updater-panel" :class="{ forced: updater.forced }">
+          <div class="status-grid">
+            <div><i :class="{ good: ['latest', 'available', 'downloading', 'downloaded'].includes(updater.status) }"></i><span>更新状态</span><strong>{{ updateStatusLabel }}</strong></div>
+            <div><i :class="{ good: updater.currentVersion }"></i><span>当前版本</span><strong>{{ updater.currentVersion || appIdentity.frontend_version || '—' }}</strong></div>
+          </div>
+          <div v-if="updater.availableVersion" class="update-version"><span>可用版本</span><strong>{{ updater.availableVersion }}</strong><em v-if="updater.forced">必须更新</em></div>
+          <div v-if="updater.status === 'downloading'" class="update-progress"><div><span :style="{ width: `${Math.min(100, Math.max(0, updater.progress || 0))}%` }"></span></div><b>{{ Number(updater.progress || 0).toFixed(1) }}%</b></div>
+          <pre v-if="updater.releaseNotes" class="update-notes">{{ updater.releaseNotes }}</pre>
+          <div v-if="updater.error" class="update-error">{{ updater.error }}</div>
+          <div class="button-row end">
+            <button :disabled="['checking', 'downloading', 'installing'].includes(updater.status)" @click="checkForUpdates">{{ updater.status === 'checking' ? '正在检查…' : '检查更新' }}</button>
+            <button v-if="['available', 'error'].includes(updater.status) && updater.availableVersion" class="primary" @click="downloadUpdate">{{ updater.status === 'error' ? '重试下载' : '立即下载' }}</button>
+            <button v-if="updater.status === 'downloaded'" class="primary" @click="installUpdate">立即重启安装</button>
+          </div>
+          <div class="security-note">更新地址固定为 https://download.yituan123.com/v3.6。带“强制更新”标记的关键版本安装前不能启动自动客服。</div>
+        </article>
       </section>
 
       <section v-else-if="route === 'logs'" class="page scroll-page">

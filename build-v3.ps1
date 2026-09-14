@@ -44,6 +44,10 @@ $stageBackend = Join-Path $stageRoot "dist-cloud-backend"
 
 Push-Location $sourceDesktop
 try {
+    & $pnpmPath run build:updater
+    if ($LASTEXITCODE -ne 0) {
+        throw "Electron updater bundle failed with exit code $LASTEXITCODE"
+    }
     & $pnpmPath run build:web
     if ($LASTEXITCODE -ne 0) {
         throw "Desktop web build failed with exit code $LASTEXITCODE"
@@ -86,8 +90,9 @@ try {
         }
 
         # electron-builder 26 cannot currently read pnpm 11's dependency database on
-        # this Windows runtime. The packaged app has no production Node dependency,
-        # so use the checked-in empty npm collector response during packaging.
+        # this Windows runtime. electron-updater and its runtime dependencies are
+        # bundled into electron/generated-updater.cjs, so no external production
+        # Node modules are required by the packaged app.
         $lockPath = Join-Path $stageDesktop "pnpm-lock.yaml"
         $heldLockPath = Join-Path $stageDesktop "pnpm-lock.build-hold.yaml"
         Move-Item -LiteralPath $lockPath -Destination $heldLockPath
@@ -104,7 +109,8 @@ try {
         Pop-Location
     }
 
-    $installer = Get-ChildItem -LiteralPath (Join-Path $stageDesktop "release-cloud-prod") -File |
+    $stageRelease = Join-Path $stageDesktop "release-cloud-prod"
+    $installer = Get-ChildItem -LiteralPath $stageRelease -File |
         Where-Object { $_.Name -like "XianyuCardAI-V3.6-CloudPreview-*.exe" -and $_.Name -notlike "*.__uninstaller.exe" } |
         Select-Object -First 1
     if (-not $installer) {
@@ -120,6 +126,16 @@ try {
     }
     New-Item -ItemType Directory -Path $releaseTarget | Out-Null
     Copy-Item -LiteralPath $installer.FullName -Destination $releaseTarget
+    $metadata = @(
+        (Join-Path $stageRelease ($installer.Name + ".blockmap")),
+        (Join-Path $stageRelease "latest.yml")
+    )
+    foreach ($requiredFile in $metadata) {
+        if (-not (Test-Path -LiteralPath $requiredFile)) {
+            throw "Required auto-update artifact was not generated: $requiredFile"
+        }
+        Copy-Item -LiteralPath $requiredFile -Destination $releaseTarget
+    }
 } finally {
     if (Test-Path -LiteralPath $stageRoot) {
         $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())

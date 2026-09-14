@@ -1,22 +1,27 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
   "main": "electron/main.cjs",
   "scripts": {
-    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "dev": "pnpm run build:updater && concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build:updater": "esbuild electron/updater-entry.cjs --bundle --platform=node --format=cjs --external:electron --outfile=electron/generated-updater.cjs",
     "build:web": "vite build",
-    "build": "vite build && electron-builder --win nsis",
-    "check": "vite build"
+    "build": "pnpm run build:updater && vite build && electron-builder --win nsis",
+    "check": "pnpm run build:updater && vite build",
+    "test": "node --test test/*.test.cjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
   "devDependencies": {
     "@vitejs/plugin-vue": "6.0.8",
     "concurrently": "10.0.5",
     "electron": "44.1.0",
     "electron-builder": "26.15.3",
+    "esbuild": "0.25.10",
     "vite": "8.2.2",
     "vue": "3.5.42",
     "wait-on": "9.1.0",
@@ -48,10 +53,19 @@
         "to": "docs/阿里云百炼APIKey获取图文教程.pdf"
       },
       {
-        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.2.pdf",
-        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.2.pdf"
+        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.3.pdf",
+        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.3.pdf"
       }
     ],
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://download.yituan123.com/v3.6"
+      }
+    ],
+    "releaseInfo": {
+      "releaseNotes": "0.11.3 引导更新版：新增启动检查、手动检查、下载进度、失败重试、更新日志和安全重启安装。"
+    },
     "win": {
       "target": [
         "nsis"
