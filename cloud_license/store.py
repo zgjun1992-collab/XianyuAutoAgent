@@ -190,16 +190,10 @@ class LicenseStore:
     @staticmethod
     def _validate_admin_password(password):
         password = str(password or "")
-        categories = sum(
-            (
-                any(char.islower() for char in password),
-                any(char.isupper() for char in password),
-                any(char.isdigit() for char in password),
-                any(not char.isalnum() for char in password),
-            )
-        )
-        if len(password) < 14 or categories < 3:
-            raise LicenseError("管理员密码至少14位，并包含大小写字母、数字、符号中的至少三类")
+        if len(password) < 8 or not any(char.isalpha() for char in password) or not any(
+            char.isdigit() for char in password
+        ):
+            raise LicenseError("管理员密码至少8位，并同时包含字母和数字")
         return password
 
     def admin_count(self):

@@ -19,6 +19,15 @@ class CloudLicenseTests(unittest.TestCase):
         with self.assertRaisesRegex(LicenseError, "套餐未开通"):
             self.store.login("buyer@example.com", "strong-pass-123", "device-0001")
 
+    def test_admin_password_allows_memorable_letters_and_digits(self):
+        admin = self.store.create_admin("operator", "hetang2026")
+        self.assertEqual("operator", admin["username"])
+
+        with self.assertRaisesRegex(LicenseError, "至少8位"):
+            self.store.create_admin("too-short", "abc123")
+        with self.assertRaisesRegex(LicenseError, "字母和数字"):
+            self.store.create_admin("digits-only", "12345678")
+
     def test_monthly_subscription_login_and_verify(self):
         entitlement = self.store.grant_subscription(self.user["id"], "monthly")
         self.assertTrue(entitlement["active"])
