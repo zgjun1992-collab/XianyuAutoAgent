@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.18",
+  "version": "0.11.19",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.18：修复不同面额代金券的独立叠加上限被合并为统一数量的问题；保留原始商品规则优先级。"
+      "releaseNotes": "0.11.19：修复原始资料明确标注工作日可用时，使用时间被错误替换为门店营业时间默认值的问题。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",

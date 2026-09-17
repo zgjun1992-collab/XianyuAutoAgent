@@ -4893,9 +4893,34 @@ class V2Store(AppStore):
         return "当前商品资料暂未明确说明每次可以使用几张，暂时无法准确确认叠加数量。"
 
     @classmethod
+    def _raw_use_time_text(cls, raw_text: str) -> str:
+        """Return an explicit use-time section before any AI-generated default."""
+        match = re.search(
+            r"【使用时间】\s*(.*?)(?=\n\s*【|\Z)", str(raw_text or ""), re.S,
+        )
+        if not match:
+            return ""
+        text = "；".join(
+            line.strip() for line in match.group(1).splitlines() if line.strip()
+        ).strip(" \t\r\n。；;")
+        wrapped = re.fullmatch(r"[（(]\s*(.*?)\s*[）)]", text)
+        if wrapped:
+            text = wrapped.group(1).strip()
+        if re.search(
+            r"工作日|平日|周末|节假日|法定假日|周[一二三四五六日天]|"
+            r"早餐|午餐|晚餐|午市|晚市|下午茶|\d{1,2}[:：]\d{2}",
+            text,
+        ):
+            return text
+        return ""
+
+    @classmethod
     def _use_time_text(cls, product: Dict) -> str:
         facts = (product.get("structured") or {}).get("facts") or {}
         raw_text = str(product.get("raw_text") or "")
+        raw_use_time = cls._raw_use_time_text(raw_text)
+        if raw_use_time:
+            return raw_use_time
         use_time = cls._first_fact(
             facts, ("使用时间", "可用时间", "营业时间", "使用日期", "time")
         )
