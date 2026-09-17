@@ -783,6 +783,30 @@ class V2StoreTests(unittest.TestCase):
         summary = self.store.build_knowledge_summary(self.store.get_v2_product("10001"))
         self.assertIn("【使用时间】\n适用门店营业时间内可用。", summary)
 
+    def test_raw_workday_use_time_overrides_ai_business_hours_default(self):
+        self.store.save_v2_product(
+            "10001", "朱富贵代金券",
+            "【商品规格】\n"
+            "朱富贵100元代金券：售价90元，发100元券1张（工作日可用）\n"
+            "朱富贵200元代金券：售价180元，发200元券1张（工作日可用）\n\n"
+            "【使用时间】\n（工作日可用）\n\n"
+            "【有效期】\n当天买当天用。",
+        )
+        product = self.store.save_ai_summary(
+            "10001", "错误的营业时间默认值",
+            {
+                "summary": "错误的营业时间默认值",
+                "products": [
+                    {"name": "朱富贵100元代金券", "face_value": "100", "sale_price": "90"},
+                    {"name": "朱富贵200元代金券", "face_value": "200", "sale_price": "180"},
+                ],
+                "facts": {"使用时间": "适用门店营业时间内可用", "有效期": "当天买当天用"},
+                "time_rules": [],
+            },
+        )
+        self.assertIn("【使用时间】\n工作日可用。", product["ai_summary"])
+        self.assertNotIn("【使用时间】\n适用门店营业时间内可用。", product["ai_summary"])
+
     def test_holiday_wording_covers_weekend_without_literal_weekend_sku(self):
         self.store.save_v2_product(
             "10001", "鱼酷烤鱼", "2.6斤单鱼套餐：售价118元。平日节假日营业时间通用。",
