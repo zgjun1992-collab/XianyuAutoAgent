@@ -1259,6 +1259,23 @@ class V2Store(AppStore):
         return output
 
     @classmethod
+    def _raw_sku_stack_limits(cls, raw_text: str) -> Dict[str, int]:
+        """Extract denomination-specific stack limits from authoritative prose."""
+        limits = {}
+        pattern = re.compile(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*元?\s*(?:代金券|抵扣券|现金券|券)"
+            r"[^。；;\n，,、]{0,24}?"
+            r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|仅限(?:使用)?|限用|限)\s*"
+            r"([一二两三四五六七八九十两\d]+)\s*张"
+        )
+        for match in pattern.finditer(str(raw_text or "")):
+            face = cls._format_number(match.group(1))
+            count = cls._chinese_count(match.group(2))
+            if face and count and count > 0:
+                limits[face] = count
+        return limits
+
+    @classmethod
     def extract_product_options(cls, product: Dict) -> List[Dict]:
         raw_options = cls._raw_product_options(
             product.get("raw_text") or "", product.get("title") or ""
@@ -1342,6 +1359,13 @@ class V2Store(AppStore):
                 else:
                     output.append(option)
                     seen.add(key)
+        # The original knowledge is authoritative for usage limits. AI summaries
+        # sometimes collapse different denominations into one global limit.
+        raw_stack_limits = cls._raw_sku_stack_limits(product.get("raw_text") or "")
+        for option in output:
+            face = cls._format_number(option.get("face_value") or "")
+            if face in raw_stack_limits:
+                option["max_stack"] = str(raw_stack_limits[face])
         valid = []
         for option in output:
             if str(option.get("availability") or "available") != "available":
@@ -4773,6 +4797,12 @@ class V2Store(AppStore):
         if allows_mixed:
             return f"支持不同面额代金券一起叠加使用{max_text}。"
         denomination = values[0] if values else ""
+        if not denomination and len(set(sku_limits.values())) > 1:
+            details = "；".join(
+                f"{face}元代金券最多使用{count}张"
+                for face, count in sku_limits.items()
+            )
+            return f"不同面额的叠加上限不同：{details}；不同面额不能混用。"
         maximum = sku_limits.get(denomination)
         if maximum or max_match:
             maximum = maximum or int(max_match.group(1))
