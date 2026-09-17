@@ -1539,6 +1539,17 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("offline", aftersale["kind"])
         self.assertEqual(ordinary["reply"], aftersale["reply"])
 
+    def test_offline_purchase_order_is_not_swallowed_by_silence_rule(self):
+        self.store.save_v2_product(
+            "10001", "代买服务", "按实际需求人工报价", coupon_type="purchase_order",
+        )
+        with self.store._connect() as conn:
+            conn.execute("UPDATE v2_products SET item_status='offline' WHERE item_id='10001'")
+        result = self.store.resolve_deterministic("10001", "现在还能买吗")
+        self.assertEqual("offline", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("已下架", result["reply"])
+
     def test_store_followup_uses_previous_matches(self):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
         first = self.store.resolve_deterministic("10001", "华熙五棵松店可以用吗")
@@ -2487,6 +2498,39 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("支持不同面额代金券叠加", summary)
         reply = self.store.stacking_reply(product, "100元和300元可以一起用吗")
         self.assertIn("不能一起使用", reply)
+
+    def test_denomination_specific_stack_limits_override_collapsed_ai_summary(self):
+        self.store.save_v2_product(
+            "10001", "多面额代金券",
+            "100元代金券：售价68元\n"
+            "200元代金券：售价142元\n"
+            "300元代金券：售价202元\n"
+            "仅支持同面额代金券叠加，100代金券（可叠加2张）、"
+            "300代金券（仅限一张）、200代金券（可叠加5张）。",
+        )
+        self.store.save_ai_summary(
+            "10001", "错误地统一为最多2张",
+            {
+                "summary": "错误地统一为最多2张",
+                "products": [
+                    {"name": "100元代金券", "face_value": "100", "sale_price": "68", "max_stack": "2"},
+                    {"name": "200元代金券", "face_value": "200", "sale_price": "142", "max_stack": "2"},
+                    {"name": "300元代金券", "face_value": "300", "sale_price": "202", "max_stack": "2"},
+                ],
+                "facts": {"叠加规则": "仅支持同面额代金券叠加，每次最多使用2张"},
+                "time_rules": [],
+            },
+        )
+        product = self.store.get_v2_product("10001")
+        options = {option["face_value"]: option["max_stack"] for option in self.store.extract_product_options(product)}
+        self.assertEqual({"100": "2", "200": "5", "300": "1"}, options)
+        self.assertIn("最多使用2张", self.store.stacking_reply(product, "100元代金券最多可以用几张"))
+        self.assertIn("最多使用5张", self.store.stacking_reply(product, "200元代金券最多可以用几张"))
+        self.assertIn("最多使用1张", self.store.stacking_reply(product, "300元代金券最多可以用几张"))
+        generic = self.store.stacking_reply(product, "代金券最多可以用几张")
+        self.assertIn("100元代金券最多使用2张", generic)
+        self.assertIn("200元代金券最多使用5张", generic)
+        self.assertIn("300元代金券最多使用1张", generic)
 
     def test_package_price_is_never_treated_as_coupon_denomination(self):
         self.store.save_v2_product(
@@ -3722,6 +3766,28 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("合计抵扣200元", result["reply"])
         self.assertIn("最多使用2张100元券", result["reply"])
         self.assertNotIn("200元代金券可以叠加", result["reply"])
+
+    def test_colloquial_max_quantity_prefers_unit_rule_over_bad_structured_limit(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季代金券",
+            "200元代金券：售价116元，发100元券2张。"
+            "100元代金券最多使用2张，仅支持同面额叠加。",
+        )
+        self.store.save_ai_summary("10001", "结构化规格", {
+            "products": [{
+                "name": "同仁四季200元代金券", "option_type": "voucher",
+                "face_value": "200", "sale_price": "116",
+                "composition": "100元券2张", "max_stack": "1", "stock": "10",
+            }],
+        })
+
+        result = self.store.resolve_deterministic("10001", "200最多用几张")
+
+        self.assertEqual("stacking", result["kind"])
+        self.assertIn("发放2张100元代金券", result["reply"])
+        self.assertIn("这2张可以同一次使用", result["reply"])
+        self.assertIn("最多使用2张100元券", result["reply"])
+        self.assertNotIn("最多使用1张", result["reply"])
 
     def test_usage_subject_reads_product_rule_instead_of_store_index(self):
         self.store.save_v2_product(

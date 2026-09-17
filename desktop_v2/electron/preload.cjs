@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('xianyuDesktop', {
   installUpdate: () => ipcRenderer.invoke('update:install'),
   setBrowserBounds: (bounds) => ipcRenderer.send('browser:set-bounds', bounds),
   browser: (action) => ipcRenderer.invoke('browser:action', action),
+  showVerificationPrompt: () => ipcRenderer.invoke('verification:prompt'),
   chooseExcel: () => ipcRenderer.invoke('dialog:choose-excel'),
   chooseImage: () => ipcRenderer.invoke('dialog:choose-image'),
   imagePreview: (filePath) => ipcRenderer.invoke('asset:preview', filePath),

@@ -7,7 +7,7 @@ import re
 import websockets
 from loguru import logger
 from dotenv import load_dotenv, set_key
-from XianyuApis import XianyuApis
+from XianyuApis import XianyuApis, XianyuVerificationRequired
 import sys
 import random
 
@@ -113,6 +113,8 @@ class XianyuLive:
         self.connection_restart_flag = False  # 连接重启标志
         self.cookie_revision = 0
         self.last_token_error = ""
+        self.verification_required = False
+        self.verification_url = ""
         
         # 人工接管相关配置
         self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
@@ -147,6 +149,7 @@ class XianyuLive:
         self._store_contexts = {}
         self._query_contexts = {}
         self._listing_status_cache = None
+        self._listing_status_refresh_task = None
         self.listing_status_ttl = max(
             10.0, float(os.getenv("LISTING_STATUS_TTL", "60"))
         )
@@ -481,6 +484,8 @@ class XianyuLive:
                 self.current_token = new_token
                 self.last_token_refresh_time = time.time()
                 self.last_token_error = ""
+                self.verification_required = False
+                self.verification_url = ""
                 logger.info("Token刷新成功")
                 return new_token
             else:
@@ -488,6 +493,17 @@ class XianyuLive:
                 self.last_token_error = "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
                 return None
                 
+        except XianyuVerificationRequired as e:
+            self.verification_required = True
+            self.verification_url = e.verification_url
+            self.last_token_error = "闲鱼要求安全验证，请在软件内完成验证后重试"
+            self.emit_event(
+                "verification_required",
+                message=self.last_token_error,
+                url=self.verification_url,
+            )
+            logger.error(self.last_token_error)
+            return None
         except Exception as e:
             logger.error(f"Token刷新异常: {str(e)}")
             self.last_token_error = str(e) or "闲鱼消息Token获取失败"
@@ -1109,6 +1125,28 @@ class XianyuLive:
                 product["enabled"] = 0
         return product
 
+    def schedule_listing_status_refresh(self, item_id, product):
+        """Refresh marketplace state in the background without delaying a reply."""
+        task = getattr(self, "_listing_status_refresh_task", None)
+        if task and not task.done():
+            return False
+
+        async def refresh():
+            try:
+                await self.refresh_current_listing_status(item_id, product)
+            except Exception as exc:
+                logger.warning(f"后台核对商品上下架状态失败，保留本地状态: {exc}")
+
+        task = asyncio.create_task(refresh())
+        self._listing_status_refresh_task = task
+
+        def clear(completed):
+            if getattr(self, "_listing_status_refresh_task", None) is completed:
+                self._listing_status_refresh_task = None
+
+        task.add_done_callback(clear)
+        return True
+
     def prepare_product_first_reply(self, product):
         """Preserve an explicitly saved welcome; sanitize automatic drafts."""
         product = product or {}
@@ -1179,21 +1217,24 @@ class XianyuLive:
         product = product or {}
         if str(product.get("coupon_type") or "").strip() != "purchase_order":
             return False
-        product_offline = self.is_product_offline(product)
+        # Offline is a higher-priority product state than the purchase-order
+        # silence rule. Let the normal deterministic route send the unified
+        # offline reply instead of swallowing the buyer's consultation here.
+        if self.is_product_offline(product):
+            return False
         first_reply_sent_now = False
-        if not product_offline:
-            try:
-                first_reply_sent_now = await self.send_required_first_reply(
-                    websocket, chat_id, send_user_id, scope_id, item_id,
-                    product, conversation, message,
-                )
-            except Exception as exc:
-                logger.error(f"代买单首次回复发送失败: {exc}")
-                self.emit_event(
-                    "product_first_reply_error", chat_id=chat_id,
-                    item_id=item_id, scope_id=scope_id, message=str(exc),
-                )
-                return True
+        try:
+            first_reply_sent_now = await self.send_required_first_reply(
+                websocket, chat_id, send_user_id, scope_id, item_id,
+                product, conversation, message,
+            )
+        except Exception as exc:
+            logger.error(f"代买单首次回复发送失败: {exc}")
+            self.emit_event(
+                "product_first_reply_error", chat_id=chat_id,
+                item_id=item_id, scope_id=scope_id, message=str(exc),
+            )
+            return True
         self.context_manager.add_message_by_chat(
             scope_id, send_user_id, item_id, "user", message
         )
@@ -1201,8 +1242,7 @@ class XianyuLive:
             logger.info(f"代买单仅发送商品首次回复 (会话: {chat_id})")
             return True
         if (
-            product_offline
-            or not bool(product.get("enabled", 1))
+            not bool(product.get("enabled", 1))
             or self.is_manual_mode(scope_id)
             or self.should_silence_disabled_purchase_order_greeting(product, message)
             or not self.should_send_first_reply(message)
@@ -1642,22 +1682,19 @@ class XianyuLive:
                 logger.debug("系统消息，跳过处理")
                 return
 
-            # Product state is a hard gate and must be fresh before the welcome.
-            # A stale two-day-old local sync must not let an offline listing send
-            # its old first reply, keyword rule or model answer.
+            # Reply immediately from the local product state. Marketplace listing
+            # pagination can take several seconds, so refresh it in the background
+            # and apply any change to later messages instead of blocking this one.
             listing_started_at = time.perf_counter()
             if current_product:
-                try:
-                    current_product = await self.refresh_current_listing_status(
-                        item_id, current_product
-                    )
-                except Exception as exc:
-                    logger.warning(f"实时核对商品上下架状态失败，保留本地状态: {exc}")
+                self.schedule_listing_status_refresh(item_id, current_product)
             reply_timings["商品核对"] = (time.perf_counter() - listing_started_at) * 1000
+            product_offline = self.is_product_offline(current_product)
 
             # 代买单与普通卡券完全隔离：首次消息只发已配置的首次回复；
             # 后续只处理纯寒暄，其余问题不进入业务规则、AI、审核或售后。
-            if await self.handle_purchase_order_buyer_message(
+            # 下架状态优先于代买单静默，确保真实买家咨询能收到下架提示。
+            if not product_offline and await self.handle_purchase_order_buyer_message(
                 websocket, chat_id, send_user_id, scope_id, item_id,
                 current_product, conversation, send_message,
             ):
@@ -1671,27 +1708,26 @@ class XianyuLive:
                 or (getattr(self.app_store, "get_conversation_state", lambda _scope: "")(scope_id))
                 or ""
             )
-            if conversation_state == "aftersale":
+            if not product_offline and conversation_state == "aftersale":
                 await self.send_aftersale_state_reply(
                     websocket, chat_id, send_user_id, send_user_name, scope_id,
                     item_id, send_message, policies, url_info, first=False,
                 )
                 return
-            if conversation_state == "aftersale_pending":
+            if not product_offline and conversation_state == "aftersale_pending":
                 await self.send_aftersale_state_reply(
                     websocket, chat_id, send_user_id, send_user_name, scope_id,
                     item_id, send_message, policies, url_info, first=True,
                 )
                 return
             order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
-            if self.is_aftersale_entry_message(send_message, order_context):
+            if not product_offline and self.is_aftersale_entry_message(send_message, order_context):
                 await self.send_aftersale_state_reply(
                     websocket, chat_id, send_user_id, send_user_name, scope_id,
                     item_id, send_message, policies, url_info, first=True,
                 )
                 return
 
-            product_offline = self.is_product_offline(current_product)
             first_reply_sent_now = False
             if current_product and not product_offline:
                 try:
@@ -2361,7 +2397,14 @@ class XianyuLive:
                 
             except Exception as e:
                 logger.error(f"连接发生错误: {e}")
-                self.emit_event("status", value="error", message=str(e))
+                if self.verification_required:
+                    self.emit_event(
+                        "verification_required",
+                        message=self.last_token_error,
+                        url=self.verification_url,
+                    )
+                else:
+                    self.emit_event("status", value="error", message=str(e))
                 
             finally:
                 # 清理任务

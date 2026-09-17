@@ -8,7 +8,7 @@ from app_store import (
     LEGACY_AFTERSALE_POLICY_SUMMARY, LEGACY_GLOBAL_SYSTEM_PROMPT,
     PolicyEngine, find_unauthorized_promises,
 )
-from XianyuApis import XianyuApis
+from XianyuApis import XianyuApis, XianyuVerificationRequired
 
 
 class AppStoreTests(unittest.TestCase):
@@ -255,6 +255,30 @@ class AppStoreTests(unittest.TestCase):
     def test_desktop_api_mode_is_non_interactive(self):
         api = XianyuApis(interactive=False)
         self.assertFalse(api.interactive)
+
+    def test_message_token_risk_control_exposes_verification_url(self):
+        api = XianyuApis(interactive=False)
+        api.session.cookies.set("_m_h5_tk", "token_123")
+
+        class Response:
+            headers = {}
+
+            @staticmethod
+            def json():
+                return {
+                    "ret": ["FAIL_SYS_USER_VALIDATE::RGV587_ERROR"],
+                    "data": {
+                        "url": "https://h5.m.goofish.com/_____tmd_____/punish?token=test"
+                    },
+                }
+
+        api.session.post = lambda *args, **kwargs: Response()
+        with self.assertRaises(XianyuVerificationRequired) as raised:
+            api.get_token("device-1")
+        self.assertEqual(
+            "https://h5.m.goofish.com/_____tmd_____/punish?token=test",
+            raised.exception.verification_url,
+        )
 
     def test_discounted_total_question_is_not_treated_as_bargaining(self):
         decision = PolicyEngine(DEFAULT_POLICIES).evaluate("273优惠完多少", "正常凑单答复")

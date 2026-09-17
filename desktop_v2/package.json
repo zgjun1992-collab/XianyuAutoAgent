@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.6",
+  "version": "0.11.18",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -53,8 +53,12 @@
         "to": "docs/阿里云百炼APIKey获取图文教程.pdf"
       },
       {
-        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.6.pdf",
-        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.6.pdf"
+        "from": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.11.pdf",
+        "to": "docs/闲鱼卡券AI客服-V3.6-客户使用说明书-0.11.11.pdf"
+      },
+      {
+        "from": "assets/xianyu-ai.ico",
+        "to": "tray-icon.ico"
       }
     ],
     "publish": [
@@ -64,15 +68,18 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.6：新增 Windows 系统托盘，可查看本地后台 PID 和客服状态，并可启动、停止、重启后台或完全退出；保留回复分段耗时诊断。"
+      "releaseNotes": "0.11.18：修复不同面额代金券的独立叠加上限被合并为统一数量的问题；保留原始商品规则优先级。"
     },
     "win": {
+      "icon": "assets/xianyu-ai.ico",
       "target": [
         "nsis"
       ],
       "artifactName": "XianyuCardAI-V3.6-CloudPreview-${version}.${ext}"
     },
     "nsis": {
+      "installerIcon": "assets/xianyu-ai.ico",
+      "uninstallerIcon": "assets/xianyu-ai.ico",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

@@ -4,6 +4,7 @@ const { normalizeServiceStatus, isRecordedBackend } = require('../electron/tray-
 
 test('formats customer service status for the tray menu', () => {
   assert.equal(normalizeServiceStatus('connected'), '客服运行中')
+  assert.equal(normalizeServiceStatus('verification_required'), '等待闲鱼安全验证')
   assert.equal(normalizeServiceStatus('stopped'), '客服已停止')
   assert.equal(normalizeServiceStatus('unexpected'), '状态未知')
 })

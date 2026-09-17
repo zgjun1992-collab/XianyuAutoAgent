@@ -14,10 +14,21 @@ if (-not (Test-Path -LiteralPath $pnpmPath)) {
     throw "Desktop build runtime was not found."
 }
 
+$backendDistPath = Join-Path $PSScriptRoot "dist-cloud-backend"
+if (Test-Path -LiteralPath $backendDistPath) {
+    $resolvedBackendDist = (Resolve-Path -LiteralPath $backendDistPath).Path
+    $resolvedRepo = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    if ((Split-Path -Parent $resolvedBackendDist) -ne $resolvedRepo -or
+        (Split-Path -Leaf $resolvedBackendDist) -ne "dist-cloud-backend") {
+        throw "Refusing to clean unexpected backend output path: $resolvedBackendDist"
+    }
+    Remove-Item -LiteralPath $resolvedBackendDist -Recurse -Force
+}
+
 & $pythonPath -m PyInstaller `
     --noconfirm `
     --clean `
-    --onefile `
+    --onedir `
     --console `
     --name "xianyu-cloud-preview-backend" `
     --distpath "dist-cloud-backend" `

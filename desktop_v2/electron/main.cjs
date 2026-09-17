@@ -8,6 +8,9 @@ const crypto = require('crypto')
 const { autoUpdater } = require('./generated-updater.cjs')
 const { normalizeReleaseNotes, isForcedUpdate, publicUpdateState } = require('./update-policy.cjs')
 const { normalizeServiceStatus, isRecordedBackend } = require('./tray-policy.cjs')
+const { requestLocalBackend } = require('./local-backend-client.cjs')
+const { stageStoreImport } = require('./import-file-policy.cjs')
+const { stringifyAsciiJson } = require('./rpc-codec.cjs')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -50,11 +53,16 @@ for (const eventName of ['will-finish-launching', 'ready', 'before-quit', 'will-
 }
 
 let mainWindow = null
+let windowCreatePromise = null
 let goofishView = null
 let backendProcess = null
 let backendPort = null
 let backendReady = false
 let backendIdentity = null
+let backendStartupFailure = null
+let backendStdoutBuffer = ''
+let backendRpcSequence = 0
+const backendRpcPending = new Map()
 let lastPendingCount = 0
 let cookieTimer = null
 let goofishSession = null
@@ -66,6 +74,19 @@ let trayStatusTimer = null
 let trayServiceStatus = 'stopped'
 let isQuitting = false
 let trayNoticeShown = false
+
+function isAllowedGoofishNavigation(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ''))
+    if (parsed.protocol !== 'https:') return false
+    const host = parsed.hostname.toLowerCase()
+    return ['goofish.com', 'taobao.com', 'tmall.com', 'alibaba.com'].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`)
+    )
+  } catch (_error) {
+    return false
+  }
+}
 
 const updaterState = {
   status: 'idle',
@@ -128,14 +149,14 @@ async function cleanupRecordedBackend() {
   const record = saved.managed_backend
   if (!record) return false
   try {
-    const response = await fetch(`http://127.0.0.1:${Number(record.port)}/health`)
+    const response = await requestLocalBackend(Number(record.port), '/health')
     const payload = response.ok ? await response.json() : null
     if (!isRecordedBackend(record, payload?.data)) {
       clearManagedBackendRecord(Number(record.pid))
       return false
     }
     try {
-      await fetch(`http://127.0.0.1:${Number(record.port)}/service/stop`, {
+      await requestLocalBackend(Number(record.port), '/service/stop', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
       })
     } catch (_error) {}
@@ -151,18 +172,45 @@ async function cleanupRecordedBackend() {
   }
 }
 
+function bringWindowToFront(window) {
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.setSkipTaskbar(false)
+  window.setAlwaysOnTop(true)
+  window.show()
+  window.focus()
+  window.moveTop()
+  setTimeout(() => {
+    if (!window.isDestroyed()) window.setAlwaysOnTop(false)
+  }, 800)
+}
+
+async function ensureMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (!goofishSession) throw new Error('主窗口环境尚未初始化，请稍后重试')
+    if (!windowCreatePromise) {
+      windowCreatePromise = createWindow().finally(() => { windowCreatePromise = null })
+    }
+    await windowCreatePromise
+  }
+  bringWindowToFront(mainWindow)
+}
+
 function showMainWindow() {
-  if (!mainWindow) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
+  appendBackendLog('WINDOW', 'tray requested main window')
+  ensureMainWindow().catch((error) => {
+    appendBackendLog('WINDOW_ERROR', error?.stack || error?.message || String(error))
+    dialog.showErrorBox('主界面打开失败', `${error?.message || error}\n日志：${backendLogPath()}`)
+  })
 }
 
 function trayIcon() {
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#ffd600"/><circle cx="16" cy="16" r="10" fill="#171a17"/><text x="16" y="20" text-anchor="middle" font-family="Arial" font-size="11" font-weight="700" fill="#ffd600">AI</text></svg>'
-  const icon = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`)
-  const fallback = nativeImage.createFromPath(process.execPath)
-  return (icon.isEmpty() ? fallback : icon).resize({ width: 16, height: 16 })
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'tray-icon.ico')
+    : path.join(projectRoot, 'desktop_v2', 'assets', 'xianyu-ai.ico')
+  const icon = nativeImage.createFromPath(iconPath)
+  if (icon.isEmpty()) throw new Error(`系统托盘图标读取失败: ${iconPath}`)
+  return icon.resize({ width: 16, height: 16, quality: 'best' })
 }
 
 function notifyTray(title, body) {
@@ -228,6 +276,7 @@ function createTray() {
   if (tray && !tray.isDestroyed()) return
   tray = new Tray(trayIcon())
   tray.on('click', showMainWindow)
+  tray.on('double-click', showMainWindow)
   updateTrayMenu()
   trayStatusTimer = setInterval(() => refreshTrayStatus().catch(() => {}), 5000)
 }
@@ -254,6 +303,22 @@ function appendUpdateLog(level, message, detail = '') {
     console.error('V3 updater: failed to write log', error?.message || String(error))
   }
   console.error(`V3 updater ${level}: ${message}`, detail)
+}
+
+function backendLogPath() {
+  return path.join(app.getPath('userData'), 'logs', 'backend.log')
+}
+
+function appendBackendLog(level, message) {
+  const normalized = String(message || '').replace(/\0/g, '').trimEnd()
+  const line = `${new Date().toISOString()} [${level}] ${normalized}\n`
+  try {
+    fs.mkdirSync(path.dirname(backendLogPath()), { recursive: true })
+    fs.appendFileSync(backendLogPath(), line, 'utf8')
+  } catch (error) {
+    console.error('V3 backend: failed to write log', error?.message || String(error))
+  }
+  console.error(`V3 backend ${level}: ${normalized}`)
 }
 
 function setUpdaterState(status, patch = {}) {
@@ -647,42 +712,97 @@ async function requestBackend(method, requestPath, body) {
     const currentLicense = await licenseStatus()
     if (!currentLicense.active) throw new Error(currentLicense.error || '请先登录并开通有效套餐')
   }
-  const response = await fetch(`http://127.0.0.1:${backendPort}${requestPath}`, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body)
-  })
-  const payload = await response.json()
-  if (!response.ok || !payload.ok) throw new Error(payload.error || `本地服务错误 ${response.status}`)
+  const response = await requestBackendRpc(method, requestPath, body)
+  const payload = response.payload || {}
+  if (response.status < 200 || response.status >= 300 || !payload.ok) {
+    throw new Error(response.error || payload.error || `本地服务错误 ${response.status}`)
+  }
   return payload.data
 }
 
-async function waitForBackend() {
-  const started = Date.now()
-  while (Date.now() - started < 25000) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${backendPort}/health`)
-      if (response.ok) {
-        const payload = await response.json()
-        const identity = payload?.data || {}
-        const expectedVersion = app.getVersion()
-        if (identity.edition !== 'V3.6' || identity.version !== expectedVersion) {
-          throw new Error(
-            `前后端版本不一致：桌面端 V3.6/${expectedVersion}，` +
-            `后台 ${identity.edition || '未知版本'}/${identity.version || '未知版本'}。` +
-            '请关闭旧程序后重新安装当前版本。'
-          )
-        }
-        backendIdentity = identity
-        backendReady = true
-        return
+function requestBackendRpc(method, requestPath, body) {
+  const child = backendProcess
+  if (!child || child.killed || !child.stdin?.writable) {
+    return Promise.reject(new Error('本地AI服务通信通道未连接'))
+  }
+  const id = `${Date.now()}-${++backendRpcSequence}`
+  return new Promise((resolve, reject) => {
+    const timeoutMs = requestPath === '/snapshot' ? 65000 : 35000
+    const timer = setTimeout(() => {
+      backendRpcPending.delete(id)
+      reject(new Error(`本地AI服务请求超时：${requestPath}`))
+    }, timeoutMs)
+    backendRpcPending.set(id, { resolve, reject, timer })
+    const requestLine = stringifyAsciiJson({ id, method, path: requestPath, body })
+    child.stdin.write(`${requestLine}\n`, 'ascii', (error) => {
+      if (!error) return
+      const pending = backendRpcPending.get(id)
+      if (!pending) return
+      backendRpcPending.delete(id)
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    })
+  })
+}
+
+function handleBackendStdout(chunk) {
+  backendStdoutBuffer += chunk.toString()
+  const lines = backendStdoutBuffer.split(/\r?\n/)
+  backendStdoutBuffer = lines.pop() || ''
+  for (const line of lines) {
+    if (!line) continue
+    appendBackendLog('STDOUT', line)
+    if (line.startsWith('__XIANYU_RPC__')) {
+      try {
+        const response = JSON.parse(line.slice('__XIANYU_RPC__'.length))
+        const pending = backendRpcPending.get(String(response.id || ''))
+        if (!pending) continue
+        backendRpcPending.delete(String(response.id))
+        clearTimeout(pending.timer)
+        if (response.error) pending.reject(new Error(response.error))
+        else pending.resolve(response)
+      } catch (error) {
+        appendBackendLog('RPC_ERROR', error?.message || String(error))
       }
-    } catch (error) {
-      if (String(error?.message || error).includes('前后端版本不一致')) throw error
+      continue
+    }
+    try {
+      const message = JSON.parse(line)
+      if (message.ready === true) {
+        backendIdentity = {
+          edition: message.edition || '',
+          version: message.version || '',
+          build_commit: message.build_commit || ''
+        }
+        backendReady = true
+      }
+    } catch (_error) {}
+  }
+}
+
+async function waitForBackend(child = backendProcess) {
+  const started = Date.now()
+  while (Date.now() - started < 90000) {
+    if (backendStartupFailure) throw backendStartupFailure
+    if (child && child.exitCode !== null) {
+      throw new Error(`本地AI服务提前退出（代码 ${child.exitCode}）。日志：${backendLogPath()}`)
+    }
+    if (backendReady && backendIdentity) {
+      const expectedVersion = app.getVersion()
+      if (backendIdentity.edition !== 'V3.6' || backendIdentity.version !== expectedVersion) {
+        throw new Error(
+          `前后端版本不一致：桌面端 V3.6/${expectedVersion}，` +
+          `后台 ${backendIdentity.edition || '未知版本'}/${backendIdentity.version || '未知版本'}。` +
+          '请关闭旧程序后重新安装当前版本。'
+        )
+      }
+      return
     }
     await new Promise((resolve) => setTimeout(resolve, 250))
   }
-  throw new Error('本地AI服务启动超时')
+  throw new Error(
+    `本地AI服务启动超时（已等待90秒）。请检查安全软件是否拦截后台程序；日志：${backendLogPath()}`
+  )
 }
 
 async function startBackend() {
@@ -694,25 +814,48 @@ async function startBackend() {
     executable = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
     args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir]
   } else {
-    executable = path.join(process.resourcesPath, 'backend', 'xianyu-cloud-preview-backend.exe')
+    executable = path.join(
+      process.resourcesPath, 'backend', 'xianyu-cloud-preview-backend',
+      'xianyu-cloud-preview-backend.exe'
+    )
     args = ['--port', String(backendPort), '--data-dir', dataDir]
   }
+  if (!fs.existsSync(executable)) {
+    throw new Error(`本地AI服务文件不存在，安装包可能不完整：${executable}`)
+  }
+  backendStartupFailure = null
+  backendStdoutBuffer = ''
+  appendBackendLog('INFO', `starting version=${app.getVersion()} port=${backendPort} executable=${executable}`)
   const child = spawn(executable, args, {
     cwd: isDev ? projectRoot : path.dirname(executable),
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe']
+    env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+    stdio: ['pipe', 'pipe', 'pipe']
   })
   backendProcess = child
   saveManagedBackendRecord(child, backendPort)
   updateTrayMenu()
-  child.stdout.on('data', (chunk) => {
-    const text = chunk.toString()
-    if (text.includes('"ready": true')) backendReady = true
-  })
+  child.stdout.on('data', handleBackendStdout)
   child.stderr.on('data', (chunk) => {
+    appendBackendLog('STDERR', chunk.toString())
     mainWindow?.webContents.send('app:event', { type: 'backend-log', message: chunk.toString() })
   })
-  child.on('exit', (code) => {
+  child.on('error', (error) => {
+    backendStartupFailure = new Error(`本地AI服务无法启动：${error?.message || error}。日志：${backendLogPath()}`)
+    appendBackendLog('ERROR', backendStartupFailure.message)
+  })
+  child.on('exit', (code, signal) => {
+    appendBackendLog('EXIT', `code=${code ?? '-'} signal=${signal || '-'}`)
+    for (const [id, pending] of backendRpcPending) {
+      backendRpcPending.delete(id)
+      clearTimeout(pending.timer)
+      pending.reject(new Error(`本地AI服务已退出（代码 ${code ?? '-'}）`))
+    }
+    if (!backendReady && !backendStartupFailure) {
+      backendStartupFailure = new Error(
+        `本地AI服务提前退出（代码 ${code ?? '-'}）。请检查安全软件拦截记录；日志：${backendLogPath()}`
+      )
+    }
     clearManagedBackendRecord(child.pid)
     if (backendProcess === child) {
       backendReady = false
@@ -723,7 +866,7 @@ async function startBackend() {
       mainWindow?.webContents.send('app:event', { type: 'backend-exit', code })
     }
   })
-  await waitForBackend()
+  await waitForBackend(child)
   await pushRuntimeConfig()
   await refreshTrayStatus()
 }
@@ -770,7 +913,7 @@ async function createGoofishView() {
   mainWindow.contentView.addChildView(goofishView)
   goofishView.setBounds({ x: 228, y: 80, width: 900, height: 700 })
   goofishView.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://www.goofish.com/')) {
+    if (isAllowedGoofishNavigation(url)) {
       goofishView.webContents.loadURL(url)
     } else {
       shell.openExternal(url)
@@ -798,6 +941,7 @@ async function createWindow() {
     minHeight: 760,
     backgroundColor: '#f4efe2',
     title: '闲鱼卡券 AI 客服 V3.6 云端测试版',
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
@@ -822,6 +966,7 @@ async function createWindow() {
     goofishView = null
     mainWindow = null
   })
+  bringWindowToFront(mainWindow)
 }
 
 function registerIpc() {
@@ -858,13 +1003,27 @@ function registerIpc() {
     if (command === 'home') await goofishView.webContents.loadURL('https://www.goofish.com/im')
     if (command === 'navigate') {
       const target = String(action?.url || '')
-      const parsed = new URL(target)
-      if (!['www.goofish.com', 'h5.m.goofish.com', '2.taobao.com'].includes(parsed.hostname)) {
-        throw new Error('仅允许在内置浏览器中打开闲鱼页面')
+      if (!isAllowedGoofishNavigation(target)) {
+        throw new Error('仅允许在内置浏览器中打开闲鱼及其安全验证页面')
       }
-      await goofishView.webContents.loadURL(parsed.toString())
+      await goofishView.webContents.loadURL(target)
     }
     return { url: goofishView.webContents.getURL() }
+  })
+  ipcMain.handle('verification:prompt', async () => {
+    await ensureMainWindow()
+    showMainWindow()
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '闲鱼安全验证',
+      message: '闲鱼要求完成安全验证',
+      detail: '请点击“立即验证”，在软件内置闲鱼页面完成验证。完成后点击工具栏中的“验证完成，重新连接”。',
+      buttons: ['立即验证', '稍后处理'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    })
+    return { open: result.response === 0 }
   })
   ipcMain.handle('dialog:choose-excel', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -872,7 +1031,8 @@ function registerIpc() {
       properties: ['openFile'],
       filters: [{ name: '门店文件', extensions: ['xlsx', 'xlsm', 'csv', 'txt'] }]
     })
-    return result.canceled ? '' : result.filePaths[0]
+    if (result.canceled) return ''
+    return stageStoreImport(result.filePaths[0], app.getPath('userData'))
   })
   ipcMain.handle('dialog:choose-image', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -937,7 +1097,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     await cleanupRecordedBackend()
     await startBackend()
     console.error('V3 stage: backend ready')
-    await createWindow()
+    await ensureMainWindow()
     console.error('V3 stage: window ready')
     setTimeout(() => checkForAppUpdate(false).catch((error) => appendUpdateLog('ERROR', 'startup update check failed', error?.message || error)), 5000)
     setInterval(() => syncGoofishCookie().catch(() => {}), 30000)

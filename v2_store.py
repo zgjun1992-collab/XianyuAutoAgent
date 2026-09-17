@@ -1259,6 +1259,23 @@ class V2Store(AppStore):
         return output
 
     @classmethod
+    def _raw_sku_stack_limits(cls, raw_text: str) -> Dict[str, int]:
+        """Extract denomination-specific stack limits from authoritative prose."""
+        limits = {}
+        pattern = re.compile(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*元?\s*(?:代金券|抵扣券|现金券|券)"
+            r"[^。；;\n，,、]{0,24}?"
+            r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|仅限(?:使用)?|限用|限)\s*"
+            r"([一二两三四五六七八九十两\d]+)\s*张"
+        )
+        for match in pattern.finditer(str(raw_text or "")):
+            face = cls._format_number(match.group(1))
+            count = cls._chinese_count(match.group(2))
+            if face and count and count > 0:
+                limits[face] = count
+        return limits
+
+    @classmethod
     def extract_product_options(cls, product: Dict) -> List[Dict]:
         raw_options = cls._raw_product_options(
             product.get("raw_text") or "", product.get("title") or ""
@@ -1342,6 +1359,13 @@ class V2Store(AppStore):
                 else:
                     output.append(option)
                     seen.add(key)
+        # The original knowledge is authoritative for usage limits. AI summaries
+        # sometimes collapse different denominations into one global limit.
+        raw_stack_limits = cls._raw_sku_stack_limits(product.get("raw_text") or "")
+        for option in output:
+            face = cls._format_number(option.get("face_value") or "")
+            if face in raw_stack_limits:
+                option["max_stack"] = str(raw_stack_limits[face])
         valid = []
         for option in output:
             if str(option.get("availability") or "available") != "available":
@@ -4671,7 +4695,8 @@ class V2Store(AppStore):
         text = str(message or "")
         if not re.search(
             r"一次(?:可以|能)?用(?:几|多少)张|(?:可以|能)用(?:几|多少)张|"
-            r"每次(?:最多)?用(?:几|多少)张|一桌(?:最多)?用(?:几|多少)张",
+            r"(?:每次|一桌)?(?:最多)(?:可以|能)?用(?:几|多少)张|"
+            r"每次用(?:几|多少)张|一桌用(?:几|多少)张",
             text,
         ):
             return ""
@@ -4722,6 +4747,12 @@ class V2Store(AppStore):
                 ("使用规则", "使用条件", "核销规则", "限制", "usage", "conditions"),
             ),
         ))
+        unit_label = re.escape(self._format_number(unit_value))
+        unit_count_cap = re.search(
+            rf"{unit_label}\s*元(?:代金)?券[^。；\n]{{0,12}}?"
+            r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
+            knowledge,
+        )
         amount_cap = re.search(
             r"(?:一桌|每桌|单桌|每次|单次)[^。；\n]{0,12}?"
             r"(?:最多)?(?:可)?(?:代|抵(?:用|扣)?)\s*(\d+(?:\.\d+)?)\s*元",
@@ -4732,13 +4763,17 @@ class V2Store(AppStore):
         if amount_cap and unit_value > 0:
             total_cap = Decimal(amount_cap.group(1))
             maximum = int(total_cap // unit_value)
+        elif unit_count_cap:
+            # A denomination-specific usage rule outranks a structured SKU field.
+            # Summaries can mistake “每单限购1份” for “每次限用1张”, while one
+            # sellable 200元规格 may actually deliver two stackable 100元 coupons.
+            maximum = int(unit_count_cap.group(1))
         if maximum <= 0:
             try:
                 maximum = int(Decimal(str(selected.get("max_stack") or "0")))
             except (InvalidOperation, ValueError):
                 maximum = 0
         if maximum <= 0:
-            unit_label = re.escape(self._format_number(unit_value))
             count_cap = re.search(
                 rf"{unit_label}\s*元(?:代金)?券[^。；\n]{{0,12}}?"
                 r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
@@ -4794,7 +4829,11 @@ class V2Store(AppStore):
         )
 
     def stacking_reply(self, product: Dict, message: str) -> str:
-        if not re.search(r"一起用|同时用|叠加|混用|合并用|一次(?:可以|能)?用|可以用几张|能用几张", message):
+        if not re.search(
+            r"一起用|同时用|叠加|混用|合并用|一次(?:可以|能)?用|"
+            r"可以用几张|能用几张|最多(?:可以|能)?用(?:几|多少)张",
+            message,
+        ):
             return ""
         if not re.search(r"代金券|优惠券|券|面额|\d+(?:\.\d+)?|[一二两三四五六七八九十]\s*张|几张|多少张|叠加|混用", message):
             return ""
@@ -4828,6 +4867,12 @@ class V2Store(AppStore):
         if allows_mixed:
             return f"支持不同面额代金券一起叠加使用{max_text}。"
         denomination = values[0] if values else ""
+        if not denomination and len(set(sku_limits.values())) > 1:
+            details = "；".join(
+                f"{face}元代金券最多使用{count}张"
+                for face, count in sku_limits.items()
+            )
+            return f"不同面额的叠加上限不同：{details}；不同面额不能混用。"
         maximum = sku_limits.get(denomination)
         if maximum or max_match:
             maximum = maximum or int(max_match.group(1))
@@ -5831,7 +5876,8 @@ class V2Store(AppStore):
     def import_store_list(self, path: str, name: str, item_ids: List[str], replace_item_bindings: bool = False) -> Dict:
         path = os.path.abspath(path)
         if not os.path.isfile(path):
-            raise FileNotFoundError("未找到门店表格")
+            filename = os.path.basename(path) or "未选择文件"
+            raise FileNotFoundError(f"未找到门店表格：{filename}，请重新选择后导入")
         if os.path.splitext(path)[1].lower() == ".txt":
             last_error = None
             for encoding in ("utf-8-sig", "gb18030"):
@@ -8462,7 +8508,8 @@ class V2Store(AppStore):
 
         stacking_match = re.search(
             r"一次(?:可以|能)?用(?:几|多少)张|(?:可以|能)用(?:几|多少)张|"
-            r"每次(?:最多)?用(?:几|多少)张|一桌(?:最多)?用(?:几|多少)张",
+            r"(?:每次|一桌)?(?:最多)(?:可以|能)?用(?:几|多少)张|"
+            r"每次用(?:几|多少)张|一桌用(?:几|多少)张",
             text,
         )
         add_task("stacking", "使用张数", stacking_match)
@@ -8996,17 +9043,6 @@ class V2Store(AppStore):
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
         product = self.get_v2_product(item_id) or {}
 
-        # This resolver never produces buyer-facing business answers for a
-        # purchase-order product. The live workflow owns its one-time welcome
-        # and pure greeting response before reaching this fallback.
-        if str(product.get("coupon_type") or "").strip() == "purchase_order":
-            return {
-                "reply": "",
-                "source": "代买单仅自动处理首次回复和纯寒暄",
-                "decision": "silent",
-                "kind": "purchase_order_other",
-            }
-
         # Product status is the highest business gate. Once the listing is
         # offline, every buyer consultation gets the same deterministic answer;
         # no price/store/keyword/aftersale branch may leak through.
@@ -9018,6 +9054,17 @@ class V2Store(AppStore):
                 "source": "当前商品已下架",
                 "decision": "allow",
                 "kind": "offline",
+            }
+
+        # This resolver never produces buyer-facing business answers for an
+        # on-sale purchase-order product. Offline must stay above this silence
+        # gate so an offline purchase-order listing is not swallowed.
+        if str(product.get("coupon_type") or "").strip() == "purchase_order":
+            return {
+                "reply": "",
+                "source": "代买单仅自动处理首次回复和纯寒暄",
+                "decision": "silent",
+                "kind": "purchase_order_other",
             }
 
         if contains_sensitive_voucher_data(message):
@@ -10495,11 +10542,11 @@ class V2Store(AppStore):
             raise ValueError("退款订单不存在")
         return record
 
-    def dashboard(self) -> Dict:
-        products = self.list_v2_products()
-        stores = self.list_store_lists()
+    def dashboard(self, products=None, stores=None, refund_orders=None) -> Dict:
+        products = self.list_v2_products() if products is None else products
+        stores = self.list_store_lists() if stores is None else stores
         audits = self.count_audits()
-        refund_orders = self.list_refund_orders()
+        refund_orders = self.list_refund_orders() if refund_orders is None else refund_orders
         return {
             "products": len(products),
             "enabled_products": sum(1 for item in products if item["enabled"]),

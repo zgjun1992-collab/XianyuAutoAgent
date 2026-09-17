@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import time
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock
 from requests import Session
 
 from main import XianyuLive
+from XianyuApis import XianyuVerificationRequired
 
 
 class _Store:
@@ -102,6 +104,29 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, live.cookie_revision)
         self.assertTrue(live.connection_restart_flag)
 
+    async def test_token_verification_is_emitted_to_frontend_state(self):
+        live = self.make_live()
+        events = []
+        live.event_callback = events.append
+        live.cookie_revision = 0
+        live.verification_required = False
+        live.verification_url = ""
+
+        class Api:
+            @staticmethod
+            def get_token(device_id):
+                raise XianyuVerificationRequired(
+                    "需要验证",
+                    "https://h5.m.goofish.com/_____tmd_____/punish?token=test",
+                )
+
+        live.xianyu = Api()
+        live.device_id = "device-1"
+        self.assertIsNone(await live.refresh_token())
+        self.assertTrue(live.verification_required)
+        self.assertEqual("verification_required", events[-1]["type"])
+        self.assertIn("punish", events[-1]["url"])
+
     async def test_complete_live_listing_marks_absent_product_offline(self):
         live = self.make_live()
         live.listing_status_ttl = 60
@@ -153,6 +178,59 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "item_status": "onsale", "enabled": 1,
         }
         self.assertIs(source, await live.refresh_current_listing_status("item-1", source))
+
+    async def test_listing_status_refresh_reuses_valid_ttl_cache(self):
+        live = self.make_live()
+        live.listing_status_ttl = 60
+        live._listing_status_cache = None
+
+        class ListingApi:
+            last_item_list_complete = True
+            calls = 0
+
+            @classmethod
+            def get_all_user_items(cls, user_id):
+                cls.calls += 1
+                return [{"cardData": {
+                    "id": "item-1", "itemStatus": 0,
+                    "detailParams": {"itemId": "item-1"},
+                }}]
+
+        live.xianyu = ListingApi()
+        product = {
+            "item_id": "item-1", "source_type": "goofish",
+            "item_status": "onsale", "enabled": 1,
+        }
+        await live.refresh_current_listing_status("item-1", product)
+        await live.refresh_current_listing_status("item-1", product)
+        self.assertEqual(1, ListingApi.calls)
+
+    async def test_listing_status_refresh_runs_in_background_and_is_deduplicated(self):
+        live = self.make_live()
+        live._listing_status_refresh_task = None
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def refresh(item_id, product):
+            calls.append((item_id, product))
+            started.set()
+            await release.wait()
+            return product
+
+        live.refresh_current_listing_status = refresh
+        product = {"item_id": "item-1", "item_status": "onsale"}
+
+        self.assertTrue(live.schedule_listing_status_refresh("item-1", product))
+        await started.wait()
+        self.assertFalse(live.schedule_listing_status_refresh("item-1", product))
+        self.assertEqual([("item-1", product)], calls)
+
+        task = live._listing_status_refresh_task
+        release.set()
+        await task
+        await asyncio.sleep(0)
+        self.assertIsNone(live._listing_status_refresh_task)
 
     async def test_waiting_payment_records_state_without_sending_message(self):
         live = self.make_live()
@@ -419,6 +497,22 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     {"first_reply_sent": 1}, message,
                 ))
                 live.send_msg.assert_not_awaited()
+
+    async def test_offline_purchase_order_falls_through_to_offline_reply_route(self):
+        live = self.make_live()
+        live.send_message_template = AsyncMock()
+        handled = await live.handle_purchase_order_buyer_message(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1",
+            {
+                "coupon_type": "purchase_order", "item_status": "offline",
+                "enabled": 0, "first_reply_enabled": True,
+                "first_reply_text": "不应发送的代买单首次回复",
+            },
+            {"first_reply_sent": 0}, "现在还能买吗",
+        )
+        self.assertFalse(handled)
+        live.send_message_template.assert_not_awaited()
+        live.send_msg.assert_not_awaited()
 
     async def test_concrete_store_question_keeps_mandatory_first_reply(self):
         live = self.make_live()

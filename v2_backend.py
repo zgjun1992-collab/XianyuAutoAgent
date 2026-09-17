@@ -2,10 +2,12 @@ import argparse
 import asyncio
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -82,6 +84,8 @@ class BackendState:
         self.worker = None
         self.service_status = "stopped"
         self.service_message = ""
+        self.verification_required = False
+        self.verification_url = ""
         self.lock = threading.RLock()
         self._service_mutex_handle = None
         self._service_mutex_api = None
@@ -138,10 +142,15 @@ class BackendState:
                 previous = trans_cookies(previous_cookie)
                 current = trans_cookies(self.runtime["cookie"])
                 auth_keys = ("unb", "_m_h5_tk", "_m_h5_tk_enc", "cookie2")
-                if any(previous.get(key) != current.get(key) for key in auth_keys):
+                auth_changed = any(previous.get(key) != current.get(key) for key in auth_keys)
+                verification_cookie_changed = (
+                    self.verification_required
+                    and self.runtime["cookie"] != previous_cookie
+                )
+                if auth_changed or verification_cookie_changed:
                     self.live.update_cookie(self.runtime["cookie"])
                     self.service_status = "reconnecting"
-                    self.service_message = "检测到新的闲鱼登录凭据，正在重新连接"
+                    self.service_message = "已同步验证凭据，正在重新获取消息Token"
         return self.config_status()
 
     def config_status(self):
@@ -456,14 +465,19 @@ class BackendState:
         return {"id": int(asset_id)}
 
     def test_ai(self):
-        result = self.ai_client().chat.completions.create(
+        # A configuration probe must fail fast.  The SDK retries transient
+        # network failures by default, which previously let this endpoint run
+        # longer than Electron's RPC deadline and made the whole UI look dead.
+        result = self.ai_client().with_options(max_retries=0, timeout=15).chat.completions.create(
             model=self.runtime["model"],
             messages=[{"role": "user", "content": "只回复：连接成功"}],
             temperature=0,
             max_tokens=12,
-            timeout=20,
         )
-        return {"reply": result.choices[0].message.content or "连接成功"}
+        # Reaching this line is the success condition. Do not display arbitrary
+        # provider output (or a wrongly decoded provider string) in the UI.
+        _ = result.choices[0].message.content
+        return {"reply": "连接成功"}
 
     def test_reply(self, payload):
         item_id = str(payload.get("item_id") or "").strip()
@@ -575,6 +589,14 @@ class BackendState:
         if event_type == "status":
             self.service_status = event.get("value", "error")
             self.service_message = event.get("message", "")
+            if self.service_status == "connected":
+                self.verification_required = False
+                self.verification_url = ""
+        elif event_type == "verification_required":
+            self.service_status = "verification_required"
+            self.service_message = event.get("message") or "闲鱼要求安全验证"
+            self.verification_required = True
+            self.verification_url = str(event.get("url") or "").strip()
         self.store.add_event(event_type, event.get("message") or event_type, event)
 
     def start_service(self):
@@ -604,6 +626,8 @@ class BackendState:
                 raise
             self.service_status = "starting"
             self.service_message = ""
+            self.verification_required = False
+            self.verification_url = ""
 
             def run():
                 try:
@@ -626,8 +650,31 @@ class BackendState:
             self.service_status = "stopping"
         return self.service_state()
 
+    def retry_service_auth(self):
+        """Retry message-token acquisition after browser verification."""
+        with self.lock:
+            if not self.live or not self.worker or not self.worker.is_alive():
+                raise RuntimeError("客服服务未运行，请先启动客服")
+            self.live.current_token = None
+            self.live.last_token_refresh_time = 0
+            self.live.verification_required = False
+            self.live.verification_url = ""
+            self.live.connection_restart_flag = True
+            if self.live.loop and self.live.ws:
+                asyncio.run_coroutine_threadsafe(self.live.ws.close(), self.live.loop)
+            self.verification_required = False
+            self.verification_url = ""
+            self.service_status = "reconnecting"
+            self.service_message = "验证已完成，正在重新获取消息Token"
+        return self.service_state()
+
     def service_state(self):
-        return {"status": self.service_status, "message": self.service_message}
+        return {
+            "status": self.service_status,
+            "message": self.service_message,
+            "verification_required": self.verification_required,
+            "verification_url": self.verification_url,
+        }
 
     def approve(self, audit_id: int, final_reply: str):
         if not self.live:
@@ -699,12 +746,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "pid": os.getpid(),
                 })
             if path == "/snapshot":
+                products = self.state.store.list_v2_products()
+                store_lists = self.state.store.list_store_lists()
+                refund_orders = self.state.store.list_refund_orders()
                 return self._ok({
-                    "dashboard": self.state.store.dashboard(),
-                    "products": self.state.store.list_v2_products(),
-                    "store_lists": self.state.store.list_store_lists(),
+                    "dashboard": self.state.store.dashboard(products, store_lists, refund_orders),
+                    "products": products,
+                    "store_lists": store_lists,
                     "reviews": self.state.store.list_audits(limit=200),
-                    "refund_orders": self.state.store.list_refund_orders(),
+                    "refund_orders": refund_orders,
                     "conversations": self.state.store.list_conversations(),
                     "service": self.state.service_state(),
                     "config": self.state.config_status(),
@@ -829,6 +879,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(self.state.start_service())
             if path == "/service/stop":
                 return self._ok(self.state.stop_service())
+            if path == "/service/retry-auth":
+                return self._ok(self.state.retry_service_auth())
             if path.startswith("/reviews/") and path.endswith("/approve"):
                 audit_id = int(path.split("/")[2])
                 return self._ok(self.state.approve(audit_id, body.get("reply", "")))
@@ -864,11 +916,63 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._error(exc)
 
 
+def _handle_stdio_rpc(line: str, port: int, output_lock: threading.Lock):
+    request_id = ""
+    connection = None
+    try:
+        request = json.loads(line)
+        request_id = str(request.get("id", ""))
+        method = str(request.get("method", "GET")).upper()
+        path = str(request.get("path", "/"))
+        body = request.get("body")
+        encoded = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"} if encoded is not None else {}
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        connection.request(method, path, body=encoded, headers=headers)
+        response = connection.getresponse()
+        response_text = response.read().decode("utf-8")
+        result = {
+            "id": request_id,
+            "status": response.status,
+            "payload": json.loads(response_text),
+        }
+    except Exception as exc:
+        result = {"id": request_id, "status": 0, "error": str(exc)}
+    finally:
+        if connection is not None:
+            connection.close()
+    # Multiple requests may finish together; serialize each complete response
+    # line so Electron never receives interleaved JSON.
+    with output_lock:
+        # Keep the stdio transport ASCII-only. Some customer Windows installs
+        # still expose a legacy console code page even with PYTHONUTF8 set;
+        # JSON.parse restores escaped Chinese characters on the Electron side.
+        print("__XIANYU_RPC__" + json.dumps(result, ensure_ascii=True), flush=True)
+
+
+def _serve_stdio_rpc(port: int):
+    output_lock = threading.Lock()
+    for line in sys.stdin:
+        threading.Thread(
+            target=_handle_stdio_rpc,
+            args=(line, port, output_lock),
+            name="xianyu-stdio-rpc",
+            daemon=True,
+        ).start()
+
+
 def serve(port: int, data_dir: str):
     state = BackendState(data_dir)
     ApiHandler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", port), ApiHandler)
-    print(json.dumps({"ready": True, "port": port}, ensure_ascii=False), flush=True)
+    threading.Thread(target=_serve_stdio_rpc, args=(port,), daemon=True).start()
+    print(json.dumps({
+        "ready": True,
+        "port": port,
+        "edition": APP_EDITION,
+        "version": APP_VERSION,
+        "build_commit": BUILD_COMMIT,
+    }, ensure_ascii=True), flush=True)
     server.serve_forever()
 
 

@@ -4,6 +4,7 @@ function normalizeServiceStatus(status) {
     connected: '客服运行中',
     starting: '客服启动中',
     reconnecting: '客服重连中',
+    verification_required: '等待闲鱼安全验证',
     stopped: '客服已停止',
     error: '客服异常'
   }

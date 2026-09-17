@@ -118,3 +118,6 @@ button { cursor: pointer; }
 .bound-store-chips > span { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 7px 9px; border: 1px solid #dfbd32; border-radius: 999px; background: #fff6bd; color: #4f4734; font-size: 10px; font-weight: 800; }
 .bound-store-chips > span button { display: grid; place-items: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: #ead67e; color: #6f5800; line-height: 1; }
 .bound-store-chips > p { margin: 4px 0; color: #aaa; font-size: 10px; }
+.browser-toolbar .address.warning { border-color: #df6b5d; background: #fff0ed; color: #9e2f23; font-weight: 800; }
+.browser-toolbar .verification-action { border-color: #df6b5d; color: #9e2f23; font-weight: 800; }
+.browser-toolbar .verification-retry { border-color: #1a8f62; background: #e9f8f1; color: #126b49; font-weight: 800; }
