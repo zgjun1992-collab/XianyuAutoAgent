@@ -54,6 +54,19 @@ let lastPendingCount = 0
 let cookieTimer = null
 let goofishSession = null
 
+function isAllowedGoofishNavigation(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ''))
+    if (parsed.protocol !== 'https:') return false
+    const host = parsed.hostname.toLowerCase()
+    return ['goofish.com', 'taobao.com', 'tmall.com', 'alibaba.com'].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`)
+    )
+  } catch (_error) {
+    return false
+  }
+}
+
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
 
@@ -353,13 +366,27 @@ function registerIpc() {
     if (command === 'home') await goofishView.webContents.loadURL('https://www.goofish.com/im')
     if (command === 'navigate') {
       const target = String(action?.url || '')
-      const parsed = new URL(target)
-      if (!['www.goofish.com', 'h5.m.goofish.com', '2.taobao.com'].includes(parsed.hostname)) {
-        throw new Error('仅允许在内置浏览器中打开闲鱼页面')
+      if (!isAllowedGoofishNavigation(target)) {
+        throw new Error('仅允许在内置浏览器中打开闲鱼及其安全验证页面')
       }
-      await goofishView.webContents.loadURL(parsed.toString())
+      await goofishView.webContents.loadURL(target)
     }
     return { url: goofishView.webContents.getURL() }
+  })
+  ipcMain.handle('verification:prompt', async () => {
+    mainWindow?.show()
+    mainWindow?.focus()
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '闲鱼安全验证',
+      message: '闲鱼要求完成安全验证',
+      detail: '请点击“立即验证”，在软件内置闲鱼页面完成验证。完成后点击工具栏中的“验证完成，重新连接”。',
+      buttons: ['立即验证', '稍后处理'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    })
+    return { open: result.response === 0 }
   })
   ipcMain.handle('dialog:choose-excel', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {

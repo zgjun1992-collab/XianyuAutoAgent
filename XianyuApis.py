@@ -4,10 +4,20 @@ import re
 import sys
 import json
 import mimetypes
+import html
+from urllib.parse import unquote
 
 import requests
 from loguru import logger
 from utils.xianyu_utils import generate_sign
+
+
+class XianyuVerificationRequired(RuntimeError):
+    """Raised when Goofish requires an interactive browser verification."""
+
+    def __init__(self, message, verification_url=""):
+        super().__init__(message)
+        self.verification_url = str(verification_url or "").strip()
 
 
 class XianyuApis:
@@ -31,6 +41,40 @@ class XianyuApis:
             'sec-fetch-site': 'same-site',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
         })
+
+    @staticmethod
+    def extract_verification_url(payload):
+        """Find a risk-control URL without depending on one response schema."""
+        values = []
+
+        def collect(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if str(key).lower() in {
+                        "url", "redirecturl", "redirect_url", "punishurl",
+                        "punish_url", "verifyurl", "verify_url",
+                    }:
+                        values.insert(0, child)
+                    else:
+                        collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+            elif value is not None:
+                values.append(value)
+
+        collect(payload)
+        candidates = []
+        for value in values:
+            text = html.unescape(unquote(str(value))).replace("\\/", "/")
+            candidates.extend(re.findall(r"https?://[^\s\"'<>]+", text, re.I))
+            if text.startswith("//"):
+                candidates.append("https:" + text)
+        preferred = ("punish", "verify", "captcha", "x5sec", "_____tmd_____", "awsc")
+        for url in sorted(candidates, key=lambda item: any(word in item.lower() for word in preferred), reverse=True):
+            if re.search(r"(?:^|\.)(?:goofish|taobao|tmall|alibaba)\.com(?::\d+)?/", url, re.I):
+                return url.rstrip(".,;，。；)")
+        return ""
 
     def upload_media(self, media_path):
         """Upload a local image to Xianyu's chat media service."""
@@ -245,9 +289,13 @@ class XianyuApis:
                     error_msg = str(ret_value)
                     if 'RGV587_ERROR' in error_msg or '被挤爆啦' in error_msg:
                         logger.error(f"❌ 触发风控: {ret_value}")
-                        logger.error("🔴 系统目前无法自动解决，请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie")
+                        verification_url = self.extract_verification_url(res_json)
+                        logger.error("🔴 闲鱼要求安全验证，请在软件内置闲鱼页面完成验证")
                         if not self.interactive:
-                            raise RuntimeError("闲鱼触发风控，请在网页版完成验证并更新Cookie")
+                            raise XianyuVerificationRequired(
+                                "闲鱼要求安全验证，请在软件内完成验证后重试",
+                                verification_url,
+                            )
                         
                         # 获取用户输入的新Cookie
                         print("\n" + "="*50)
@@ -293,6 +341,8 @@ class XianyuApis:
                 logger.error(f"Token API返回格式异常: {res_json}")
                 return self.get_token(device_id, retry_count + 1, relogin_attempted)
                 
+        except XianyuVerificationRequired:
+            raise
         except Exception as e:
             logger.error(f"Token API请求异常: {str(e)}")
             time.sleep(0.5)

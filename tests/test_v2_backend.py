@@ -139,6 +139,30 @@ class BackendSyncTests(unittest.TestCase):
         self.assertEqual([], self.state.live.updated)
         self.assertEqual("connected", self.state.service_status)
 
+    def test_verification_event_is_exposed_and_new_challenge_cookie_reconnects(self):
+        class Live:
+            def __init__(self):
+                self.updated = []
+
+            def update_cookie(self, value):
+                self.updated.append(value)
+
+        self.state.live = Live()
+        self.state.on_live_event({
+            "type": "verification_required",
+            "message": "闲鱼要求安全验证",
+            "url": "https://h5.m.goofish.com/_____tmd_____/punish?token=test",
+        })
+        state = self.state.service_state()
+        self.assertEqual("verification_required", state["status"])
+        self.assertTrue(state["verification_required"])
+        self.assertIn("punish", state["verification_url"])
+
+        cookie = "unb=seller-1; _m_h5_tk=testtoken_123; x5sec=verified"
+        self.state.configure({"cookie": cookie})
+        self.assertEqual([cookie], self.state.live.updated)
+        self.assertEqual("reconnecting", self.state.service_status)
+
 
 if __name__ == "__main__":
     unittest.main()

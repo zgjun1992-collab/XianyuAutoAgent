@@ -7,7 +7,7 @@ import re
 import websockets
 from loguru import logger
 from dotenv import load_dotenv, set_key
-from XianyuApis import XianyuApis
+from XianyuApis import XianyuApis, XianyuVerificationRequired
 import sys
 import random
 
@@ -113,6 +113,8 @@ class XianyuLive:
         self.connection_restart_flag = False  # 连接重启标志
         self.cookie_revision = 0
         self.last_token_error = ""
+        self.verification_required = False
+        self.verification_url = ""
         
         # 人工接管相关配置
         self.manual_mode_conversations = set()  # 存储处于人工接管模式的会话ID
@@ -466,6 +468,8 @@ class XianyuLive:
                 self.current_token = new_token
                 self.last_token_refresh_time = time.time()
                 self.last_token_error = ""
+                self.verification_required = False
+                self.verification_url = ""
                 logger.info("Token刷新成功")
                 return new_token
             else:
@@ -473,6 +477,17 @@ class XianyuLive:
                 self.last_token_error = "闲鱼消息Token获取失败，请在内置闲鱼重新登录"
                 return None
                 
+        except XianyuVerificationRequired as e:
+            self.verification_required = True
+            self.verification_url = e.verification_url
+            self.last_token_error = "闲鱼要求安全验证，请在软件内完成验证后重试"
+            self.emit_event(
+                "verification_required",
+                message=self.last_token_error,
+                url=self.verification_url,
+            )
+            logger.error(self.last_token_error)
+            return None
         except Exception as e:
             logger.error(f"Token刷新异常: {str(e)}")
             self.last_token_error = str(e) or "闲鱼消息Token获取失败"
@@ -1370,6 +1385,10 @@ class XianyuLive:
             if url_info:
                 route["order_url"] = url_info
             route["status"] = status
+            route["chat_id"] = chat_id
+            route["user_id"] = user_id
+            route["item_id"] = item_id
+            route["observed_at"] = time.time()
             order_routes[scope_id] = route
 
         if refund_status:
@@ -2323,7 +2342,14 @@ class XianyuLive:
                 
             except Exception as e:
                 logger.error(f"连接发生错误: {e}")
-                self.emit_event("status", value="error", message=str(e))
+                if self.verification_required:
+                    self.emit_event(
+                        "verification_required",
+                        message=self.last_token_error,
+                        url=self.verification_url,
+                    )
+                else:
+                    self.emit_event("status", value="error", message=str(e))
                 
             finally:
                 # 清理任务

@@ -82,6 +82,8 @@ class BackendState:
         self.worker = None
         self.service_status = "stopped"
         self.service_message = ""
+        self.verification_required = False
+        self.verification_url = ""
         self.lock = threading.RLock()
         self._service_mutex_handle = None
         self._service_mutex_api = None
@@ -138,10 +140,15 @@ class BackendState:
                 previous = trans_cookies(previous_cookie)
                 current = trans_cookies(self.runtime["cookie"])
                 auth_keys = ("unb", "_m_h5_tk", "_m_h5_tk_enc", "cookie2")
-                if any(previous.get(key) != current.get(key) for key in auth_keys):
+                auth_changed = any(previous.get(key) != current.get(key) for key in auth_keys)
+                verification_cookie_changed = (
+                    self.verification_required
+                    and self.runtime["cookie"] != previous_cookie
+                )
+                if auth_changed or verification_cookie_changed:
                     self.live.update_cookie(self.runtime["cookie"])
                     self.service_status = "reconnecting"
-                    self.service_message = "检测到新的闲鱼登录凭据，正在重新连接"
+                    self.service_message = "已同步验证凭据，正在重新获取消息Token"
         return self.config_status()
 
     def config_status(self):
@@ -575,6 +582,14 @@ class BackendState:
         if event_type == "status":
             self.service_status = event.get("value", "error")
             self.service_message = event.get("message", "")
+            if self.service_status == "connected":
+                self.verification_required = False
+                self.verification_url = ""
+        elif event_type == "verification_required":
+            self.service_status = "verification_required"
+            self.service_message = event.get("message") or "闲鱼要求安全验证"
+            self.verification_required = True
+            self.verification_url = str(event.get("url") or "").strip()
         self.store.add_event(event_type, event.get("message") or event_type, event)
 
     def start_service(self):
@@ -604,6 +619,8 @@ class BackendState:
                 raise
             self.service_status = "starting"
             self.service_message = ""
+            self.verification_required = False
+            self.verification_url = ""
 
             def run():
                 try:
@@ -626,8 +643,31 @@ class BackendState:
             self.service_status = "stopping"
         return self.service_state()
 
+    def retry_service_auth(self):
+        """Retry message-token acquisition after browser verification."""
+        with self.lock:
+            if not self.live or not self.worker or not self.worker.is_alive():
+                raise RuntimeError("客服服务未运行，请先启动客服")
+            self.live.current_token = None
+            self.live.last_token_refresh_time = 0
+            self.live.verification_required = False
+            self.live.verification_url = ""
+            self.live.connection_restart_flag = True
+            if self.live.loop and self.live.ws:
+                asyncio.run_coroutine_threadsafe(self.live.ws.close(), self.live.loop)
+            self.verification_required = False
+            self.verification_url = ""
+            self.service_status = "reconnecting"
+            self.service_message = "验证已完成，正在重新获取消息Token"
+        return self.service_state()
+
     def service_state(self):
-        return {"status": self.service_status, "message": self.service_message}
+        return {
+            "status": self.service_status,
+            "message": self.service_message,
+            "verification_required": self.verification_required,
+            "verification_url": self.verification_url,
+        }
 
     def approve(self, audit_id: int, final_reply: str):
         if not self.live:
@@ -828,6 +868,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(self.state.start_service())
             if path == "/service/stop":
                 return self._ok(self.state.stop_service())
+            if path == "/service/retry-auth":
+                return self._ok(self.state.retry_service_auth())
             if path.startswith("/reviews/") and path.endswith("/approve"):
                 audit_id = int(path.split("/")[2])
                 return self._ok(self.state.approve(audit_id, body.get("reply", "")))

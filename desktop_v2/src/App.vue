@@ -7,6 +7,7 @@ const sidebarCollapsed = ref(false)
 const aiPanelOpen = ref(true)
 const browserStage = ref(null)
 const loading = ref(false)
+const verificationRetrying = ref(false)
 const toast = reactive({ text: '', kind: 'ok', visible: false })
 const appIdentity = reactive({ edition: 'V3.5', frontend_version: '', backend_version: '', build_commit: '' })
 const snapshot = reactive({
@@ -36,6 +37,7 @@ let refreshTimer = null
 let toastTimer = null
 let resizeObserver = null
 let removeEventListener = null
+let lastVerificationPrompt = ''
 
 const navItems = [
   { id: 'dashboard', icon: '总', label: '工作总览' },
@@ -72,9 +74,9 @@ const firstReplyParts = computed(() => {
   pushText(source.slice(cursor))
   return parts.slice(0, 8)
 })
-const serviceActive = computed(() => ['starting', 'connected', 'reconnecting', 'stopping'].includes(snapshot.service.status))
+const serviceActive = computed(() => ['starting', 'connected', 'reconnecting', 'verification_required', 'stopping'].includes(snapshot.service.status))
 const serviceLabel = computed(() => ({
-  stopped: '客服已停止', starting: '正在启动', connected: '客服运行中', reconnecting: '正在重连', stopping: '正在停止', error: '连接异常'
+  stopped: '客服已停止', starting: '正在启动', connected: '客服运行中', reconnecting: '正在重连', verification_required: '等待闲鱼验证', stopping: '正在停止', error: '连接异常'
 }[snapshot.service.status] || snapshot.service.status))
 
 function notify(text, kind = 'ok') {
@@ -602,8 +604,31 @@ async function syncCookie() {
 
 async function toggleService() {
   const endpoint = serviceActive.value ? '/service/stop' : '/service/start'
-  await call('POST', endpoint, {})
-  await refresh()
+  const state = await call('POST', endpoint, {})
+  Object.assign(snapshot.service, state || {})
+  refresh(true).catch(() => {})
+}
+
+async function openXianyuVerification() {
+  route.value = 'workspace'
+  await nextTick()
+  syncBrowserBounds()
+  const target = String(snapshot.service.verification_url || '').trim()
+  await desktop.browser(target ? { action: 'navigate', url: target } : 'home')
+}
+
+async function retryXianyuAuthentication() {
+  try {
+    verificationRetrying.value = true
+    await desktop.syncCookie()
+    await call('POST', '/service/retry-auth', {}, true)
+    await refresh(true)
+    notify('验证信息已同步，正在重新获取消息Token')
+  } catch (error) {
+    notify(error.message || '重新连接失败', 'error')
+  } finally {
+    verificationRetrying.value = false
+  }
 }
 
 function changeRoute(nextRoute) {
@@ -621,6 +646,20 @@ function syncBrowserBounds() {
 }
 
 watch([route, aiPanelOpen, sidebarCollapsed], () => nextTick(syncBrowserBounds))
+watch(
+  () => [Boolean(snapshot.service.verification_required), snapshot.service.verification_url || ''],
+  async ([required, url]) => {
+    if (!required) {
+      lastVerificationPrompt = ''
+      return
+    }
+    const key = url || 'goofish-home'
+    if (lastVerificationPrompt === key) return
+    lastVerificationPrompt = key
+    const decision = await desktop.showVerificationPrompt()
+    if (decision?.open) await openXianyuVerification()
+  }
+)
 
 onMounted(async () => {
   const [, , identity] = await Promise.all([refresh(false), getConfig(), desktop.getVersion()])
@@ -696,7 +735,12 @@ onBeforeUnmount(() => {
         <div class="browser-column">
           <div class="browser-toolbar">
             <button @click="desktop.browser('back')">←</button><button @click="desktop.browser('forward')">→</button><button @click="desktop.browser('reload')">↻</button>
-            <div class="address"><span>🔒</span> www.goofish.com/im</div>
+            <div :class="['address', { warning: snapshot.service.verification_required }]">
+              <span>{{ snapshot.service.verification_required ? '⚠' : '🔒' }}</span>
+              {{ snapshot.service.verification_required ? '闲鱼要求安全验证，请在下方完成' : 'www.goofish.com/im' }}
+            </div>
+            <button v-if="snapshot.service.verification_required" class="verification-action" @click="openXianyuVerification">打开验证页</button>
+            <button v-if="snapshot.service.verification_required" class="verification-retry" :disabled="verificationRetrying" @click="retryXianyuAuthentication">{{ verificationRetrying ? '正在重新连接…' : '验证完成，重新连接' }}</button>
             <button @click="desktop.browser('home')">回到消息</button><button @click="syncCookie">同步登录</button>
           </div>
           <div ref="browserStage" class="browser-stage"><div class="browser-placeholder"><strong>正在载入完整闲鱼网页</strong><span>登录状态会保存在本机，不需要手动复制 Cookie</span></div></div>

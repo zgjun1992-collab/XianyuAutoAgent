@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 from requests import Session
 
 from main import XianyuLive
+from XianyuApis import XianyuVerificationRequired
 
 
 class _Store:
@@ -90,6 +91,29 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(live.current_token)
         self.assertEqual(1, live.cookie_revision)
         self.assertTrue(live.connection_restart_flag)
+
+    async def test_token_verification_is_emitted_to_frontend_state(self):
+        live = self.make_live()
+        events = []
+        live.event_callback = events.append
+        live.cookie_revision = 0
+        live.verification_required = False
+        live.verification_url = ""
+
+        class Api:
+            @staticmethod
+            def get_token(device_id):
+                raise XianyuVerificationRequired(
+                    "需要验证",
+                    "https://h5.m.goofish.com/_____tmd_____/punish?token=test",
+                )
+
+        live.xianyu = Api()
+        live.device_id = "device-1"
+        self.assertIsNone(await live.refresh_token())
+        self.assertTrue(live.verification_required)
+        self.assertEqual("verification_required", events[-1]["type"])
+        self.assertIn("punish", events[-1]["url"])
 
     async def test_complete_live_listing_marks_absent_product_offline(self):
         live = self.make_live()
