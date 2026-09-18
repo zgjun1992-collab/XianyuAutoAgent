@@ -1425,10 +1425,15 @@ class XianyuLive:
             if url_info:
                 route["order_url"] = url_info
             route["status"] = status
+            route["status_source"] = "platform_event"
+            route["payment_state_verified"] = False
             route["chat_id"] = chat_id
             route["user_id"] = user_id
             route["item_id"] = item_id
             route["observed_at"] = time.time()
+            paid_amount = self.extract_actual_paid_amount(message)
+            if paid_amount not in (None, ""):
+                route["actual_paid_amount"] = paid_amount
             order_routes[scope_id] = route
 
         if refund_status:
@@ -1819,7 +1824,11 @@ class XianyuLive:
             deterministic = None
             image_match = None
             image_asset = None
-            actual_paid_amount = self.extract_actual_paid_amount(message)
+            order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            actual_paid_amount = (
+                self.extract_actual_paid_amount(message)
+                or order_context.get("actual_paid_amount")
+            )
             predecision = PolicyEngine(policies).evaluate(send_message, "")
             # Product keyword rules are an exclusive local fast path. Resolve
             # them before any semantic/model work, but never above offline.
@@ -1839,7 +1848,7 @@ class XianyuLive:
                     deterministic = resolver(
                         item_id, send_message, actual_paid_amount,
                         query_context or None,
-                        getattr(self, "_order_routes", {}).get(scope_id) or None,
+                        order_context or None,
                     )
                 except TypeError:
                     deterministic = resolver(item_id, send_message)

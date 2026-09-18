@@ -295,6 +295,21 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         payload = {"order": {"actualPaidAmount": "67.90"}}
         self.assertEqual("67.90", XianyuLive.extract_actual_paid_amount(payload))
 
+    async def test_order_event_preserves_actual_paid_amount_for_next_buyer_message(self):
+        live = self.make_live()
+        event = {
+            "1": {"2": "chat-1@goofish", "10": {"senderUserId": "buyer-1"}},
+            "3": {
+                "redReminder": "等待卖家发货", "itemId": "item-1",
+                "orderId": "ORDER-1", "actualPaidAmount": "67.90",
+            },
+        }
+        self.assertTrue(await live.handle_order_reminder(event, object()))
+        route = live._order_routes["seller:chat-1:item-1"]
+        self.assertEqual("67.90", route["actual_paid_amount"])
+        self.assertEqual("platform_event", route["status_source"])
+        self.assertFalse(route["payment_state_verified"])
+
     def test_buyer_reply_sanitizer_removes_internal_and_coverage_terms(self):
         text = XianyuLive.sanitize_buyer_reply("SKU来自数据库，全国通用，所有门店都能用")
         self.assertNotIn("SKU", text.upper())
