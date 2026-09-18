@@ -8202,20 +8202,14 @@ class V2Store(AppStore):
         )):
             return "paid"
         if any(word in status for word in ("等待买家付款", "待付款", "未付款")):
-            order_id = str(context.get("order_id") or "").strip()
-            observed_at = context.get("observed_at")
-            # Runtime order cards are timestamped. Without an order id they
-            # cannot prove that a later refund question belongs to that order.
-            if not order_id and observed_at not in (None, ""):
-                return "unknown"
-            if observed_at not in (None, ""):
-                try:
-                    age = datetime.now(timezone.utc).timestamp() - float(observed_at)
-                except (TypeError, ValueError):
-                    return "unknown"
-                if age < 0 or age > 120:
-                    return "unknown"
-            return "unpaid"
+            # A pushed waiting-payment card is only a historical event.  The
+            # buyer may pay immediately afterwards without another event being
+            # delivered, so it must not be used to reject a later refund
+            # request.  Only a current order-detail lookup may mark the status
+            # as verified; explicit buyer text is handled above.
+            if context.get("payment_state_verified") is True:
+                return "unpaid"
+            return "unknown"
         return "unknown"
 
     @staticmethod
@@ -9170,7 +9164,9 @@ class V2Store(AppStore):
         payment_state = self._order_payment_state(order_context, message, actual_paid_amount)
         if payment_state == "unknown" and context_is_aftersale:
             previous_payment_state = str(query_context.get("aftersale_payment_state") or "")
-            if previous_payment_state in {"paid", "unpaid"}:
+            # Paid is monotonic for the same order.  Unpaid is not: a buyer can
+            # pay after the previous message, therefore never inherit it.
+            if previous_payment_state == "paid":
                 payment_state = previous_payment_state
 
         if compact in {"没看到", "没有看到", "没显示", "没有显示", "哪里写了", "没标注", "没有标注"}:

@@ -1658,7 +1658,9 @@ class V2StoreTests(unittest.TestCase):
 
     def test_order_payment_state_controls_refund_next_step(self):
         unpaid = self.store.resolve_deterministic(
-            "10001", "给我退了吧", order_context={"status": "等待买家付款"},
+            "10001", "给我退了吧", order_context={
+                "status": "等待买家付款", "payment_state_verified": True,
+            },
         )
         self.assertEqual("unpaid_cancel", unpaid["kind"])
         self.assertIn("尚未付款", unpaid["reply"])
@@ -1690,6 +1692,26 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertNotEqual("unpaid_cancel", paid["kind"])
         self.assertNotIn("尚未付款", paid["reply"])
+
+        fresh_but_unverified = self.store.resolve_deterministic(
+            "10001", "能退吗", order_context={
+                "status": "等待买家付款", "order_id": "ORDER-1",
+                "observed_at": datetime.now().timestamp(),
+            },
+        )
+        self.assertNotEqual("unpaid_cancel", fresh_but_unverified["kind"])
+        self.assertNotIn("尚未付款", fresh_but_unverified["reply"])
+
+    def test_aftersale_does_not_inherit_unpaid_state(self):
+        result = self.store.resolve_deterministic(
+            "10001", "能退吗", store_context={
+                "intent": "aftersale", "aftersale_payment_state": "unpaid",
+                "aftersale_stage": "payment_and_reason",
+                "aftersale_prompt": "请确认是否已经付款。",
+            },
+        )
+        self.assertNotEqual("unpaid_cancel", result["kind"])
+        self.assertNotIn("尚未付款", result["reply"])
 
     def test_refund_policy_consultation_is_gentle_and_does_not_fake_an_order(self):
         result = self.store.resolve_deterministic("10001", "可以退款吗")
