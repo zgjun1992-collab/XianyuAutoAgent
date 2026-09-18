@@ -5045,6 +5045,10 @@ class V2Store(AppStore):
             if allows_mixed:
                 return f"支持同面额或不同面额代金券叠加，每次最多使用{count}张。"
             return f"仅支持同面额代金券叠加，每次最多使用{count}张。"
+        if allows_mixed:
+            if re.search(r"无限叠加|不限(?:制)?(?:使用)?(?:数量|张数)|不限制(?:使用)?(?:数量|张数)", combined):
+                return "支持同面额及不同面额代金券互相叠加，不限制使用张数。"
+            return "支持同面额及不同面额代金券互相叠加。"
         # Never inherit an AI-expanded mixed-denomination claim unless the
         # authoritative user/page text says so explicitly.
         return "仅支持同面额代金券叠加。" if options else ""
@@ -8206,21 +8210,36 @@ class V2Store(AppStore):
     ) -> str:
         """Return only payment states supported by order or message evidence."""
         context = order_context if isinstance(order_context, dict) else {}
-        status = re.sub(r"\s+", "", str(context.get("status") or ""))
-        if any(word in status for word in ("等待买家付款", "待付款", "未付款")):
+        text = re.sub(r"\s+", "", str(message or ""))
+        # Current explicit buyer evidence wins over an older order card.
+        if re.search(r"(?:还没|没有|未|尚未)(?:付钱|付款)|待付款", text):
             return "unpaid"
+        if re.search(r"已经付款|已付款|付款了|付过款|钱已经付|买了|购买后|收到券|收到码|收到链接", text):
+            return "paid"
+        if actual_paid_amount not in (None, "") or cls._paid_amount_from_text(message) is not None:
+            return "paid"
+
+        status = re.sub(r"\s+", "", str(context.get("status") or ""))
         if any(word in status for word in (
             "等待卖家发货", "待发货", "已付款", "已发货", "等待确认收货", "确认收货",
             "交易成功", "退款", "退货", "售后", "纠纷",
         )):
             return "paid"
-        if actual_paid_amount not in (None, "") or cls._paid_amount_from_text(message) is not None:
-            return "paid"
-        text = re.sub(r"\s+", "", str(message or ""))
-        if re.search(r"(?:还没|没有|未|尚未)(?:付钱|付款)|待付款", text):
+        if any(word in status for word in ("等待买家付款", "待付款", "未付款")):
+            order_id = str(context.get("order_id") or "").strip()
+            observed_at = context.get("observed_at")
+            # Runtime order cards are timestamped. Without an order id they
+            # cannot prove that a later refund question belongs to that order.
+            if not order_id and observed_at not in (None, ""):
+                return "unknown"
+            if observed_at not in (None, ""):
+                try:
+                    age = datetime.now(timezone.utc).timestamp() - float(observed_at)
+                except (TypeError, ValueError):
+                    return "unknown"
+                if age < 0 or age > 120:
+                    return "unknown"
             return "unpaid"
-        if re.search(r"已经付款|已付款|付款了|付过款|钱已经付|买了|购买后|收到券|收到码|收到链接", text):
-            return "paid"
         return "unknown"
 
     @staticmethod

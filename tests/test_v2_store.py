@@ -1677,6 +1677,21 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("非卡券质量问题", personal["reply"])
         self.assertIn("95%", personal["reply"])
 
+    def test_refund_never_uses_unidentified_cached_unpaid_card(self):
+        runtime_cache = {"status": "等待买家付款", "observed_at": 1}
+        result = self.store.resolve_deterministic(
+            "10001", "还没用的可以退吗", order_context=runtime_cache,
+        )
+        self.assertNotEqual("unpaid_cancel", result["kind"])
+        self.assertNotIn("尚未付款", result["reply"])
+
+        paid = self.store.resolve_deterministic(
+            "10001", "已经付款了，还没用，可以退吗",
+            order_context={"status": "等待买家付款", "order_id": "old-order", "observed_at": 1},
+        )
+        self.assertNotEqual("unpaid_cancel", paid["kind"])
+        self.assertNotIn("尚未付款", paid["reply"])
+
     def test_refund_policy_consultation_is_gentle_and_does_not_fake_an_order(self):
         result = self.store.resolve_deterministic("10001", "可以退款吗")
         self.assertEqual("refund_process", result["kind"])
@@ -2522,6 +2537,17 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("支持不同面额代金券叠加", summary)
         reply = self.store.stacking_reply(product, "100元和300元可以一起用吗")
         self.assertIn("不能一起使用", reply)
+
+    def test_mixed_denomination_unlimited_rule_is_preserved(self):
+        self.store.save_v2_product(
+            "10001", "多面额代金券",
+            "100元代金券：售价90元\n200元代金券：售价180元\n"
+            "不同面额代金券可互相叠加，可无限叠加，不限制数量",
+        )
+        summary = self.store.build_knowledge_summary(self.store.get_v2_product("10001"))
+        self.assertIn("支持同面额及不同面额代金券互相叠加", summary)
+        self.assertIn("不限制使用张数", summary)
+        self.assertNotIn("仅支持同面额", summary)
 
     def test_denomination_specific_stack_limits_override_collapsed_ai_summary(self):
         self.store.save_v2_product(

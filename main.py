@@ -1425,6 +1425,10 @@ class XianyuLive:
             if url_info:
                 route["order_url"] = url_info
             route["status"] = status
+            route["chat_id"] = chat_id
+            route["user_id"] = user_id
+            route["item_id"] = item_id
+            route["observed_at"] = time.time()
             order_routes[scope_id] = route
 
         if refund_status:
