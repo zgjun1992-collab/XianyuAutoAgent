@@ -4356,7 +4356,26 @@ class V2Store(AppStore):
         if not candidates:
             if not bare:
                 return None
-            if options and not any(rejected[key] for key in ("inventory", "stack", "value_limit")):
+            catalog_totals = set()
+            for option in options:
+                try:
+                    option_total = Decimal(str(self._option_total_value(option) or "0"))
+                except (InvalidOperation, ValueError):
+                    continue
+                if option_total > 0:
+                    catalog_totals.add(option_total)
+            has_lower_catalog_choice = (
+                len(catalog_totals) > 1
+                and any(option_total < target for option_total in catalog_totals)
+            )
+            # An exact amount may exceed one SKU's stacking limit while a
+            # smaller, fully valid SKU still exists.  Fall back to the closest
+            # non-overpaying plan instead of rejecting the whole request.
+            if (
+                options
+                and not any(rejected[key] for key in ("inventory", "value_limit"))
+                and (not rejected["stack"] or has_lower_catalog_choice)
+            ):
                 plan = self.consumption_plan_reply(
                     product, target, available_options=options, include_final_cost=False,
                 )
@@ -6492,15 +6511,25 @@ class V2Store(AppStore):
         matched = self.match_message_skus(item_id, message, product)
         if matched:
             return matched
-        values = {
-            self._format_number(value)
-            for match in re.finditer(
-                r"(?<!\d)(\d+(?:\.\d+)?)\s*元?\s*(?:代金券|优惠券|券|面额)|"
-                r"(?:代金券|优惠券|券|面额)\s*(\d+(?:\.\d+)?)",
-                str(message or ""),
-            )
-            for value in match.groups() if value
-        }
+        multiplier = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?\s*[xX×*]\s*"
+            r"(\d+)\s*(?:张)?\s*(?:的)?\s*(?:代金券|优惠券|券)?",
+            str(message or ""),
+        )
+        if multiplier:
+            # “100x2的券” means two 100-yuan coupons.  The quantity must not
+            # be reclassified as a separate 2-yuan denomination.
+            values = {self._format_number(multiplier.group(1))}
+        else:
+            values = {
+                self._format_number(value)
+                for match in re.finditer(
+                    r"(?<!\d)(\d+(?:\.\d+)?)\s*元?\s*(?:代金券|优惠券|券|面额)|"
+                    r"(?:代金券|优惠券|券|面额)\s*(\d+(?:\.\d+)?)",
+                    str(message or ""),
+                )
+                for value in match.groups() if value
+            }
         if not values and re.search(r"可以用|能用|可用|适用|使用", str(message or "")):
             values = {
                 self._format_number(match.group(1))
@@ -6516,6 +6545,44 @@ class V2Store(AppStore):
             sku for sku in self.list_product_skus(item_id, product)
             if self._format_number(sku.get("face_value") or "") in values
         ]
+
+    def _all_store_scope_reply(self, item_id: str, product: Dict,
+                               message: str) -> Optional[Dict]:
+        """Answer nationwide/all-store questions before generic multi-intent parsing."""
+        if not re.search(
+            r"(?:所有|全部|全国|每家|每个|任意).{0,5}(?:门店|店铺|店).{0,5}(?:通用|可用|能用|可以用)|"
+            r"(?:门店|店铺|店).{0,5}(?:都|全部|所有).{0,4}(?:通用|可用|能用|可以用)|"
+            r"(?:全国|全城)(?:门店|店铺|店)?(?:都|全部)?(?:通用|可用|能用|可以用)|"
+            r"^(?:通用吗|都能用吗|都可以用吗|都可用吗)[？?。！!]*$",
+            str(message or ""),
+        ):
+            return None
+
+        selected_skus = self._explicit_store_skus(item_id, message, product)
+        if self._multi_sku_store_scope(item_id, product).get("stores_differ") and len(selected_skus) != 1:
+            return {
+                "reply": "不同商品规格的适用门店可能不同。请发送要购买的规格名称、面额或人数，我按对应规格为您准确查询。",
+                "source": "当前商品不同规格绑定了不同门店表",
+                "decision": "allow", "kind": "stores_clarify",
+            }
+
+        multiplier = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?\s*[xX×*]\s*(\d+)\s*(?:张)?",
+            str(message or ""),
+        )
+        if selected_skus:
+            face = self._format_number(selected_skus[0].get("face_value") or "")
+            subject = f"{face}元代金券" if face else "该规格代金券"
+        else:
+            title = str(product.get("title") or "")
+            subject = "鱼酷烤鱼券" if "鱼酷" in title else "当前商品卡券"
+        if multiplier and self._format_number(multiplier.group(1)) in subject:
+            subject += f"（购买{int(multiplier.group(2))}张）"
+        return {
+            "reply": f"{subject}需在指定门店使用，不是全国所有门店通用。\n\n具体可用门店，请发送城市或店面名称进行查询。",
+            "source": "当前商品绑定的指定适用门店",
+            "decision": "allow", "kind": "stores_scope",
+        }
 
     def _strip_store_sku_edges(
         self, item_id: str, query: str, product: Optional[Dict] = None,
@@ -8468,9 +8535,13 @@ class V2Store(AppStore):
             r"(?:部分|个别)?(?:菜品|餐品|单品)[^。；\n]{0,40}"
             r"(?:时令|售罄|无货|缺货|不可抗|无法提供)", clause
         )), "")
+        local_exception = next((clause for clause in relevant_clauses if re.search(
+            r"(?:使用范围)?例外[：:]?|但[^。；\n]{0,80}(?:不可|不能|不支持|不适用|不参与|不抵扣)",
+            clause,
+        )), "")
         negative = next((clause for clause in relevant_clauses if re.search(
             r"不可(?!抗)|不能|不支持|不适用|除外|不参与|不抵扣", clause
-        )), "")
+        ) and clause != local_exception), "")
         exclusion_segments = []
         for pattern in (
             r"除([^。；\n]{1,80}?)外[^。；\n]{0,30}(?:全场通用|全场可用|均可使用|都可使用)",
@@ -8490,7 +8561,24 @@ class V2Store(AppStore):
             r"(?:使用|抵扣)[^。；\n]{0,8}(?:可以|可|支持)|可用", clause
         ) and not re.search(r"不可|不能|不支持|不适用", clause)), "")
 
-        if negative or excluded:
+        if local_exception and subject == "菜品":
+            exception_text = re.sub(
+                r"^(?:使用范围)?例外[：:]?\s*", "", local_exception,
+            ).strip(" \t，,。；;")
+            exclusion_text = "、".join(dict.fromkeys(
+                value.strip(" ，,、") for value in exclusion_segments if value.strip(" ，,、")
+            ))
+            if global_scope:
+                scope = f"除{exclusion_text}外，其他菜品可以使用当前代金券抵扣" if exclusion_text else (
+                    "其他菜品可以使用当前代金券抵扣"
+                )
+                reply = f"{scope}；但{exception_text}。"
+            else:
+                reply = (
+                    "当前规则只明确排除了以下范围，并不表示所有菜品都不可用："
+                    f"{exception_text}。其他菜品是否可用请以适用门店实际规则为准。"
+                )
+        elif negative or excluded:
             evidence = negative or f"除{excluded}外全场通用"
             reply = f"不可以，当前代金券不可用于{subject}。商品规则：{evidence}。"
         elif availability_clause and subject == "菜品":
@@ -9426,6 +9514,10 @@ class V2Store(AppStore):
                 "kind": "aftersale_clarify",
             }
 
+        all_store_scope = self._all_store_scope_reply(item_id, product, message)
+        if all_store_scope:
+            return all_store_scope
+
         if _allow_multi and not aftersale_candidate:
             multi = self.resolve_multi_question(
                 item_id, product, message, actual_paid_amount,
@@ -10169,29 +10261,6 @@ class V2Store(AppStore):
                 "kind": "sku_availability",
                 **({"query_context_update": {"last_sku_catalog": True}}
                    if re.search(r"代金券|优惠券|券型|面额", message) else {}),
-            }
-
-        all_store_question = bool(re.search(
-            r"(?:所有|全部|全国|每家|每个|任意).{0,5}(?:门店|店铺|店).{0,5}(?:通用|可用|能用|可以用)|"
-            r"(?:门店|店铺|店).{0,5}(?:都|全部|所有).{0,4}(?:通用|可用|能用|可以用)|"
-            r"(?:全国|全城)(?:门店|店铺|店)?(?:都|全部)?(?:通用|可用|能用|可以用)|"
-            r"^(?:通用吗|都能用吗|都可以用吗|都可用吗)[？?。！!]*$",
-            message,
-        ))
-        if all_store_question:
-            if self._multi_sku_store_scope(item_id, product).get("stores_differ"):
-                return {
-                    "reply": "不同商品规格的适用门店可能不同。请发送要购买的规格名称、面额或人数，以及城市或门店名称，我按对应规格为您准确查询。",
-                    "source": "当前商品不同规格绑定了不同门店表",
-                    "decision": "allow", "kind": "stores_clarify",
-                }
-            title = str(product.get("title") or "")
-            subject = "鱼酷烤鱼券" if "鱼酷" in title else "当前商品卡券"
-            return {
-                "reply": f"{subject}需在指定门店使用。\n\n具体可用门店，请发送城市或店面名称进行查询。",
-                "source": "当前商品绑定的指定适用门店",
-                "decision": "allow",
-                "kind": "stores_scope",
             }
 
         explicit_area_list_query = bool(

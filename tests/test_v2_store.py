@@ -3859,6 +3859,36 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("不可用于菜品", result["reply"])
         self.assertIn("部分菜品可能因时令、售罄", result["reply"])
 
+    def test_specific_dish_exception_is_not_widened_to_all_dishes(self):
+        self.store.save_v2_product(
+            "10001", "餐饮代金券",
+            "100元代金券：售价65元。除酒水饮料外全场通用。"
+            "使用范围例外：郑州市正弘店‘粉丝蒸松叶蟹’菜品不可用。",
+        )
+
+        result = self.store.resolve_deterministic("10001", "哪些菜品可以用")
+
+        self.assertEqual("usage_scope", result["kind"])
+        self.assertIn("除酒水饮料外，其他菜品可以使用", result["reply"])
+        self.assertIn("粉丝蒸松叶蟹", result["reply"])
+        self.assertNotIn("当前代金券不可用于菜品", result["reply"])
+
+    def test_coupon_multiplier_in_all_store_question_is_not_a_two_yuan_sku(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡代金券",
+            "100元代金券：售价57.9元，发100元券1张。"
+            "300元代金券：售价212.8元，发300元券1张。",
+        )
+
+        result = self.store.resolve_deterministic(
+            "10001", "你好请问100x2的券全国门店通用吗",
+        )
+
+        self.assertEqual("stores_scope", result["kind"])
+        self.assertIn("100元代金券（购买2张）", result["reply"])
+        self.assertIn("不是全国所有门店通用", result["reply"])
+        self.assertNotIn("2元代金券", result["reply"])
+
     def test_elliptical_amount_followup_uses_consumption_plan(self):
         self.store.save_v2_product(
             "10001", "餐饮代金券",
@@ -3881,6 +3911,21 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("共支付260元", result["reply"])
         self.assertIn("剩余26元到店自行支付", result["reply"])
         self.assertNotIn("出价", result["reply"])
+
+    def test_amount_over_stack_limit_uses_closest_valid_sku(self):
+        self.store.save_v2_product(
+            "10001", "多规格代金券",
+            "100元代金券：售价85元（可叠加4张）\n"
+            "300元代金券：售价235元（可叠加2张）\n"
+            "400元代金券：售价340元，发100元券4张\n"
+            "仅支持同面额代金券叠加。100元券最多叠加4张；300元券最多叠加2张。",
+        )
+        result = self.store.resolve_deterministic("10001", "500")
+        self.assertEqual("consumption_plan", result["kind"])
+        self.assertIn("共支付340元", result["reply"])
+        self.assertIn("可抵扣400元", result["reply"])
+        self.assertIn("剩余100元到店自行支付", result["reply"])
+        self.assertNotIn("无法组成", result["reply"])
 
     def test_global_scope_allows_only_items_outside_explicit_exclusions(self):
         self.store.save_v2_product(
