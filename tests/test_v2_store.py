@@ -216,6 +216,28 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("售价168元", result["reply"])
         self.assertNotIn("单人套餐", result["reply"])
 
+    def test_store_reply_preserves_meaningful_marketplace_sku_names(self):
+        meituan = {
+            "sku_key": "meituan-200", "sku_name": "美团200（可叠加2张）",
+            "face_value": "200", "sale_price": "119.8", "option_type": "voucher",
+        }
+        douyin = {
+            "sku_key": "douyin-200", "sku_name": "抖音200（可叠加4张）",
+            "face_value": "200", "sale_price": "138", "option_type": "voucher",
+        }
+        matrix = [{
+            "store": {"branch": "天河店", "city": "广州"},
+            "supported_skus": [meituan, douyin], "unknown_skus": [],
+        }]
+        reply = self.store._format_store_sku_matrix("天河店", matrix)
+        self.assertIn("美团200（可叠加2张）（售价119.8元）", reply)
+        self.assertIn("抖音200（可叠加4张）（售价138元）", reply)
+        selected_reply = self.store._format_store_sku_matrix(
+            "天河店", matrix, [meituan, douyin],
+        )
+        self.assertIn("美团200（可叠加2张）、抖音200（可叠加4张）可以使用", selected_reply)
+        self.assertNotIn("200元、200元代金券", selected_reply)
+
     def test_multi_sku_specific_store_uses_product_union_without_city_fallback(self):
         self.store.save_v2_product(
             "10001", "多规格代金券",
@@ -3888,6 +3910,89 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("100元代金券（购买2张）", result["reply"])
         self.assertIn("不是全国所有门店通用", result["reply"])
         self.assertNotIn("2元代金券", result["reply"])
+
+    def test_platform_skus_recover_missing_sale_prices_for_store_configuration(self):
+        product = {
+            "title": "蚂蚁洞烤肉代金券",
+            "raw_text": (
+                "美团200元代金券（最多叠加2张）\n"
+                "抖音50元代金券（最多叠加4张）\n"
+                "抖音200元代金券（最多叠加4张）"
+            ),
+            "structured": {"products": [
+                {"name": "美团200元代金券", "face_value": "200", "sale_price": ""},
+                {"name": "抖音200元代金券", "face_value": "200", "sale_price": ""},
+            ]},
+            "platform_summary": json.dumps({
+                "title": "蚂蚁洞烤肉代金券",
+                "description": "不同卡券适用门店不同",
+                "sku": [
+                    {"priceInCent": 11980, "quantity": 200, "propertyList": [
+                        {"actualValueText": "美团200（可叠加2张）"}
+                    ]},
+                    {"priceInCent": 12900, "quantity": 200, "propertyList": [
+                        {"actualValueText": "抖音50x4"}
+                    ]},
+                    {"priceInCent": 13800, "quantity": 500, "propertyList": [
+                        {"actualValueText": "抖音200（可叠加4张）"}
+                    ]},
+                    {"priceInCent": 5600, "quantity": 200, "propertyList": [
+                        {"actualValueText": "防下架勿拍"}
+                    ]},
+                ],
+            }, ensure_ascii=False),
+            "manual_edited": True,
+        }
+
+        skus = self.store.list_product_skus("platform-sku", product)
+        by_name = {sku["sku_name"]: sku for sku in skus}
+
+        self.assertEqual(3, len(skus))
+        self.assertEqual("119.8", by_name["美团200（可叠加2张）"]["sale_price"])
+        self.assertEqual("2", by_name["美团200（可叠加2张）"]["max_stack"])
+        self.assertEqual("138", by_name["抖音200（可叠加4张）"]["sale_price"])
+        self.assertEqual("4", by_name["抖音200（可叠加4张）"]["max_stack"])
+        self.assertEqual("50元券4张", by_name["抖音50x4"]["composition"])
+        self.assertNotIn("防下架勿拍", by_name)
+
+    def test_platform_and_face_keep_distinct_stack_limits(self):
+        product = {
+            "title": "双平台代金券",
+            "raw_text": (
+                "美团200元代金券最多叠加2张。\n"
+                "抖音200元代金券最多叠加4张。\n"
+                "仅支持同一规格代金券叠加，不同规格不能混用。"
+            ),
+            "structured": {"products": [
+                {
+                    "name": "美团200元代金券", "face_value": "200",
+                    "sale_price": "119.8", "max_stack": "2",
+                },
+                {
+                    "name": "抖音200元代金券", "face_value": "200",
+                    "sale_price": "138", "max_stack": "4",
+                },
+            ]},
+        }
+        self.assertEqual("", self.store.benefit_combination_reply(
+            product, "美团200元代金券可以叠加吗",
+        ))
+        meituan = self.store.stacking_reply(product, "美团200元代金券能用几张")
+        self.assertIn("美团200元代金券", meituan)
+        self.assertIn("最多使用2张", meituan)
+        self.assertNotIn("抖音200元代金券", meituan)
+        douyin = self.store.stacking_reply(product, "抖音200元代金券能用几张")
+        self.assertIn("抖音200元代金券", douyin)
+        self.assertIn("最多使用4张", douyin)
+        bare = self.store.stacking_reply(product, "200元代金券能用几张")
+        self.assertIn("美团200元代金券每次最多使用2张", bare)
+        self.assertIn("抖音200元代金券每次最多使用4张", bare)
+        self.assertIn("请确认需要哪一种规格", bare)
+        summary = self.store.build_knowledge_summary(product)
+        self.assertIn("美团200元代金券最多使用2张", summary)
+        self.assertIn("抖音200元代金券最多使用4张", summary)
+        matches = self.store.match_message_skus("10001", "美团200元", product)
+        self.assertEqual(["美团200元代金券"], [row["sku_name"] for row in matches])
 
     def test_elliptical_amount_followup_uses_consumption_plan(self):
         self.store.save_v2_product(
