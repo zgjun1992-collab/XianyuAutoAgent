@@ -1018,6 +1018,24 @@ class V2Store(AppStore):
         except (TypeError, ValueError):
             return text
 
+    @classmethod
+    def _normalize_stack_limit(cls, value: object) -> str:
+        """Return a numeric per-SKU limit, ignoring descriptive stack rules."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            number = Decimal(text)
+            return cls._format_number(number) if number > 0 else ""
+        except InvalidOperation:
+            pass
+        match = re.search(
+            r"(?:最多|上限|每次最多|可叠加|可使用|最多使用)[^\d]{0,6}(\d+)\s*张|"
+            r"(\d+)\s*张(?:封顶|以内|上限)?",
+            text,
+        )
+        return str(int(match.group(1) or match.group(2))) if match else ""
+
     @staticmethod
     def _pick(record: Dict, aliases: Iterable[str]):
         for alias in aliases:
@@ -1151,7 +1169,7 @@ class V2Store(AppStore):
         if not voucher_evidence or invalid_name:
             return None
         composition = cls._normalize_composition(composition_value, face_value)
-        max_stack = cls._format_number(cls._pick(record, (
+        max_stack = cls._normalize_stack_limit(cls._pick(record, (
             "最多叠加", "叠加上限", "最多使用张数", "最多使用", "max_stack", "max_count",
         )))
         if not name and face_value:
@@ -1507,7 +1525,8 @@ class V2Store(AppStore):
                 except InvalidOperation:
                     base_price = current_price = Decimal("0")
                 if base_price > 0 and abs(current_price - base_price * quantity) <= Decimal("0.2"):
-                    current_max = int(str(base.get("max_stack") or "0") or "0")
+                    current_limit = cls._normalize_stack_limit(base.get("max_stack"))
+                    current_max = int(Decimal(current_limit)) if current_limit else 0
                     base["max_stack"] = str(max(current_max, quantity))
                     continue
             collapsed.append(option)
