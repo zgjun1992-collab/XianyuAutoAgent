@@ -4238,8 +4238,12 @@ class V2Store(AppStore):
     def amount_inquiry_plan_reply(self, product: Dict, message: str) -> Optional[Dict]:
         """Plan an amount inquiry using one in-stock denomination and explicit stacking."""
         text = str(message or "").strip()
+        contextual_amount = bool(re.match(
+            r"\s*(?:我(?:这边)?|这边|一共|总共)\s*\d", text,
+        ))
         match = re.fullmatch(
-            r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"\s*(?:(?:我(?:这边)?|这边|一共|总共)\s*)?"
+            r"(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
             r"(?:(?:的)?(?:呢|嘛|么|呀|啊))?\s*[?？。!！]?\s*",
             text,
         )
@@ -4271,7 +4275,7 @@ class V2Store(AppStore):
             return None
         day = self._requested_day_type(message, default_today=True)
         options = self._filter_options_for_day(options, day)
-        if bare:
+        if bare and not contextual_amount:
             exact_sale_prices = [
                 option for option in self.extract_sale_options(product)
                 if option.get("option_type") == "voucher"

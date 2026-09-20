@@ -3870,6 +3870,18 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("共支付130元", result["reply"])
         self.assertNotIn("没有200元代金券", result["reply"])
 
+    def test_buyer_prefixed_amount_uses_consumption_plan_instead_of_offer(self):
+        self.store.save_v2_product(
+            "10001", "餐饮代金券",
+            "100元代金券：售价65元，发100元券1张。支持同面额代金券叠加，最多叠加5张。",
+        )
+        result = self.store.resolve_deterministic("10001", "我426元")
+        self.assertEqual("consumption_plan", result["kind"])
+        self.assertIn("购买4张100元代金券", result["reply"])
+        self.assertIn("共支付260元", result["reply"])
+        self.assertIn("剩余26元到店自行支付", result["reply"])
+        self.assertNotIn("出价", result["reply"])
+
     def test_global_scope_allows_only_items_outside_explicit_exclusions(self):
         self.store.save_v2_product(
             "10001", "火锅代金券",
