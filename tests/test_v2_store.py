@@ -228,6 +228,13 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertEqual(["美团200元代金券"], [sku["sku_name"] for sku in matched])
 
+        updated = self.store.set_sku_store_rule(
+            "10001", skus[0]["sku_key"], skus[0]["sku_name"], "inherit", [], "119.8",
+        )
+        self.assertEqual("119.8", updated["sale_price"])
+        self.assertEqual("119.8", updated["sale_price_override"])
+        self.assertFalse(updated["price_pending"])
+
     def test_store_query_reverse_recommends_only_supported_sku_with_real_price(self):
         self.store.save_ai_summary("10001", "两种套餐", {
             "sale_options": [
@@ -262,6 +269,8 @@ class V2StoreTests(unittest.TestCase):
             "supported_skus": [meituan, douyin], "unknown_skus": [],
         }]
         reply = self.store._format_store_sku_matrix("天河店", matrix)
+        self.assertIn("支持使用下面卡券", reply)
+        self.assertIn("美团200（可叠加2张）（售价119.8元）；\n\n", reply)
         self.assertIn("美团200（可叠加2张）（售价119.8元）", reply)
         self.assertIn("抖音200（可叠加4张）（售价138元）", reply)
         selected_reply = self.store._format_store_sku_matrix(
@@ -300,11 +309,11 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("根据“合肥”", result["reply"])
         self.assertEqual(
             "根据“合肥之心城店”查询到以下可用门店及规格：\n\n"
-            "1. 【合肥之心城店】：100元代金券（售价64元）；300元代金券（售价192元）。\n\n"
+            "1. 【合肥之心城店】：支持使用下面卡券\n\n"
+            "100元代金券（售价64元）；\n\n300元代金券（售价192元）。\n\n"
             "请按对应门店支持的规格拍下。",
             result["reply"],
         )
-
         unavailable_sku = self.store.resolve_deterministic(
             "10001", "合肥之心城200可以用吗",
         )
@@ -317,6 +326,59 @@ class V2StoreTests(unittest.TestCase):
             "10001", "合肥之心城300可以用吗",
         )
         self.assertEqual("【合肥之心城店】：300元代金券可以使用。", available_sku["reply"])
+
+    def test_store_followup_amount_lists_every_supported_exact_combination(self):
+        self.store.save_v2_product(
+            "10001", "双平台代金券",
+            "美团200元代金券：售价119.8元，最多叠加2张\n"
+            "抖音200元代金券：售价138元，最多叠加4张\n"
+            "抖音500元代金券：售价328元，最多叠加4张",
+        )
+        self.store.save_ai_summary("10001", "双平台真实规格", {"products": [
+            {"name": "美团200元代金券", "option_type": "代金券", "face_value": "200", "sale_price": "119.8", "max_stack": 2},
+            {"name": "抖音200元代金券", "option_type": "代金券", "face_value": "200", "sale_price": "138", "max_stack": 4},
+            {"name": "抖音500元代金券", "option_type": "代金券", "face_value": "500", "sale_price": "328", "max_stack": 4},
+        ]})
+        meituan_list = self.store.import_store_text(
+            "【江西省】\n【南昌】南昌江西首店、南昌红谷滩店", "美团门店", [],
+        )
+        douyin_list = self.store.import_store_text(
+            "【江西省】\n【南昌】南昌江西首店", "抖音门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = meituan_list["id"] if "美团" in sku["sku_name"] else douyin_list["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+        first = self.store.resolve_deterministic("10001", "南昌江西首店")
+        context = {
+            "query": first["store_query"], "status": first["store_status"],
+            "matches": first["store_matches"], "verified": True,
+            "store_sku_matrix": first["store_sku_matrix"],
+        }
+
+        result = self.store.resolve_deterministic("10001", "400怎么买", store_context=context)
+
+        self.assertEqual("consumption_plan", result["kind"])
+        self.assertIn("可选组合方案", result["reply"])
+        self.assertIn("美团200元代金券×2（共支付239.6元，可抵扣400元）", result["reply"])
+        self.assertIn("抖音200元代金券×2（共支付276元，可抵扣400元）", result["reply"])
+        self.assertNotIn("抖音500元代金券", result["reply"])
+
+    def test_bare_amount_then_generic_price_uses_selected_sku(self):
+        self.store.save_v2_product("10001", "抖音代金券", "抖音500元代金券：售价328元")
+        self.store.save_ai_summary("10001", "抖音500元代金券售价328元", {
+            "products": [{
+                "name": "抖音500元代金券", "option_type": "代金券",
+                "face_value": "500", "sale_price": "328", "max_stack": 4,
+            }],
+        })
+        first = self.store.resolve_deterministic("10001", "500")
+        self.assertIn("328元", first["reply"])
+        followup = self.store.resolve_deterministic(
+            "10001", "多少钱", store_context=first["query_context_update"],
+        )
+        self.assertIn("抖音500元代金券（售价328元）", followup["reply"])
 
     def test_city_plus_unique_homophone_store_name_can_auto_match(self):
         self.store.save_v2_product(
@@ -490,15 +552,20 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "郑州")
         self.assertEqual("stores_sku_recommendation", result["kind"])
         self.assertEqual(2, len(result["store_matches"]))
-        lines = result["reply"].splitlines()
-        david = next(line for line in lines if "大卫城店" in line)
-        wanda = next(line for line in lines if "二七万达店" in line)
-        self.assertIn("100元代金券", david)
-        self.assertNotIn("200元代金券", david)
-        self.assertIn("100元代金券", wanda)
-        self.assertIn("200元代金券", wanda)
+        matrix = {
+            row["store"]["branch"]: "、".join(
+                sku["sku_name"] for sku in row["supported_skus"]
+            )
+            for row in result["store_sku_matrix"]
+        }
+        self.assertIn("100元代金券", matrix["郑州大卫城店"])
+        self.assertNotIn("200元代金券", matrix["郑州大卫城店"])
+        self.assertIn("100元代金券", matrix["郑州二七万达店"])
+        self.assertIn("200元代金券", matrix["郑州二七万达店"])
         self.assertIn("\n\n1. 【", result["reply"])
-        self.assertIn("；", wanda)
+        self.assertIn("100元代金券（售价64元）", result["reply"])
+        self.assertIn("200元代金券（售价120元）", result["reply"])
+        self.assertIn("；", result["reply"])
         self.assertNotIn("&#x20;", result["reply"])
 
     def test_multi_sku_store_matrix_supports_amount_followup(self):
@@ -2150,6 +2217,19 @@ class V2StoreTests(unittest.TestCase):
                 self.assertIn("三人经典自助", followup["reply"])
                 self.assertIn("495元", followup["reply"])
                 self.assertNotIn("几个人用餐", followup["reply"])
+
+    def test_date_and_meal_without_people_asks_only_for_people_count(self):
+        self.store.save_v2_product(
+            "10001", "分时自助电子券码",
+            "工作日单人经典自助（午餐可用）：售价159元\n"
+            "工作日双人经典自助（午餐可用）：售价299元",
+        )
+
+        result = self.store.resolve_deterministic("10001", "明天中午")
+
+        self.assertIn("几个人用餐", result["reply"])
+        self.assertNotIn("请补充具体想查询的商品", result["reply"])
+        self.assertEqual("people_count", result["query_context_update"]["price_filters"]["awaiting"])
 
     def test_people_and_date_followups_fill_the_requested_slot_in_order(self):
         self.store.save_v2_product(

@@ -64,6 +64,18 @@ class BackendSyncTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_nested_goofish_sku_records_are_recovered(self):
+        payload = {
+            "itemDO": {"skuList": []},
+            "tradeInfo": {"skuInfo": {"skuList": [{
+                "skuId": "sku-200", "priceInCent": 11980,
+                "propertyList": [{"valueText": "美团200元代金券"}],
+            }] }},
+        }
+        records = self.state._collect_sku_records(payload)
+        self.assertEqual(1, len(records))
+        self.assertEqual("sku-200", records[0]["skuId"])
+
     @patch("v2_backend.XianyuApis", FakeXianyuApis)
     def test_syncs_onsale_text_without_sending_images_to_ai(self):
         result = self.state.sync_products()

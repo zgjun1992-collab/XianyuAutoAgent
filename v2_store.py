@@ -344,6 +344,7 @@ class V2Store(AppStore):
                     item_id TEXT NOT NULL,
                     sku_key TEXT NOT NULL,
                     sku_name TEXT NOT NULL DEFAULT '',
+                    sale_price_override TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'inherit',
                     status TEXT NOT NULL DEFAULT 'active',
                     created_at TEXT NOT NULL,
@@ -486,6 +487,14 @@ class V2Store(AppStore):
             if "business_hours" not in store_columns:
                 conn.execute(
                     "ALTER TABLE stores ADD COLUMN business_hours TEXT NOT NULL DEFAULT ''"
+                )
+            sku_rule_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(product_sku_store_rules)").fetchall()
+            }
+            if "sale_price_override" not in sku_rule_columns:
+                conn.execute(
+                    "ALTER TABLE product_sku_store_rules "
+                    "ADD COLUMN sale_price_override TEXT NOT NULL DEFAULT ''"
                 )
             refund_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(refund_orders)").fetchall()
@@ -1274,6 +1283,12 @@ class V2Store(AppStore):
                 price = cls._format_number(Decimal(str(cents)) / Decimal("100"))
             except (InvalidOperation, TypeError, ValueError):
                 price = ""
+            if not price:
+                direct_price = record.get("soldPrice")
+                try:
+                    price = cls._format_number(Decimal(str(direct_price)))
+                except (InvalidOperation, TypeError, ValueError):
+                    price = ""
             if not price:
                 continue
             quantity_match = re.search(
@@ -2749,12 +2764,30 @@ class V2Store(AppStore):
             r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛|轻享和牛",
             text, re.I,
         ))
+        condition_package_options = [
+            option for option in self.extract_sale_options(product)
+            if option.get("option_type") == "package" and option.get("sale_price")
+        ]
+        condition_people_counts = {
+            int(count)
+            for option in condition_package_options
+            for count in (option.get("people_counts") or [])
+            if count
+        }
+        condition_only_package_query = bool(
+            direct_slots.get("meal_period")
+            and (direct_slots.get("day_type") or direct_slots.get("date_label"))
+            and len(condition_people_counts) > 1
+        )
         implicit_condition_price = bool(
-            direct_slots.get("people_count")
-            and (
-                direct_slots.get("day_type") or direct_slots.get("meal_period")
-                or package_tier_intent
+            (
+                direct_slots.get("people_count")
+                and (
+                    direct_slots.get("day_type") or direct_slots.get("meal_period")
+                    or package_tier_intent
+                )
             )
+            or condition_only_package_query
         )
         if (
             availability_intent
@@ -4380,7 +4413,10 @@ class V2Store(AppStore):
         ) or 1
         return max(1, maximum // delivered)
 
-    def amount_inquiry_plan_reply(self, product: Dict, message: str) -> Optional[Dict]:
+    def amount_inquiry_plan_reply(
+        self, product: Dict, message: str,
+        available_options: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
         """Plan an amount inquiry using one in-stock denomination and explicit stacking."""
         text = str(message or "").strip()
         contextual_amount = bool(re.match(
@@ -4412,7 +4448,10 @@ class V2Store(AppStore):
         if not match:
             return None
         knowledge = "\n".join(str(product.get(key) or "") for key in ("title", "raw_text", "ai_summary"))
-        options = self.extract_product_options(product)
+        options = (
+            list(available_options)
+            if available_options is not None else self.extract_product_options(product)
+        )
         if not options and not re.search(r"代金券|抵扣券|现金券", knowledge):
             return None
         target = Decimal(match.group(1))
@@ -4499,6 +4538,28 @@ class V2Store(AppStore):
                 continue
         amount = self._format_number(target)
         if not candidates:
+            exact_unpriced = [
+                option for option in options
+                if self._option_total_value(option) == amount
+                and self._is_sellable_option(option)
+                and not str(option.get("sale_price") or "").strip()
+            ]
+            if len(exact_unpriced) == 1:
+                option = exact_unpriced[0]
+                name = str(
+                    option.get("name") or option.get("sku_name") or f"{amount}元代金券"
+                ).strip()
+                return {
+                    "reply": f"当前商品包含{name}，但该规格售价尚未同步，请先在后台补充售价后再报价。",
+                    "kind": "sku_price", "decision": "allow",
+                    "source": "当前真实SKU存在但售价待同步",
+                    "query_context_update": {
+                        "selected_sku_key": str(
+                            option.get("sku_key") or self.sku_key_for_option(option)
+                        ),
+                        "selected_sku_name": name,
+                    },
+                }
             if not bare:
                 return None
             catalog_totals = set()
@@ -4542,12 +4603,41 @@ class V2Store(AppStore):
                 "kind": "redemption_plan", "decision": "deny",
                 "source": "当前SKU库存、适用日期、面额与叠加限制",
             }
+        candidates.sort(key=lambda row: (
+            row[0], row[1], str(row[2].get("name") or row[2].get("sku_name") or "")
+        ))
+        plans = []
+        seen_plans = set()
+        for total, quantity, option in candidates:
+            name = str(option.get("name") or option.get("sku_name") or "代金券").strip()
+            key = (normalize_text(name), quantity, self._format_number(total))
+            if key in seen_plans:
+                continue
+            seen_plans.add(key)
+            purchase = name if quantity == 1 else f"{name}×{quantity}"
+            plans.append(
+                f"{len(plans) + 1}. {purchase}（共支付{self._format_number(total)}元，"
+                f"可抵扣{amount}元）"
+            )
+        if len(plans) > 1:
+            return {
+                "reply": f"需要抵扣{amount}元，可选组合方案：\n" + "\n".join(plans)
+                + "\n请按所选平台和对应规格拍下，不同平台、不同面额不要混用。",
+                "kind": "redemption_plan", "decision": "allow",
+                "source": "当前门店可用SKU售价、面额与各自叠加上限",
+            }
         total, quantity, option = min(candidates, key=lambda row: (row[1] != 1, row[0], row[1]))
         contents = self._purchase_contents_label(option, quantity)
         return {
             "reply": f"需要抵扣{amount}元的话，可以购买{contents}，共支付{self._format_number(total)}元，可抵扣{amount}元。",
             "kind": "redemption_plan", "decision": "allow",
             "source": "当前可售且日期适用的同一SKU及明确叠加限制",
+            "query_context_update": {
+                "selected_sku_key": str(option.get("sku_key") or self.sku_key_for_option(option)),
+                "selected_sku_name": str(
+                    option.get("name") or option.get("sku_name") or "商品规格"
+                ),
+            },
         }
 
     def consumption_plan_reply(
@@ -6310,6 +6400,9 @@ class V2Store(AppStore):
             if key not in rules and (legacy_key in rules or legacy_key in bindings):
                 key = legacy_key
             rule = rules.get(key) or {}
+            source_sale_price = str(option.get("sale_price") or "").strip()
+            sale_price_override = str(rule.get("sale_price_override") or "").strip()
+            effective_sale_price = sale_price_override or source_sale_price
             mode = rule.get("mode") if rule.get("mode") in {"inherit", "custom"} else "inherit"
             rule_status = str(rule.get("status") or "active").strip().lower()
             option_available = str(option.get("availability") or "available") == "available"
@@ -6320,7 +6413,9 @@ class V2Store(AppStore):
             effective_ids = own_ids if mode == "custom" else default_ids
             output.append({
                 "sku_key": key, "sku_name": str(option.get("name") or "商品规格"),
-                "sale_price": str(option.get("sale_price") or ""),
+                "sale_price": effective_sale_price,
+                "source_sale_price": source_sale_price,
+                "sale_price_override": sale_price_override,
                 "face_value": str(option.get("face_value") or ""),
                 "composition": str(option.get("composition") or ""),
                 "max_stack": str(option.get("max_stack") or ""),
@@ -6333,7 +6428,7 @@ class V2Store(AppStore):
                 "stock": str(option.get("stock") or ""),
                 "availability_explicit": bool(option.get("availability_explicit")),
                 "sellable": sellable,
-                "price_pending": bool(option.get("price_pending")),
+                "price_pending": not bool(effective_sale_price),
                 "list_ids": own_ids, "effective_list_ids": effective_ids,
                 "own_store_count": self._store_count_for_lists(own_ids),
                 "effective_store_count": self._store_count_for_lists(effective_ids),
@@ -6342,13 +6437,23 @@ class V2Store(AppStore):
         return output
 
     def set_sku_store_rule(self, item_id: str, sku_key: str, sku_name: str,
-                           mode: str, list_ids: Optional[List[int]] = None) -> Dict:
+                           mode: str, list_ids: Optional[List[int]] = None,
+                           sale_price: object = "") -> Dict:
         item_id, sku_key = str(item_id or "").strip(), str(sku_key or "").strip()
         mode = str(mode or "inherit").strip()
         if not item_id or not sku_key:
             raise ValueError("请选择商品规格")
         if mode not in {"inherit", "custom"}:
             raise ValueError("门店适用方式无效")
+        sale_price = str(sale_price or "").strip()
+        if sale_price:
+            try:
+                normalized_price = self._format_number(Decimal(sale_price))
+                if Decimal(normalized_price) <= 0:
+                    raise ValueError
+                sale_price = normalized_price
+            except (InvalidOperation, ValueError):
+                raise ValueError("规格售价必须是大于0的数字")
         valid_keys = {row["sku_key"]: row for row in self.list_product_skus(item_id)}
         if sku_key not in valid_keys:
             raise ValueError("商品规格不存在或已经失效")
@@ -6364,10 +6469,15 @@ class V2Store(AppStore):
         now = self._now()
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO product_sku_store_rules(item_id,sku_key,sku_name,mode,status,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(item_id,sku_key) DO UPDATE SET
-                   sku_name=excluded.sku_name,mode=excluded.mode,status='active',updated_at=excluded.updated_at""",
-                (item_id, sku_key, sku_name or valid_keys[sku_key]["sku_name"], mode, "active", now, now),
+                """INSERT INTO product_sku_store_rules(
+                       item_id,sku_key,sku_name,sale_price_override,mode,status,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(item_id,sku_key) DO UPDATE SET
+                   sku_name=excluded.sku_name,sale_price_override=excluded.sale_price_override,
+                   mode=excluded.mode,status='active',updated_at=excluded.updated_at""",
+                (
+                    item_id, sku_key, sku_name or valid_keys[sku_key]["sku_name"],
+                    sale_price, mode, "active", now, now,
+                ),
             )
             conn.execute("DELETE FROM product_sku_store_lists WHERE item_id=? AND sku_key=?", (item_id, sku_key))
             if mode == "custom":
@@ -6445,7 +6555,7 @@ class V2Store(AppStore):
     def _sku_public_label(sku: Dict) -> str:
         name = str(sku.get("sku_name") or "该规格").strip()
         price = str(sku.get("sale_price") or "").strip()
-        return f"{name}（售价{price}元）" if price else name
+        return f"{name}（售价{price}元）" if price else f"{name}（售价待同步）"
 
     def reverse_store_sku_matches(self, item_id: str, query: str,
                                   product: Optional[Dict] = None) -> List[Dict]:
@@ -6587,8 +6697,12 @@ class V2Store(AppStore):
                     direct.append("可用规格为" + cls._compact_sku_names(supported))
                 line = f"【{store_name}】：{'；'.join(direct) or '暂无已确认的可用规格'}。"
             else:
-                labels = "；".join(cls._sku_public_label(sku) for sku in supported)
-                line = f"{index}. 【{store_name}】：{labels or '暂无已确认的可用规格'}。"
+                if supported:
+                    labels = [cls._sku_public_label(sku) for sku in supported]
+                    catalog = "；\n\n".join(labels) + "。"
+                    line = f"{index}. 【{store_name}】：支持使用下面卡券\n\n{catalog}"
+                else:
+                    line = f"{index}. 【{store_name}】：暂无已确认的可用规格。"
             unknown = [
                 sku for sku in row.get("unknown_skus") or []
                 if not selected_keys or str(sku.get("sku_key") or "") in selected_keys
@@ -9862,6 +9976,37 @@ class V2Store(AppStore):
             # Package prices must continue to the semantic package resolver,
             # otherwise “消费200元怎么买” can invent a coupon-like plan.
             if self.extract_product_options(product):
+                context_matrix = list((store_context or {}).get("store_sku_matrix") or [])
+                context_skus = []
+                seen_context_skus = set()
+                for row in context_matrix:
+                    for sku in row.get("supported_skus") or []:
+                        key = str(sku.get("sku_key") or sku.get("sku_name") or "")
+                        if key and key not in seen_context_skus and sku.get("sellable", True):
+                            seen_context_skus.add(key)
+                            context_skus.append(sku)
+                plan_skus = context_skus or [
+                    sku for sku in self.list_product_skus(item_id, product)
+                    if sku.get("sellable", True)
+                ]
+                planned = self.amount_inquiry_plan_reply(
+                    product, amount_plan.group(1), available_options=[
+                        {**sku, "name": str(sku.get("sku_name") or "商品规格")}
+                        for sku in plan_skus
+                    ],
+                )
+                if planned and planned.get("decision") == "allow":
+                    # Keep the public result type used by the existing
+                    # “消费额怎么买” route while reusing the SKU-aware planner.
+                    planned = dict(planned)
+                    if "可选组合方案" not in str(planned.get("reply") or ""):
+                        legacy_reply = self.consumption_plan_reply(
+                            product, amount_plan.group(1), available_options=plan_skus,
+                        )
+                        if legacy_reply:
+                            planned["reply"] = legacy_reply
+                    planned["kind"] = "consumption_plan"
+                    return planned
                 reply = self.consumption_plan_reply(product, amount_plan.group(1))
                 return {
                     "reply": reply,
@@ -9952,7 +10097,26 @@ class V2Store(AppStore):
             return candidate_followup
 
         if not (store_context or {}).get("price_filters"):
-            redemption_plan = self.amount_inquiry_plan_reply(product, message)
+            context_matrix = list((store_context or {}).get("store_sku_matrix") or [])
+            context_skus = []
+            seen_context_skus = set()
+            for row in context_matrix:
+                for sku in row.get("supported_skus") or []:
+                    key = str(sku.get("sku_key") or sku.get("sku_name") or "")
+                    if key and key not in seen_context_skus and sku.get("sellable", True):
+                        seen_context_skus.add(key)
+                        context_skus.append(sku)
+            plan_skus = context_skus or [
+                sku for sku in self.list_product_skus(item_id, product)
+                if sku.get("sellable", True)
+            ]
+            plan_options = [
+                {**sku, "name": str(sku.get("sku_name") or "商品规格")}
+                for sku in plan_skus
+            ]
+            redemption_plan = self.amount_inquiry_plan_reply(
+                product, message, available_options=plan_options,
+            )
             if redemption_plan:
                 return redemption_plan
 
@@ -10071,6 +10235,30 @@ class V2Store(AppStore):
                 "decision": "allow",
                 "kind": "price",
             }
+
+        selected_key = str((store_context or {}).get("selected_sku_key") or "")
+        if selected_key and compact in {
+            "多少钱", "多钱", "多少", "价格", "价格呢", "什么价", "什么价格",
+            "怎么卖", "售价多少", "当前多少钱", "现在多少钱",
+        }:
+            selected = next((
+                sku for sku in self.list_product_skus(item_id, product)
+                if str(sku.get("sku_key") or "") == selected_key
+            ), None)
+            if selected:
+                label = self._sku_public_label(selected)
+                reply = (
+                    f"{label}。" if selected.get("sale_price") else
+                    f"{selected.get('sku_name') or '该规格'}的售价尚未同步，请先在后台补充售价后再报价。"
+                )
+                return {
+                    "reply": reply, "source": "当前会话已选SKU的真实售价",
+                    "decision": "allow", "kind": "price",
+                    "query_context_update": {
+                        "selected_sku_key": selected_key,
+                        "selected_sku_name": str(selected.get("sku_name") or ""),
+                    },
+                }
 
         named_sku_price = self.named_sku_price_reply(product, message)
         if named_sku_price:
