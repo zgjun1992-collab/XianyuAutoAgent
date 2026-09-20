@@ -196,6 +196,38 @@ class V2StoreTests(unittest.TestCase):
             "10001", single["sku_key"]
         )[0])
 
+    def test_structured_vouchers_without_prices_remain_available_for_store_binding(self):
+        raw_text = (
+            "美团200元代金券最多叠加2张。\n"
+            "抖音200元代金券最多叠加4张。"
+        )
+        self.store.save_v2_product("10001", "双平台代金券", raw_text)
+        self.store.save_ai_summary("10001", "双平台规格", {
+            "products": [
+                {
+                    "name": "美团200元代金券", "option_type": "代金券",
+                    "face_value": "200", "sale_price": "", "max_stack": 2,
+                },
+                {
+                    "name": "抖音200元代金券", "option_type": "代金券",
+                    "face_value": "200", "sale_price": "", "max_stack": 4,
+                },
+            ]
+        })
+
+        skus = self.store.get_v2_product("10001")["skus"]
+
+        self.assertEqual(["美团200元代金券", "抖音200元代金券"], [
+            sku["sku_name"] for sku in skus
+        ])
+        self.assertTrue(all(sku["price_pending"] for sku in skus))
+        self.assertTrue(all(sku["sellable"] for sku in skus))
+        self.assertEqual(2, len({sku["sku_key"] for sku in skus}))
+        matched = self.store.match_message_skus(
+            "10001", "美团200能用吗", self.store.get_v2_product("10001"),
+        )
+        self.assertEqual(["美团200元代金券"], [sku["sku_name"] for sku in matched])
+
     def test_store_query_reverse_recommends_only_supported_sku_with_real_price(self):
         self.store.save_ai_summary("10001", "两种套餐", {
             "sale_options": [
@@ -4141,6 +4173,36 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("usage_scope", result["kind"])
         self.assertEqual("allow", result["decision"])
         self.assertIn("没有明确说明锅底是否可用", result["reply"])
+
+    def test_incomplete_sync_preserves_last_complete_platform_payload(self):
+        complete = json.dumps({
+            "title": "双平台券",
+            "description": "完整使用规则",
+            "price": "119.8",
+            "sku": [{
+                "priceInCent": 11980,
+                "propertyList": [{"actualValueText": "美团200（可叠加2张）"}],
+            }],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "sync-sku", "title": "双平台券",
+            "platform_summary": complete, "image_urls": [], "price": "119.8",
+        })
+
+        self.store.upsert_synced_product({
+            "item_id": "sync-sku", "title": "双平台券新标题",
+            "platform_summary": json.dumps({
+                "title": "双平台券新标题", "description": "",
+                "price": "120", "stock": None, "sku": [],
+            }, ensure_ascii=False),
+            "image_urls": [], "price": "120",
+        })
+
+        payload = json.loads(self.store.get_v2_product("sync-sku")["platform_summary"])
+        self.assertEqual("双平台券新标题", payload["title"])
+        self.assertEqual("120", payload["price"])
+        self.assertEqual("完整使用规则", payload["description"])
+        self.assertEqual(1, len(payload["sku"]))
 
     def test_synced_summary_preserves_page_rules_omitted_by_ai(self):
         platform_summary = json.dumps({

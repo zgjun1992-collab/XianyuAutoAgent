@@ -979,7 +979,7 @@ onBeforeUnmount(() => {
               <div v-if="productDraft.skus.length" class="sku-store-layout">
                 <div class="sku-store-options">
                   <button v-for="sku in productDraft.skus" :key="sku.sku_key" :class="['sku-store-option', { active: selectedStoreSkuKey === sku.sku_key }]" @click="selectStoreSku(sku)">
-                    <strong>{{ sku.sku_name }}</strong><small>{{ sku.sale_price ? `售价${sku.sale_price}元 · ` : '' }}{{ sku.mode === 'custom' ? `专属门店${sku.effective_store_count}家` : `继承默认门店${sku.effective_store_count}家` }}</small>
+                    <strong>{{ sku.sku_name }}</strong><small>{{ sku.sale_price ? `售价${sku.sale_price}元 · ` : sku.price_pending ? '售价待同步 · ' : '' }}{{ sku.mode === 'custom' ? `专属门店${sku.effective_store_count}家` : `继承默认门店${sku.effective_store_count}家` }}</small>
                   </button>
                 </div>
                 <div class="sku-store-editor">
