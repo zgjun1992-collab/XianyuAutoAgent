@@ -220,6 +220,36 @@ class V2Store(AppStore):
             return str(parsed.get("description") or "").strip()
         return ""
 
+    @staticmethod
+    def _merge_platform_summary(previous: object, incoming: object) -> str:
+        """Keep the last complete marketplace payload when a refresh is partial."""
+        current_text = str(incoming or "").strip()
+        previous_text = str(previous or "").strip()
+        if not previous_text:
+            return current_text
+        try:
+            current = json.loads(current_text) if current_text else {}
+            old = json.loads(previous_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return current_text or previous_text
+        if not isinstance(current, dict) or not isinstance(old, dict):
+            return current_text or previous_text
+        current_complete = bool(
+            str(current.get("description") or "").strip()
+            or (isinstance(current.get("sku"), list) and current.get("sku"))
+        )
+        old_complete = bool(
+            str(old.get("description") or "").strip()
+            or (isinstance(old.get("sku"), list) and old.get("sku"))
+        )
+        if current_complete or not old_complete:
+            return current_text
+        merged = dict(old)
+        for key in ("title", "price", "stock"):
+            if current.get(key) not in (None, ""):
+                merged[key] = current[key]
+        return json.dumps(merged, ensure_ascii=False)
+
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15, check_same_thread=False)
@@ -636,6 +666,9 @@ class V2Store(AppStore):
         image_urls = [str(value).strip() for value in item.get("image_urls", []) if str(value).strip()]
         with self._connect() as conn:
             old = conn.execute("SELECT * FROM v2_products WHERE item_id=?", (item_id,)).fetchone()
+            platform_summary = self._merge_platform_summary(
+                old["platform_summary"] if old else "", platform_summary,
+            )
             conn.execute(
                 """INSERT INTO v2_products(
                     item_id,title,raw_text,ai_summary,structured_json,platform_summary,
@@ -1172,6 +1205,11 @@ class V2Store(AppStore):
         max_stack = cls._normalize_stack_limit(cls._pick(record, (
             "最多叠加", "叠加上限", "最多使用张数", "最多使用", "max_stack", "max_count",
         )))
+        platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
+        source_id = (
+            f"platform:{platforms[0]}:{face_value}" if platforms and face_value else
+            str(cls._pick(record, ("sku_id", "skuId", "option_id", "id")) or "").strip()
+        )
         if not name and face_value:
             name = f"{face_value}元代金券"
         if not name and not price:
@@ -1183,6 +1221,7 @@ class V2Store(AppStore):
             "applicable_time": applicable_time,
             "composition": composition,
             "max_stack": max_stack,
+            "sku_id": source_id,
             **cls._option_availability(record),
         }
 
@@ -1250,10 +1289,12 @@ class V2Store(AppStore):
                 stack_match.group(1) if stack_match else
                 (quantity_match.group(1) if quantity_match else "")
             )
+            platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
             output.append({
                 "name": name, "face_value": face, "sale_price": price,
                 "applicable_time": "", "composition": composition,
                 "max_stack": max_stack, "_platform_sku": True,
+                "sku_id": f"platform:{platforms[0]}:{face}" if platforms else "",
                 **cls._option_availability(record),
             })
         return output
@@ -6165,6 +6206,63 @@ class V2Store(AppStore):
         ))
         return "local:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
+    @classmethod
+    def _configuration_voucher_options(cls, product: Dict) -> List[Dict]:
+        """Expose corroborated voucher names for store binding before prices sync."""
+        structured = product.get("structured") or {}
+        if not structured and product.get("structured_json"):
+            try:
+                structured = json.loads(product.get("structured_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                structured = {}
+        if not isinstance(structured, dict):
+            return []
+        records = []
+        for key in ("products", "product_options", "skus", "sku", "商品规格", "商品列表", "规格"):
+            value = structured.get(key)
+            if isinstance(value, list):
+                records.extend(item for item in value if isinstance(item, dict))
+            elif isinstance(value, dict):
+                records.extend(item for item in value.values() if isinstance(item, dict))
+        raw_text = normalize_text(product.get("raw_text") or "")
+        output = []
+        for record in records:
+            option = cls._normalize_product_option(record)
+            if not option:
+                continue
+            name = str(option.get("name") or "")
+            face = cls._format_number(option.get("face_value") or "")
+            platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
+            corroborated = normalize_text(name) in raw_text
+            if not corroborated and face:
+                corroborated = any(
+                    platform in raw_text and re.search(
+                        rf"{re.escape(platform)}[^\n。；]{{0,12}}(?<!\d){re.escape(face)}(?:\.0+)?\s*(?:元|代金券|券)",
+                        raw_text,
+                    )
+                    for platform in platforms
+                )
+            if not corroborated:
+                continue
+            if platforms and face:
+                option["sku_id"] = f"platform:{platforms[0]}:{face}"
+            option.update({
+                "option_type": "voucher",
+                "people_counts": cls._people_counts(name),
+                "day_types": cls._day_types(
+                    f"{name} {option.get('applicable_time') or ''}"
+                ),
+                "meal_periods": cls._meal_periods(
+                    f"{name} {option.get('applicable_time') or ''}"
+                ),
+                "audience_types": cls._audience_types(
+                    f"{name} {option.get('applicable_time') or ''}"
+                ),
+                "price_pending": not bool(option.get("sale_price")),
+            })
+            output.append(option)
+        return output
+
     def _store_count_for_lists(self, list_ids: List[int]) -> int:
         ids = sorted({int(value) for value in list_ids})
         if not ids:
@@ -6187,6 +6285,12 @@ class V2Store(AppStore):
             except json.JSONDecodeError:
                 product["structured"] = {}
         options = self.extract_sale_options(product)
+        known_keys = {self.sku_key_for_option(option) for option in options}
+        for option in self._configuration_voucher_options(product):
+            key = self.sku_key_for_option(option)
+            if key not in known_keys:
+                options.append(option)
+                known_keys.add(key)
         with self._connect() as conn:
             rules = {row["sku_key"]: dict(row) for row in conn.execute(
                 "SELECT * FROM product_sku_store_rules WHERE item_id=?", (item_id,)
@@ -6200,6 +6304,11 @@ class V2Store(AppStore):
         output = []
         for option in options:
             key = self.sku_key_for_option(option)
+            legacy_option = dict(option)
+            legacy_option.pop("sku_id", None)
+            legacy_key = self.sku_key_for_option(legacy_option)
+            if key not in rules and (legacy_key in rules or legacy_key in bindings):
+                key = legacy_key
             rule = rules.get(key) or {}
             mode = rule.get("mode") if rule.get("mode") in {"inherit", "custom"} else "inherit"
             rule_status = str(rule.get("status") or "active").strip().lower()
@@ -6224,6 +6333,7 @@ class V2Store(AppStore):
                 "stock": str(option.get("stock") or ""),
                 "availability_explicit": bool(option.get("availability_explicit")),
                 "sellable": sellable,
+                "price_pending": bool(option.get("price_pending")),
                 "list_ids": own_ids, "effective_list_ids": effective_ids,
                 "own_store_count": self._store_count_for_lists(own_ids),
                 "effective_store_count": self._store_count_for_lists(effective_ids),
@@ -6304,7 +6414,7 @@ class V2Store(AppStore):
             return []
         matched = []
         for sku in skus:
-            option = by_key.get(sku["sku_key"], {})
+            option = by_key.get(sku["sku_key"]) or sku
             if requested_platforms and not any(
                 platform in str(option.get("name") or sku.get("sku_name") or "")
                 for platform in requested_platforms
