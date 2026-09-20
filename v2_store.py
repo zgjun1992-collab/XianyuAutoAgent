@@ -4238,7 +4238,11 @@ class V2Store(AppStore):
     def amount_inquiry_plan_reply(self, product: Dict, message: str) -> Optional[Dict]:
         """Plan an amount inquiry using one in-stock denomination and explicit stacking."""
         text = str(message or "").strip()
-        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*[?？。!！]?\s*", text)
+        match = re.fullmatch(
+            r"\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+            r"(?:(?:的)?(?:呢|嘛|么|呀|啊))?\s*[?？。!！]?\s*",
+            text,
+        )
         bare = bool(match)
         discount_total = False
         if not match:
@@ -8456,8 +8460,12 @@ class V2Store(AppStore):
             for value in re.split(r"[\r\n。；;]+", knowledge)
             if any(alias in value for alias in aliases)
         ]
+        availability_clause = next((clause for clause in relevant_clauses if re.search(
+            r"(?:部分|个别)?(?:菜品|餐品|单品)[^。；\n]{0,40}"
+            r"(?:时令|售罄|无货|缺货|不可抗|无法提供)", clause
+        )), "")
         negative = next((clause for clause in relevant_clauses if re.search(
-            r"不可|不能|不支持|不适用|除外|不参与|不抵扣", clause
+            r"不可(?!抗)|不能|不支持|不适用|除外|不参与|不抵扣", clause
         )), "")
         exclusion_segments = []
         for pattern in (
@@ -8481,6 +8489,11 @@ class V2Store(AppStore):
         if negative or excluded:
             evidence = negative or f"除{excluded}外全场通用"
             reply = f"不可以，当前代金券不可用于{subject}。商品规则：{evidence}。"
+        elif availability_clause and subject == "菜品":
+            reply = (
+                "当前资料没有说明代金券不能用于菜品；仅提示部分菜品可能因时令、售罄"
+                "或其他不可抗因素无法提供，具体以门店实际供应为准。"
+            )
         elif global_scope:
             exclusion_text = "、".join(dict.fromkeys(
                 value.strip(" ，,、") for value in exclusion_segments if value.strip(" ，,、")
