@@ -1169,6 +1169,78 @@ class V2Store(AppStore):
         }
 
     @classmethod
+    def _platform_product_options(cls, product: Dict) -> List[Dict]:
+        """Recover real sellable voucher options from the Goofish SKU payload."""
+        payload = str((product or {}).get("platform_summary") or "").strip()
+        if not payload:
+            return []
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        records = parsed.get("sku") if isinstance(parsed, dict) else None
+        if not isinstance(records, list):
+            return []
+        product_evidence = " ".join((
+            str((product or {}).get("title") or ""),
+            str(parsed.get("title") or ""), str(parsed.get("description") or ""),
+        ))
+        if not re.search(r"代金券|抵扣券|现金券|餐饮券", product_evidence):
+            return []
+
+        output = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            property_rows = record.get("propertyList") or []
+            name = next((
+                str(row.get("actualValueText") or row.get("valueText") or "").strip()
+                for row in property_rows if isinstance(row, dict)
+                and str(row.get("actualValueText") or row.get("valueText") or "").strip()
+            ), "")
+            if not name:
+                idle_pairs = str((record.get("features") or {}).get("idlePvPairs") or "")
+                name = idle_pairs.rsplit("#", 1)[-1].strip() if "#" in idle_pairs else idle_pairs.strip()
+            if not name or re.search(r"勿拍|不要拍|防下架|补差|运费|测试", name):
+                continue
+            face_match = re.search(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?(?=\s*(?:代金券|券|[xX×*（(]|$))",
+                name,
+            )
+            if not face_match:
+                continue
+            face = cls._format_number(face_match.group(1))
+            cents = record.get("priceInCent")
+            if cents in (None, ""):
+                cents = record.get("price")
+            try:
+                price = cls._format_number(Decimal(str(cents)) / Decimal("100"))
+            except (InvalidOperation, TypeError, ValueError):
+                price = ""
+            if not price:
+                continue
+            quantity_match = re.search(
+                rf"{re.escape(face)}\s*(?:元)?\s*[xX×*]\s*(\d+)\s*张?", name,
+            )
+            composition = cls._normalize_composition(
+                f"{face}x{quantity_match.group(1)}" if quantity_match else "", face,
+            )
+            stack_match = re.search(
+                r"(?:最多)?(?:可)?叠加\s*(\d+)\s*张", name,
+            )
+            max_stack = (
+                stack_match.group(1) if stack_match else
+                (quantity_match.group(1) if quantity_match else "")
+            )
+            output.append({
+                "name": name, "face_value": face, "sale_price": price,
+                "applicable_time": "", "composition": composition,
+                "max_stack": max_stack, "_platform_sku": True,
+                **cls._option_availability(record),
+            })
+        return output
+
+    @classmethod
     def _raw_product_options(cls, raw_text: str, title: str = "") -> List[Dict]:
         text = str(raw_text or "").replace("\\n", "\n")
         output = []
@@ -1300,6 +1372,11 @@ class V2Store(AppStore):
             option for option in (cls._normalize_product_option(record) for record in candidates)
             if option
         ]
+        # Manual knowledge remains authoritative when it already contains real
+        # prices. If it only lists denominations and rules, recover the missing
+        # sale facts from the marketplace's current SKU payload.
+        if not raw_options:
+            structured_options.extend(cls._platform_product_options(product))
         # For automatically synced products the real SKU payload is the price
         # authority; listing prose is only a supplement. A human-edited product
         # keeps the manually saved text as the highest authority.
@@ -1364,7 +1441,13 @@ class V2Store(AppStore):
         raw_stack_limits = cls._raw_sku_stack_limits(product.get("raw_text") or "")
         for option in output:
             face = cls._format_number(option.get("face_value") or "")
-            if face in raw_stack_limits:
+            named_platform_sku = any(
+                platform in str(option.get("name") or "")
+                for platform in ("抖音", "美团", "小程序")
+            )
+            if face in raw_stack_limits and not (
+                (option.get("_platform_sku") or named_platform_sku) and option.get("max_stack")
+            ):
                 option["max_stack"] = str(raw_stack_limits[face])
         valid = []
         for option in output:
@@ -1428,6 +1511,8 @@ class V2Store(AppStore):
                     base["max_stack"] = str(max(current_max, quantity))
                     continue
             collapsed.append(option)
+        for option in collapsed:
+            option.pop("_platform_sku", None)
         return collapsed
 
     @staticmethod
@@ -4669,11 +4754,23 @@ class V2Store(AppStore):
         # the same-denomination rule and produce an unrelated answer.
         platform_names = [name for name in ("抖音", "美团", "小程序") if name in text]
         if platform_names:
-            labels = "、".join(f"{name}券" for name in platform_names)
-            return (
-                f"当前仅能确认本商品单独使用，不能与{labels}或其他优惠券混用，"
-                "也无法保证能和其他优惠一起使用哦。"
+            # A platform plus a real denomination may identify this product's
+            # own SKU, not an external coupon-combination question.
+            requested_faces = {
+                self._format_number(value)
+                for value in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?", text)
+            }
+            current_platform_sku = len(platform_names) == 1 and bool(requested_faces) and any(
+                platform_names[0] in str(option.get("name") or "")
+                and self._format_number(option.get("face_value") or "") in requested_faces
+                for option in self.extract_product_options(product)
             )
+            if not current_platform_sku:
+                labels = "、".join(f"{name}券" for name in platform_names)
+                return (
+                    f"当前仅能确认本商品单独使用，不能与{labels}或其他优惠券混用，"
+                    "也无法保证能和其他优惠一起使用哦。"
+                )
 
         buyer_owned_external = bool(re.search(
             r"(?:我|手里|之前|已经|还有|另有|另外|店里送的|朋友给的)"
@@ -4739,14 +4836,35 @@ class V2Store(AppStore):
             if bare_value:
                 values = [bare_value.group(1)]
         options = self.extract_product_options(product)
-        selected = None
-        for value in values:
-            selected = next((
-                option for option in options
-                if self._format_number(option.get("face_value")) == self._format_number(value)
-            ), None)
-            if selected:
-                break
+        requested_platforms = [name for name in ("抖音", "美团", "小程序") if name in text]
+        requested_values = {self._format_number(value) for value in values}
+        candidates = []
+        for option in options:
+            face = self._format_number(option.get("face_value"))
+            if requested_values and face not in requested_values:
+                continue
+            if requested_platforms and not any(
+                platform in str(option.get("name") or "") for platform in requested_platforms
+            ):
+                continue
+            candidates.append(option)
+        if len(candidates) > 1 and requested_values and len({
+            self._format_number(option.get("face_value") or "") for option in candidates
+        }) == 1:
+            limited = []
+            for option in candidates:
+                try:
+                    limit = int(Decimal(str(option.get("max_stack") or "0")))
+                except (InvalidOperation, ValueError):
+                    limit = 0
+                if limit > 0:
+                    limited.append((str(option.get("name") or "当前规格"), limit))
+            if len(limited) > 1:
+                details = "；".join(
+                    f"{name}每次最多使用{limit}张" for name, limit in limited
+                )
+                return f"{details}。请确认需要哪一种规格。"
+        selected = candidates[0] if len(candidates) == 1 else None
         if not selected and len(options) == 1:
             selected = options[0]
         if not selected:
@@ -4787,7 +4905,22 @@ class V2Store(AppStore):
         )
         maximum = 0
         total_cap = Decimal("0")
-        if amount_cap and unit_value > 0:
+        selected_face = self._format_number(selected.get("face_value") or "")
+        selected_name = str(selected.get("name") or "")
+        same_face_variants = [
+            option for option in options
+            if self._format_number(option.get("face_value") or "") == selected_face
+        ]
+        platform_specific_variant = (
+            len(same_face_variants) > 1
+            and any(platform in selected_name for platform in ("抖音", "美团", "小程序"))
+        )
+        if platform_specific_variant:
+            try:
+                maximum = int(Decimal(str(selected.get("max_stack") or "0")))
+            except (InvalidOperation, ValueError):
+                maximum = 0
+        elif amount_cap and unit_value > 0:
             total_cap = Decimal(amount_cap.group(1))
             maximum = int(total_cap // unit_value)
         elif unit_count_cap:
@@ -4872,7 +5005,50 @@ class V2Store(AppStore):
         if not values:
             values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\s*张)", message)))
         different = len(values) >= 2 and len(set(values)) >= 2
-        sku_limits = self._sku_stack_limits(self.extract_product_options(product))
+        options = self.extract_product_options(product)
+        requested_platforms = [name for name in ("抖音", "美团", "小程序") if name in message]
+        if len(values) == 1:
+            denomination = self._format_number(values[0])
+            matching = [
+                option for option in options
+                if self._format_number(option.get("face_value") or "") == denomination
+                and (not requested_platforms or any(
+                    platform in str(option.get("name") or "")
+                    for platform in requested_platforms
+                ))
+            ]
+            limited = []
+            for option in matching:
+                try:
+                    maximum = int(Decimal(str(option.get("max_stack") or "0")))
+                except (InvalidOperation, ValueError):
+                    maximum = 0
+                if maximum > 0:
+                    limited.append((option, maximum))
+            if len(limited) > 1:
+                details = "；".join(
+                    f"{str(option.get('name') or '当前规格')}每次最多使用{maximum}张"
+                    for option, maximum in limited
+                )
+                return f"{details}。请确认需要哪一种规格。"
+            if len(limited) == 1:
+                selected, maximum = limited[0]
+                name = str(selected.get("name") or f"{denomination}元代金券")
+                quantity_match = re.search(r"([一二两三四五六七八九十\d]+)\s*张", message)
+                if quantity_match:
+                    chinese = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+                    quantity = (int(quantity_match.group(1)) if quantity_match.group(1).isdigit()
+                                else chinese.get(quantity_match.group(1), 0))
+                    if quantity > maximum:
+                        return f"{name}每次最多使用{maximum}张，超出的金额请在门店另行支付。"
+                    total = Decimal(denomination) * quantity
+                    return (
+                        f"可以，{quantity}张{name}合计可抵扣{self._format_number(total)}元；"
+                        f"每次最多使用{maximum}张。"
+                    )
+                return f"{name}可以叠加，每次最多使用{maximum}张；不同规格不能混用。"
+        sku_limits = self._sku_stack_limits(options)
         denies_mixed = bool(re.search(
             r"不同面额[^。；\n]{0,12}(?:不可|不能|不支持|禁止)[^。；\n]{0,8}(?:叠加|混用|一起)|"
             r"(?:不可|不能|不支持|禁止)[^。；\n]{0,8}不同面额",
@@ -5060,6 +5236,23 @@ class V2Store(AppStore):
         if denies_mixed:
             allows_mixed = False
         sku_limits = cls._sku_stack_limits(options)
+        limited_options = []
+        for option in options:
+            face = cls._format_number(option.get("face_value") or "")
+            match_limit = re.match(r"\d+", str(option.get("max_stack") or "").strip())
+            if face and match_limit and int(match_limit.group()) > 0:
+                limited_options.append((
+                    str(option.get("name") or f"{face}元代金券"),
+                    face,
+                    int(match_limit.group()),
+                ))
+        duplicate_faces = len({face for _, face, _ in limited_options}) < len(limited_options)
+        if duplicate_faces and len({count for _, _, count in limited_options}) > 1:
+            mode = "支持不同规格代金券叠加" if allows_mixed else "仅支持同一规格代金券叠加"
+            details = "；".join(
+                f"{name}最多使用{count}张" for name, _, count in limited_options
+            )
+            return f"{mode}。{details}。"
         if len(set(sku_limits.values())) > 1:
             mode = "支持不同面额代金券叠加" if allows_mixed else "仅支持同面额代金券叠加"
             details = "；".join(
@@ -6119,6 +6312,10 @@ class V2Store(AppStore):
             return exact
         slots = self._conditional_query_slots(message)
         requested_amount = self._requested_price_amount(message)
+        requested_platforms = [name for name in ("抖音", "美团", "小程序") if name in text]
+        if not requested_amount and requested_platforms:
+            platform_face = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?", text)
+            requested_amount = self._format_number(platform_face.group(1)) if platform_face else ""
         filters_present = bool(
             requested_amount or slots.get("people_counts") or slots.get("day_types")
             or slots.get("meal_periods") or slots.get("audience_types")
@@ -6128,6 +6325,11 @@ class V2Store(AppStore):
         matched = []
         for sku in skus:
             option = by_key.get(sku["sku_key"], {})
+            if requested_platforms and not any(
+                platform in str(option.get("name") or sku.get("sku_name") or "")
+                for platform in requested_platforms
+            ):
+                continue
             if not slots.get("audience_types") and (sku.get("audience_types") or []):
                 continue
             if requested_amount:
@@ -6314,12 +6516,20 @@ class V2Store(AppStore):
 
     @classmethod
     def _compact_sku_names(cls, skus: List[Dict]) -> str:
-        """Render voucher faces compactly without dropping non-voucher SKU names."""
+        """Keep meaningful SKU names; compact only truly generic voucher labels."""
         faces = [
             cls._format_number(sku.get("face_value") or "")
             for sku in skus
         ]
-        if skus and all(faces) and all((sku.get("option_type") or "voucher") == "voucher" for sku in skus):
+        generic_vouchers = bool(skus) and all(faces) and all(
+            (sku.get("option_type") or "voucher") == "voucher"
+            and bool(re.fullmatch(
+                rf"{re.escape(face)}(?:\.0+)?\s*(?:元)?\s*(?:代金券|优惠券|抵扣券|现金券|券)",
+                str(sku.get("sku_name") or "").strip(),
+            ))
+            for sku, face in zip(skus, faces)
+        )
+        if generic_vouchers:
             return "、".join(f"{face}元" for face in faces) + "代金券"
         return "、".join(str(sku.get("sku_name") or "当前规格") for sku in skus)
 
