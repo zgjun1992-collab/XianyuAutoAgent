@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.23",
+  "version": "0.11.24",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.23：支持“我426元”等口语消费金额自动计算购券方案，不再误判为买家出价。"
+      "releaseNotes": "0.11.24：修复局部菜品例外被扩大、100×2门店问法误判，并优化大额消费凑券方案。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
