@@ -4017,6 +4017,29 @@ class V2StoreTests(unittest.TestCase):
         matches = self.store.match_message_skus("10001", "美团200元", product)
         self.assertEqual(["美团200元代金券"], [row["sku_name"] for row in matches])
 
+    def test_textual_stack_rule_does_not_crash_quantity_sku_collapse(self):
+        product = {
+            "title": "100元代金券",
+            "structured": {"products": [
+                {
+                    "name": "100元代金券", "face_value": "100",
+                    "sale_price": "68", "max_stack": "同面额可叠加",
+                },
+                {
+                    "name": "100元代金券x2", "face_value": "100",
+                    "sale_price": "136", "composition": "100元券2张",
+                    "max_stack": "同面额可叠加",
+                },
+            ]},
+        }
+
+        options = self.store.extract_product_options(product)
+
+        self.assertEqual(1, len(options))
+        self.assertEqual("2", options[0]["max_stack"])
+        self.assertEqual("4", self.store._normalize_stack_limit("最多叠加4张"))
+        self.assertEqual("", self.store._normalize_stack_limit("同面额可叠加"))
+
     def test_elliptical_amount_followup_uses_consumption_plan(self):
         self.store.save_v2_product(
             "10001", "餐饮代金券",
