@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.21",
+  "version": "0.11.22",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.21：退款咨询不再使用未核验的待付款卡片或继承旧未付款状态。"
+      "releaseNotes": "0.11.22：修复菜品适用范围误判，并支持“200的呢”等金额追问自动计算购券方案。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",

@@ -3871,6 +3871,28 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("不可用于锅底和酒水", result["reply"])
         self.assertNotIn("适用门店资料", result["reply"])
 
+    def test_unavailable_dishes_are_not_misread_as_coupon_exclusion(self):
+        self.store.save_v2_product(
+            "10001", "餐饮代金券",
+            "100元代金券：售价65元。部分菜品因时令、售罄或其他不可抗因素无法提供时，"
+            "可以联系商家协商处理。",
+        )
+        result = self.store.resolve_deterministic("10001", "菜品都能用是吧")
+        self.assertEqual("usage_scope", result["kind"])
+        self.assertNotIn("不可用于菜品", result["reply"])
+        self.assertIn("部分菜品可能因时令、售罄", result["reply"])
+
+    def test_elliptical_amount_followup_uses_consumption_plan(self):
+        self.store.save_v2_product(
+            "10001", "餐饮代金券",
+            "100元代金券：售价65元，发100元券1张。支持同面额代金券叠加，不限制数量。",
+        )
+        result = self.store.resolve_deterministic("10001", "200的呢")
+        self.assertEqual("redemption_plan", result["kind"])
+        self.assertIn("购买2张100元代金券", result["reply"])
+        self.assertIn("共支付130元", result["reply"])
+        self.assertNotIn("没有200元代金券", result["reply"])
+
     def test_global_scope_allows_only_items_outside_explicit_exclusions(self):
         self.store.save_v2_product(
             "10001", "火锅代金券",
