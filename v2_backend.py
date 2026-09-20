@@ -294,6 +294,43 @@ class BackendState:
         walk(value)
         return list(dict.fromkeys(found))
 
+    @staticmethod
+    def _collect_sku_records(value):
+        """Find priced SKU arrays even when Goofish moves them below a nested key."""
+        found = []
+        seen = set()
+
+        def looks_like_sku(row):
+            if not isinstance(row, dict):
+                return False
+            has_price = any(
+                row.get(key) not in (None, "")
+                for key in ("priceInCent", "price", "soldPrice")
+            )
+            has_identity = bool(
+                row.get("propertyList") or row.get("skuId") or row.get("id")
+                or row.get("name") or row.get("title") or row.get("features")
+            )
+            return has_price and has_identity
+
+        def walk(node, parent_key=""):
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if isinstance(child, list) and "sku" in str(key).lower():
+                        for row in child:
+                            if looks_like_sku(row):
+                                fingerprint = json.dumps(row, ensure_ascii=False, sort_keys=True)
+                                if fingerprint not in seen:
+                                    seen.add(fingerprint)
+                                    found.append(row)
+                    walk(child, str(key))
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child, parent_key)
+
+        walk(value)
+        return found
+
     def sync_products(self):
         if not self.runtime["cookie"]:
             raise ValueError("请先在内置闲鱼页面登录")
@@ -329,12 +366,15 @@ class BackendState:
                 item_do = ((detail_result or {}).get("data") or {}).get("itemDO") or {}
                 title = str(item_do.get("title") or data.get("title") or detail.get("title") or "").strip()
                 price = item_do.get("soldPrice") or (data.get("priceInfo") or {}).get("price") or detail.get("soldPrice") or ""
+                sku_records = item_do.get("skuList") or self._collect_sku_records(
+                    (detail_result or {}).get("data") or detail_result or {}
+                )
                 platform = {
                     "title": title,
                     "description": item_do.get("desc") or "",
                     "price": str(price),
                     "stock": item_do.get("quantity"),
-                    "sku": item_do.get("skuList") or [],
+                    "sku": sku_records,
                 }
                 platform_summary = json.dumps(platform, ensure_ascii=False)
                 images = self._collect_image_urls(item_do)
@@ -842,6 +882,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(self.state.store.set_sku_store_rule(
                     item_id, body.get("sku_key", ""), body.get("sku_name", ""),
                     body.get("mode", "inherit"), body.get("list_ids", []),
+                    body.get("sale_price", ""),
                 ))
             if path == "/store-lists/import":
                 return self._ok(self.state.store.import_store_list(

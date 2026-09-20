@@ -34,7 +34,7 @@ const syncReport = ref(null)
 const aftersaleProductId = ref('')
 const storeListSelection = ref('')
 const selectedStoreSkuKey = ref('')
-const skuStoreDraft = reactive({ mode: 'inherit', list_ids: [] })
+const skuStoreDraft = reactive({ mode: 'inherit', list_ids: [], sale_price: '' })
 let policiesLoaded = false
 let refreshTimer = null
 let toastTimer = null
@@ -225,6 +225,7 @@ function selectStoreSku(sku) {
   selectedStoreSkuKey.value = sku?.sku_key || ''
   skuStoreDraft.mode = sku?.mode || 'inherit'
   skuStoreDraft.list_ids = [...(sku?.list_ids || [])]
+  skuStoreDraft.sale_price = sku?.sale_price_override || ''
 }
 
 function toggleSkuStoreList(id) {
@@ -239,7 +240,8 @@ async function saveSkuStoreRule() {
   const updated = await call('POST', `/products/${encodeURIComponent(productDraft.item_id)}/sku-stores`, {
     sku_key: sku.sku_key, sku_name: sku.sku_name,
     mode: skuStoreDraft.mode,
-    list_ids: skuStoreDraft.mode === 'custom' ? skuStoreDraft.list_ids : []
+    list_ids: skuStoreDraft.mode === 'custom' ? skuStoreDraft.list_ids : [],
+    sale_price: String(skuStoreDraft.sale_price || '').trim()
   })
   const index = productDraft.skus.findIndex((item) => item.sku_key === updated.sku_key)
   if (index >= 0) productDraft.skus[index] = updated
@@ -983,6 +985,7 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
                 <div class="sku-store-editor">
+                  <label>当前售价（元）<input v-model="skuStoreDraft.sale_price" inputmode="decimal" placeholder="接口未同步时可人工补充，例如 119.8" /></label>
                   <label class="radio-line"><input v-model="skuStoreDraft.mode" type="radio" value="inherit" />继承商品默认门店 <small>默认选项，商品门店更新后自动同步</small></label>
                   <label class="radio-line"><input v-model="skuStoreDraft.mode" type="radio" value="custom" />使用该规格专属门店 <small>只影响当前选中的规格</small></label>
                   <div v-if="skuStoreDraft.mode === 'custom'" class="sku-list-checks">
