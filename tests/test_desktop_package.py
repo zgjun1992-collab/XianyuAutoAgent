@@ -101,6 +101,15 @@ class DesktopPackageTests(unittest.TestCase):
         self.assertNotIn("order_notice_enabled", source)
         self.assertNotIn("拍下未付款", source)
 
+    def test_ai_draft_ui_never_displays_effective_summary_as_a_new_draft(self):
+        source = (DESKTOP / "src" / "App.vue").read_text(encoding="utf-8")
+        self.assertIn("ai_draft_summary: product.ai_draft_summary || ''", source)
+        self.assertNotIn(
+            "ai_draft_summary: product.ai_draft_summary || product.ai_summary",
+            source,
+        )
+        self.assertIn("尚未生成AI草稿", source)
+
     def test_goofish_verification_is_visible_and_retryable_in_the_frontend(self):
         source = (DESKTOP / "src" / "App.vue").read_text(encoding="utf-8")
         main = (DESKTOP / "electron" / "main.cjs").read_text(encoding="utf-8")

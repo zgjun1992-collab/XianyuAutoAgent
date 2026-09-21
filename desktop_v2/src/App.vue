@@ -175,7 +175,10 @@ function selectProduct(product) {
     raw_text: product.raw_text || '',
     enabled: Boolean(product.enabled),
     ai_summary: product.ai_summary || '',
-    ai_draft_summary: product.ai_draft_summary || product.ai_summary || '',
+    // A missing draft must stay visibly empty. Falling back to ai_summary makes
+    // stale, already-effective knowledge look like a newly generated draft and
+    // allows the operator to accidentally adopt old page copy again.
+    ai_draft_summary: product.ai_draft_summary || '',
     structured: product.structured || {},
     ai_draft_structured: product.ai_draft_structured || {},
     source_update: product.source_update || {},
@@ -968,7 +971,7 @@ onBeforeUnmount(() => {
               <pre>{{ productDraft.platform_summary || '当前没有同步到闲鱼页面资料。' }}</pre>
             </div>
             <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea><div class="button-row end"><button class="primary" @click="saveProduct">保存当前生效知识</button></div></article>
-            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>真实在售SKU的名称、售价和发券内容优先；每个SKU单独归档时间、门店、叠加和人群规则。草稿确认采纳前不会影响客服回复</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_draft_summary" v-model="productDraft.ai_draft_summary" rows="16" placeholder="AI会按真实SKU分别整理品牌、名称、价格、日期/餐段、门店、叠加、人群、核销、退款及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_draft_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="(productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in (productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)" :key="field">{{ field }}</span></div></article>
+            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>真实在售SKU的名称、售价和发券内容优先；每个SKU单独归档时间、门店、叠加和人群规则。草稿确认采纳前不会影响客服回复</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_draft_summary" v-model="productDraft.ai_draft_summary" rows="16" placeholder="AI会按真实SKU分别整理品牌、名称、价格、日期/餐段、门店、叠加、人群、核销、退款及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">尚未生成AI草稿，请点击上方按钮重新归纳。</div><div v-if="productDraft.ai_draft_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="(productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in (productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)" :key="field">{{ field }}</span></div></article>
           </div>
 
           <div v-else-if="productTab === 'firstReply'" class="product-tab-body">
