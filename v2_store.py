@@ -835,14 +835,15 @@ class V2Store(AppStore):
         # any clause omitted by the model impossible to recover.
         source_description = self._platform_description(current)
         normalized_product.update({
-            "raw_text": "\n".join(
-                value for value in (summary, source_description) if value
-            ),
+            # Keep source prose and AI output in separate fields. Re-feeding an
+            # AI summary into raw_text caused later summaries to summarize a
+            # summary and made provenance/conflict checks impossible.
+            "raw_text": source_description,
             "structured": structured or {},
         })
         summary = self.build_knowledge_summary(normalized_product) or summary
         structured_text = json.dumps(structured or {}, ensure_ascii=False)
-        effective = current["raw_text"] if current.get("manual_edited") else summary
+        effective = current["raw_text"] if current.get("manual_edited") else source_description
         sync_status = "source_updated" if current.get("manual_edited") else "ready"
         with self._connect() as conn:
             conn.execute(
@@ -1473,12 +1474,15 @@ class V2Store(AppStore):
         text = str(raw_text or "").replace("\\n", "\n")
         output = []
         voucher_context = bool(re.search(
-            r"\d+(?:\.\d+)?\s*元?\s*(?:代金券|抵扣券|现金券|券)",
+            r"\d+(?:\.\d+)?\s*元?\s*(?:代金券|抵扣券|现金券|券)|"
+            r"(?:美团|抖音|小程序)\s*\d+(?:\.\d+)?",
             "\n".join((str(title or ""), text)),
         ))
         pattern = re.compile(
             r"(?:^|[\n；;])[ \t]*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d{1,2}、[ \t]*|\d{1,2}\.[ \t]+)?[ \t]*"
+            r"(?P<platform>美团|抖音|小程序)?[ \t]*"
             r"(?P<face>\d+(?:\.\d+)?)[ \t]*元?[ \t]*(?:代金券|券)?"
+            r"(?P<label_tail>[ \t]*[（(][^（）()\n]{1,30}[）)])?"
             r"[ \t]*[：:\"“”']+[ \t]*(?:售价|价格)?[ \t]*[¥￥]?[ \t]*(?P<price>\d+(?:\.\d+)?)[ \t]*元?"
             r"(?P<tail>[^\n；;]{0,100})",
             re.M,
@@ -1486,11 +1490,16 @@ class V2Store(AppStore):
         for match in pattern.finditer(text):
             matched_text = match.group(0)
             if not voucher_context and not re.search(
-                r"代金券|抵扣券|现金券|\d+(?:\.\d+)?\s*元券", matched_text
+                r"代金券|抵扣券|现金券|\d+(?:\.\d+)?\s*元券|"
+                r"(?:美团|抖音|小程序)\s*\d+(?:\.\d+)?", matched_text
             ):
                 continue
             face = cls._format_number(match.group("face"))
-            tail = match.group("tail") or ""
+            raw_label_tail = (match.group("label_tail") or "").strip()
+            label_tail = raw_label_tail if re.search(
+                r"(?:叠加|使用|限用|最多)[^）)]*\d+\s*张", raw_label_tail,
+            ) else ""
+            tail = (raw_label_tail + " " + (match.group("tail") or "")).strip()
             time_match = re.search(
                 r"(工作日|节假日|周末|全周(?:通用)?|下午茶|午餐|晚餐|午市|晚市)", tail
             )
@@ -1511,7 +1520,7 @@ class V2Store(AppStore):
                 tail,
             )
             output.append({
-                "name": f"{face}元代金券",
+                "name": f"{match.group('platform') or ''}{face}元代金券{label_tail}",
                 "face_value": face,
                 "sale_price": cls._format_number(match.group("price")),
                 "applicable_time": time_match.group(1) if time_match else "",
@@ -1795,6 +1804,23 @@ class V2Store(AppStore):
         tens = re.fullmatch(r"([一二两三四五六七八九])?十([一二两三四五六七八九])?", text)
         if tens:
             return (digits.get(tens.group(1), 1) * 10) + digits.get(tens.group(2), 0)
+        # Amount questions are often written as “两百怎么拍” or “一千怎么凑”.
+        # People-count callers already cap this shared parser at 20.
+        units = {"十": 10, "百": 100, "千": 1000}
+        if re.fullmatch(r"[零一二两三四五六七八九十百千]+", text):
+            total = 0
+            current = 0
+            for char in text:
+                if char == "零":
+                    continue
+                if char in digits:
+                    current = digits[char]
+                    continue
+                unit = units[char]
+                total += (current or 1) * unit
+                current = 0
+            total += current
+            return total or None
         return None
 
     @staticmethod
@@ -1976,14 +2002,40 @@ class V2Store(AppStore):
         if combined:
             result["adult"] = cls._chinese_count(combined.group(1)) or 0
             result["child"] = cls._chinese_count(combined.group(2)) or 0
+        first_identity = re.search(
+            r"成人|大人|儿童|小孩|孩子|小朋友|宝宝|娃|学生|老人|老年人|长者|女士|女生|女性|女宾",
+            text,
+        )
+        first_count = re.search(number, text)
+        identity_first = bool(
+            first_identity and first_count and first_identity.start() < first_count.start()
+        )
         patterns = {
             "adult": rf"({number})\s*(?:个|名|位)?(?:成人|大人|大(?!学))",
-            "child": rf"({number})\s*(?:个|名|位)?(?:儿童|小孩|小朋友|宝宝|娃|小(?!时|午))",
+            "child": rf"({number})\s*(?:个|名|位)?(?:儿童|小孩|孩子|小朋友|宝宝|娃|小(?!时|午))",
             "student": rf"({number})\s*(?:个|名|位)?学生",
             "senior": rf"({number})\s*(?:个|名|位)?(?:老人|老年人|长者|老)",
             "female": rf"({number})\s*(?:个|名|位)?(?:女士|女生|女性|女宾)",
         }
-        for kind, pattern in patterns.items():
+        if not identity_first:
+            for kind, pattern in patterns.items():
+                match = re.search(pattern, text)
+                if match:
+                    count = cls._chinese_count(match.group(1))
+                    if count:
+                        result[kind] = count
+        # Identity-first colloquial forms: “成人2个老人1个孩子1个” and
+        # “成人x2老人×1儿童x1”.
+        reverse_patterns = {
+            "adult": rf"(?:成人|大人|大(?!学))\s*(?:[xX×*]\s*)?({number})\s*(?:个|名|位)?",
+            "child": rf"(?:儿童|小孩|孩子|小朋友|宝宝|娃)\s*(?:[xX×*]\s*)?({number})\s*(?:个|名|位)?",
+            "student": rf"学生\s*(?:[xX×*]\s*)?({number})\s*(?:个|名|位)?",
+            "senior": rf"(?:老人|老年人|长者)\s*(?:[xX×*]\s*)?({number})\s*(?:个|名|位)?",
+            "female": rf"(?:女士|女生|女性|女宾)\s*(?:[xX×*]\s*)?({number})\s*(?:个|名|位)?",
+        }
+        for kind, pattern in reverse_patterns.items():
+            if kind in result and not identity_first:
+                continue
             match = re.search(pattern, text)
             if match:
                 count = cls._chinese_count(match.group(1))
@@ -1998,7 +2050,7 @@ class V2Store(AppStore):
     def _audience_types(value: object) -> List[str]:
         text = str(value or "")
         result = []
-        if re.search(r"儿童|小孩|小朋友|宝宝|娃|儿童票|儿童餐|\d+\s*小(?!时|午)", text):
+        if re.search(r"儿童|小孩|孩子|小朋友|宝宝|娃|儿童票|儿童餐|\d+\s*小(?!时|午)", text):
             result.append("child")
         if re.search(r"学生|学生票", text):
             result.append("student")
@@ -2074,7 +2126,7 @@ class V2Store(AppStore):
             result.append("breakfast")
         if re.search(r"午餐|午市|中午|午间|午饭|中餐", text):
             result.append("lunch")
-        if re.search(r"今晚|晚餐|晚市|晚上|夜间|夜宵|晚饭", text):
+        if re.search(r"今晚|明晚|晚餐|晚市|晚上|夜间|夜宵|晚饭", text):
             result.append("dinner")
         if re.search(r"下午茶|茶歇|午后茶", text):
             result.append("afternoon_tea")
@@ -2192,7 +2244,7 @@ class V2Store(AppStore):
         for line in ([] if has_structured_package else re.split(r"[\r\n；;]+", raw_text)):
             if not re.search(
                 r"套餐|人餐|自助|单人|双人|[一二两三四五六七八九十\d]+人|"
-                r"儿童|小孩|学生|老人|老年|长者|女士|女生|成人票|"
+                r"儿童|小孩|学生|老人|老年|长者|女士|女生|成人|大人|"
                 r"菜品|餐品|烤鱼|单鱼|整条|单条|\d+(?:\.\d+)?\s*斤",
                 line,
             ):
@@ -2800,6 +2852,27 @@ class V2Store(AppStore):
         }
         party_counts = self._people_counts(text)
         party_count = party_counts[0] if len(party_counts) == 1 else None
+
+        # “老人和小孩怎么收费” asks for the fare table, not for an assumed
+        # one-senior/one-child order. Quote every requested real SKU and wait
+        # for counts before calculating a total.
+        if not counts and explicit_types and price_intent:
+            quoted = []
+            for option in options:
+                audiences = set(option.get("audience_types") or [])
+                if audiences and audiences.intersection(explicit_types):
+                    quoted.append(self._format_conditional_option(option, slots))
+            if quoted:
+                return {
+                    "reply": "；".join(dict.fromkeys(quoted)) + "。如需计算合计，请告诉我各有几位。",
+                    "source": "自助餐当前在售身份票SKU",
+                    "decision": "allow", "kind": "audience_price",
+                    "query_context_update": {"price_filters": {
+                        **{key: slots.get(key) for key in ("day_type", "meal_period", "date_label") if slots.get(key)},
+                        "intent": "price", "awaiting": "audience_mix",
+                        "updated_at": datetime.now(CHINA_TZ).isoformat(timespec="seconds"),
+                    }},
+                }
 
         def make_audience_context(next_slot: str = "") -> Dict:
             return {"price_filters": {
@@ -3900,18 +3973,42 @@ class V2Store(AppStore):
 
     def voucher_value_confirmation_reply(self, product: Dict, message: str) -> str:
         """Answer compact paid-price/face-value confirmations from real SKUs."""
+        text = str(message or "")
+        paid_face = None
         match = re.search(
             r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
             r"(?:(?:拍下|下单|购买)(?:后)?(?:就|可|可以)?\s*)?(?:直接\s*)?"
             r"(?:可?抵(?:用|扣)?|代)\s*"
             r"(\d+(?:\.\d+)?)\s*(?:元|块)?",
-            str(message or ""),
+            text,
         )
-        if not match:
+        if match:
+            paid_face = (match.group(1), match.group(2))
+        if not paid_face:
+            # Paid price first: 108是200的券吗 / 108买200 / 108→200 / 108能抵200.
+            relation = re.search(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*"
+                r"(?:是|可以买|可买|买|购|得|发|换|/|→|->|能抵|可抵|抵)\s*"
+                r"(\d+(?:\.\d+)?)\s*(?:元|块)?(?:的)?(?:代金券|优惠券|券)?",
+                text,
+            )
+            if relation:
+                paid_face = (relation.group(1), relation.group(2))
+        if not paid_face:
+            # Face value first: 200的券是108 / 200卖108 / 300券拍下来205.
+            reverse = re.search(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?(?:的)?(?:代金券|优惠券|券)?"
+                r"[^\d。！？]{0,14}(?:是|卖|售价|价格|拍下来(?:是)?|下单(?:是)?)\s*"
+                r"(\d+(?:\.\d+)?)\s*(?:元|块)?",
+                text,
+            )
+            if reverse:
+                paid_face = (reverse.group(2), reverse.group(1))
+        if not paid_face:
             lookup = re.search(
                 r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*(?:的券)?\s*"
                 r"(?:是多少抵|能抵多少|抵多少|代多少)",
-                str(message or ""),
+                text,
             )
             if not lookup:
                 return ""
@@ -3947,8 +4044,8 @@ class V2Store(AppStore):
             }, key=Decimal)
             suffix = f"当前已确认面额为{'、'.join(value + '元' for value in faces)}。" if faces else ""
             return day_prefix + f"当前商品没有{requested}元这一已确认的代金券规格。{suffix}"
-        paid = self._format_number(match.group(1))
-        face = self._format_number(match.group(2))
+        paid = self._format_number(paid_face[0])
+        face = self._format_number(paid_face[1])
         options = self.extract_product_options(product)
         day_prefix = ""
         if self._has_explicit_day_options(options):
@@ -3963,11 +4060,7 @@ class V2Store(AppStore):
             and self._format_number(option.get("face_value")) == face
         ), None)
         if exact:
-            contents = self._purchase_contents_label(exact)
-            return day_prefix + (
-                f"是的，售价{paid}元，购买后发放{contents}，"
-                f"共可抵扣{face}元。"
-            )
+            return day_prefix + f"是的，{self._atomic_voucher_option_text(exact)}。"
 
         # A listed bundle may be represented in the active manual facts as one
         # atomic coupon plus an explicit stack cap (for example 54元×2 ->
@@ -3988,8 +4081,9 @@ class V2Store(AppStore):
             if unit_paid * quantity != asked_paid:
                 continue
             contents = self._purchase_contents_label(option, quantity)
+            option_name = str(option.get("name") or f"{self._format_number(unit_face)}元代金券")
             return day_prefix + (
-                f"是的，售价{paid}元，购买后发放{contents}，"
+                f"是的，{option_name}购买{quantity}张共支付{paid}元，购买后发放{contents}，"
                 f"共可抵扣{face}元。"
             )
 
@@ -4001,7 +4095,7 @@ class V2Store(AppStore):
             actual_price = self._format_number(same_face.get("sale_price"))
             contents = self._purchase_contents_label(same_face)
             return day_prefix + (
-                f"不是，{face}元代金券当前售价{actual_price}元，"
+                f"不是，{str(same_face.get('name') or face + '元代金券')}当前售价{actual_price}元，"
                 f"购买后发放{contents}。"
             )
 
@@ -4765,6 +4859,8 @@ class V2Store(AppStore):
                 str(product.get("raw_text") or ""),
                 str(product.get("ai_summary") or ""),
             ))
+            if cls._supports_unlimited_stacking(knowledge):
+                return 10000
             limit = re.search(
                 r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张",
                 knowledge,
@@ -4867,7 +4963,8 @@ class V2Store(AppStore):
             r"(?:不同面额|跨面额|混合)[^。；\n]{0,6}叠加",
             knowledge,
         ))
-        same_face_stacking = bool(re.search(r"(?:支持|允许|可|仅)[^。；\n]{0,12}同面额[^。；\n]{0,12}叠加", knowledge))
+        unlimited_stacking = self._supports_unlimited_stacking(knowledge)
+        same_face_stacking = unlimited_stacking or bool(re.search(r"(?:支持|允许|可|仅)[^。；\n]{0,12}同面额[^。；\n]{0,12}叠加", knowledge))
         forbidden = bool(re.search(
             r"不可叠加|不能叠加|不支持叠加|不得叠加", knowledge
         )) and not mixed_face_forbidden and not same_face_stacking
@@ -5284,7 +5381,9 @@ class V2Store(AppStore):
         if not re.search(
             r"一次(?:可以|能)?用(?:几|多少)张|(?:可以|能)用(?:几|多少)张|"
             r"(?:每次|一桌)?(?:最多)(?:可以|能)?用(?:几|多少)张|"
-            r"每次用(?:几|多少)张|一桌用(?:几|多少)张",
+            r"每次用(?:几|多少)张|一桌用(?:几|多少)张|"
+            r"一次(?:几|多少)张|最多(?:叠加|叠|用)?(?:几|多少)张|"
+            r"(?:限|限制)(?:用)?(?:几|多少)张",
             text,
         ):
             return ""
@@ -5455,7 +5554,10 @@ class V2Store(AppStore):
     def stacking_reply(self, product: Dict, message: str) -> str:
         if not re.search(
             r"一起用|同时用|叠加|混用|合并用|一次(?:可以|能)?用|"
-            r"可以用几张|能用几张|最多(?:可以|能)?用(?:几|多少)张",
+            r"同时核销|可以用几张|能用几张|最多(?:可以|能)?用(?:几|多少)张|"
+            r"一次(?:几|多少)张|最多(?:叠加|叠|用)?(?:几|多少)张|"
+            r"(?:限|限制)(?:用)?(?:几|多少)张|"
+            r"(?:可以|能)用[一二两三四五六七八九十\d]+张",
             message,
         ):
             return ""
@@ -5465,6 +5567,12 @@ class V2Store(AppStore):
         if quantity_reply:
             return quantity_reply
         knowledge = str(product.get("raw_text") or "")
+        facts = (product.get("structured") or {}).get("facts") or {}
+        stacking_fact = self._first_fact(
+            facts,
+            ("叠加规则", "代金券叠加", "使用张数", "最多使用", "stacking", "stack_rule"),
+        )
+        stack_evidence = f"{knowledge}\n{stacking_fact}"
         values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*元", message)))
         if not values:
             values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\s*张)", message)))
@@ -5522,6 +5630,7 @@ class V2Store(AppStore):
             r"(?:支持|可以|可)[^。；\n]{0,10}不同面额[^。；\n]{0,8}叠加|不同面额[^。；\n]{0,10}(?:可以|可|支持)[^。；\n]{0,8}叠加|混合叠加",
             knowledge,
         ))
+        unlimited_stack = self._supports_unlimited_stacking(stack_evidence)
         max_match = re.search(r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张", knowledge)
         max_text = f"，每次最多使用{max_match.group(1)}张" if max_match else ""
         if different and not allows_mixed:
@@ -5532,6 +5641,8 @@ class V2Store(AppStore):
             detail = "；" + "；".join(mentioned_limits) if mentioned_limits else max_text
             return f"{values[0]}元和{values[1]}元属于不同面额，不能一起使用；当前仅支持同面额代金券叠加{detail}。"
         if allows_mixed:
+            if unlimited_stack and not max_match:
+                return "可以，同面额及不同面额代金券均可叠加使用，不限制使用张数。"
             return f"支持不同面额代金券一起叠加使用{max_text}。"
         denomination = values[0] if values else ""
         if not denomination and len(set(sku_limits.values())) > 1:
@@ -5544,19 +5655,24 @@ class V2Store(AppStore):
         if maximum or max_match:
             maximum = maximum or int(max_match.group(1))
             quantity_match = re.search(r"([一二两三四五六七八九十\d]+)\s*张", message)
-            if denomination and quantity_match:
+            if quantity_match:
                 chinese = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
                            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
                 quantity = (int(quantity_match.group(1)) if quantity_match.group(1).isdigit()
                             else chinese.get(quantity_match.group(1), 0))
                 if quantity > maximum:
                     return f"同面额代金券每次最多使用{maximum}张，超出的金额请在门店另行支付。"
-                total = Decimal(denomination) * quantity
-                return (
-                    f"可以，{quantity}张{self._format_number(denomination)}元代金券"
-                    f"合计可抵扣{self._format_number(total)}元；每次最多使用{maximum}张。"
-                )
+                if denomination:
+                    total = Decimal(denomination) * quantity
+                    return (
+                        f"可以，{quantity}张{self._format_number(denomination)}元代金券"
+                        f"合计可抵扣{self._format_number(total)}元；每次最多使用{maximum}张。"
+                    )
+                return f"可以，每次最多使用{maximum}张同一规格代金券。"
             return f"{denomination + '元代金券' if denomination else '同面额代金券'}可以叠加，每次最多使用{maximum}张；不同面额不能混用。"
+        if unlimited_stack:
+            target = f"{self._format_number(denomination)}元代金券" if denomination else "同面额代金券"
+            return f"可以，{target}支持叠加使用，不限制使用张数；不同面额不能混用。"
         return "当前商品资料暂未明确说明每次可以使用几张，暂时无法准确确认叠加数量。"
 
     @classmethod
@@ -5671,6 +5787,34 @@ class V2Store(AppStore):
                 limits[face] = max(limits.get(face, 0), count)
         return limits
 
+    @staticmethod
+    def _supports_unlimited_stacking(text: str) -> bool:
+        """Recognize explicit unlimited or positive no-number stack rules."""
+        evidence = str(text or "")
+        clauses = [part.strip() for part in re.split(r"[。；;\n]+", evidence) if part.strip()]
+        unlimited = re.compile(
+            r"无限叠加|不限(?:制)?(?:使用|叠加)?(?:数量|张数)|"
+            r"不限制(?:使用|叠加)?(?:数量|张数)|(?:使用|叠加)(?:数量|张数)不限(?:制)?"
+        )
+        bare_positive = re.compile(
+            r"(?:支持|允许|可以|可|仅支持)[^。；\n]{0,12}(?:同面额)?[^。；\n]{0,8}叠加(?:使用)?"
+            r"(?!\s*\d+\s*(?:张|个))|同面额[^。；\n]{0,8}(?:可以|可|支持)叠加(?:使用)?"
+            r"(?!\s*\d+\s*(?:张|个))"
+        )
+        for clause in clauses:
+            if re.search(
+                r"不可(?:无限)?叠加|不能(?:无限)?叠加|不支持(?:无限)?叠加|"
+                r"禁止(?:无限)?叠加|并非无限|不是无限",
+                clause,
+            ):
+                continue
+            # “可叠加2个单品优惠” is a benefit rule, not coupon quantity.
+            if re.search(r"叠加\s*\d+\s*个(?:单品|店内|其他)?优惠", clause):
+                continue
+            if unlimited.search(clause) or bare_positive.search(clause):
+                return True
+        return False
+
     @classmethod
     def _stack_rule(cls, facts: Dict, raw_text: str, options: List[Dict]) -> str:
         explicit = cls._first_fact(
@@ -5730,9 +5874,11 @@ class V2Store(AppStore):
                 return f"支持同面额或不同面额代金券叠加，每次最多使用{count}张。"
             return f"仅支持同面额代金券叠加，每次最多使用{count}张。"
         if allows_mixed:
-            if re.search(r"无限叠加|不限(?:制)?(?:使用)?(?:数量|张数)|不限制(?:使用)?(?:数量|张数)", combined):
+            if cls._supports_unlimited_stacking(combined):
                 return "支持同面额及不同面额代金券互相叠加，不限制使用张数。"
             return "支持同面额及不同面额代金券互相叠加。"
+        if cls._supports_unlimited_stacking(combined):
+            return "仅支持同面额代金券叠加，不限制使用张数。"
         # Never inherit an AI-expanded mixed-denomination claim unless the
         # authoritative user/page text says so explicitly.
         return "仅支持同面额代金券叠加。" if options else ""
@@ -5865,7 +6011,18 @@ class V2Store(AppStore):
         if rule_parts:
             sections.append("【使用规则】\n" + "\n".join(rule_parts))
         sections.append("【发券方式】\n" + self.coupon_usage_instructions(product).rstrip("。；; ") + "。")
-        sections.append("【提醒】\n请当天购买、当天使用，过期不退不补。")
+        reminder_source = "\n".join((
+            raw_text,
+            str(product.get("custom_policy_summary") or product.get("custom_policy_raw") or ""),
+            str(product.get("ai_summary") or ""),
+        ))
+        reminders = []
+        if re.search(r"当天(?:购买|下单).{0,12}当天(?:使用|核销)|当天使用", reminder_source):
+            reminders.append("请按商品规则在购买当天使用")
+        if re.search(r"过期.{0,8}(?:不退|不退款|不补|不补发)", reminder_source):
+            reminders.append("过期后的处理按当前商品退款政策执行")
+        if reminders:
+            sections.append("【提醒】\n" + "；".join(reminders) + "。")
         return "\n".join(sections)
 
     def refresh_first_reply(self, item_id: str, force: bool = False) -> Dict:
@@ -6759,6 +6916,18 @@ class V2Store(AppStore):
                 known_keys.add(key)
         for option in self._configuration_voucher_options(product):
             key = self.sku_key_for_option(option)
+            same = next((
+                existing for existing in options
+                if normalize_text(existing.get("name") or "").lower()
+                == normalize_text(option.get("name") or "").lower()
+                and str(existing.get("sale_price") or "")
+                == str(option.get("sale_price") or "")
+            ), None)
+            if same:
+                for field in ("face_value", "composition", "max_stack"):
+                    if not same.get(field) and option.get(field):
+                        same[field] = option[field]
+                continue
             if key not in known_keys:
                 options.append(option)
                 known_keys.add(key)
@@ -7586,7 +7755,21 @@ class V2Store(AppStore):
         compact = re.sub(r"[\s，,。.!！?？；;：:~～]+", "", str(message or ""))
         if re.search(r"退款|退货|退钱|售后|不想要|买多了|拍多了|申请退", compact):
             return ""
+        if re.search(
+            r"(?:能不能|可不可以|有没有|有无|有没|是否有|可以不可以)"
+            r"[^\d]{0,6}\d+(?:\.\d+)?(?:元|块)?(?:代金券|优惠券|券)",
+            compact,
+        ):
+            return ""
         amounts = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", compact)
+        if not amounts:
+            chinese_amounts = re.findall(
+                r"([零一二两三四五六七八九十百千]+)"
+                r"(?=(?:元|块|怎么|如何|咋|买|拍|要|来|下单|消费|账单|预算|$))",
+                compact,
+            )
+            converted = [cls._chinese_count(value) for value in chinese_amounts]
+            amounts = [str(value) for value in converted if value and value >= 20]
         if len(amounts) != 1:
             return ""
         consumption_words = bool(re.search(
@@ -7602,9 +7785,18 @@ class V2Store(AppStore):
             r"(?:要|该|需要)(?:买|拍|下单)?几张|能买什么|"
             r"给(?:我)?(?:一个|个)?方案|有(?:什么|啥)方案|推荐(?:一下)?|"
             r"怎么办|怎么最划算|如何最划算|哪个最划算|哪种最划算|"
-            r"怎么划算|如何划算|怎么合适|哪个合适|能抵多少|抵扣多少",
+            r"怎么划算|如何划算|怎么合适|哪个合适|能抵多少|抵扣多少|"
+            r"(?:给我|帮我|我要|要|来|买|拍|下单|购|整)\d+(?:\.\d+)?(?:元|块)?(?:的)?|"
+            r"\d+(?:\.\d+)?(?:元|块)?(?:的)?(?:买|拍|下单)(?:几张|多少张)",
             compact,
         ))
+        if not plan_words and not re.search(r"\d", compact):
+            plan_words = bool(re.search(
+                r"(?:给我|帮我|我要|要|来|买|拍|下单|购|整)?"
+                r"[零一二两三四五六七八九十百千]+(?:元|块)?(?:的)?"
+                r"(?:怎么拍|怎么买|如何拍|如何买|拍几张|买几张)?",
+                compact,
+            ))
         if not (consumption_words or plan_words):
             return ""
         return cls._format_number(amounts[0])
@@ -7758,6 +7950,22 @@ class V2Store(AppStore):
         # queried, and buyers commonly omit both the store name and “能用”.
         amount_followup = self._sku_amount_followup(text)
         selected_skus = self._explicit_store_skus(item_id, text, product)
+        # Buyers also refer to a SKU by its sale price after a store result,
+        # e.g. “138那个不能用吗”. Only apply this alias to availability wording
+        # so an ordinary “138多少钱” still follows the price/plan route.
+        if not selected_skus and re.search(
+            r"能用|可以用|可用|不能用|不可以用|不可用|用不了|支持|适用|有吗|能买吗|能拍",
+            compact,
+        ):
+            mentioned_amounts = {
+                self._format_number(value)
+                for value in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", text)
+            }
+            if mentioned_amounts:
+                selected_skus = [
+                    sku for sku in self.list_product_skus(item_id, product)
+                    if self._format_number(sku.get("sale_price") or "") in mentioned_amounts
+                ]
         if not selected_skus:
             bare_amount = amount_followup
             if bare_amount:
@@ -10432,6 +10640,15 @@ class V2Store(AppStore):
         )
 
         if delivery_mismatch:
+            if not refund_request:
+                return {
+                    "reply": (
+                        "您反馈的发券面额或数量与订单预期不一致。请先核对订单规格和券包数量，"
+                        "不要发送完整券码、密码或领取链接；如仍不一致，请提供脱敏后的订单规格和页面提示以便核实。"
+                    ),
+                    "source": "卡券发放异常先排查，买家尚未提出退款",
+                    "decision": "allow", "kind": "coupon_troubleshooting",
+                }
             return {
                 "reply": (
                     "您反馈的发券面额、数量或退券结果与预期不一致，需要核对订单和实际发券记录。"
@@ -10951,6 +11168,12 @@ class V2Store(AppStore):
             }
 
         if quality_expiry:
+            if not refund_request:
+                return {
+                    "reply": "请先核对券页面显示的有效期，并保留脱敏后的有效期提示；若收到时已经过期，请把页面提示文字发来核实。",
+                    "source": "卡券有效期异常先排查，买家尚未提出退款",
+                    "decision": "allow", "kind": "coupon_troubleshooting",
+                }
             return {
                 "reply": (
                     "如果卡券收到时就已过期，请先保留券码页面和有效期提示，并在订单中申请“仅退款”。"
@@ -10964,12 +11187,23 @@ class V2Store(AppStore):
         # An actual code/redemption failure is aftersales evidence by itself.
         # A bare “不能用吗” is intentionally excluded and remains available to
         # the existing store/time intent resolvers above.
-        if actual_failure and (refund_request or payment_state == "paid"):
-            reply = policy_sentences(
+        if actual_failure and not refund_request:
+            return {
+                "reply": (
+                    "请先确认选择的是订单对应门店和规格，并重新打开券码后再尝试核销。"
+                    "如仍提示无效或核销失败，请保留脱敏后的页面提示和门店反馈，我再按卡券异常继续核实。"
+                ),
+                "source": "卡券核销异常先排查，买家尚未提出退款",
+                "decision": "allow", "kind": "coupon_troubleshooting",
+            }
+
+        if actual_failure and refund_request:
+            guidance = policy_sentences(
                 ("质量", "异常", "仅退款", "72", "人工"),
-                "如遇券码无效或无法核销，请保留页面提示或门店反馈，并在订单中申请“仅退款”。"
-                "提交后需要人工核实，通常会在申请后的72小时内处理。",
+                "请保留脱敏后的页面提示或门店反馈，并按当前商品退款政策在订单售后页面操作。",
             )
+            policy = policy_text()
+            reply = (policy.rstrip() + "\n\n" if policy else "") + "根据您描述，属于卡券原因退款。" + guidance
             return {
                 "reply": reply,
                 "source": "卡券质量退款需人工核实",
@@ -11048,8 +11282,45 @@ class V2Store(AppStore):
                 }
 
             if personal_reason:
+                policy = policy_text()
+                guidance = (
+                    "根据您描述，属于买家原因退款。请按上述政策在当前订单售后页面选择相符原因并提交；"
+                    "退款条件、金额和审核结果均以已配置政策及订单页面为准。"
+                )
+                # Prefer the actual refund percentage over a fee percentage.  A
+                # policy such as “扣除5%手续费，退款金额为实付金额95%” contains
+                # both numbers and must calculate with 95%, not the first 5%.
+                rate_match = re.search(
+                    r"退款金额[^。；\n%]{0,30}?(\d+(?:\.\d+)?)\s*%", policy,
+                ) or re.search(
+                    r"(?:退回|可退|按)[^。；\n%]{0,20}?(\d+(?:\.\d+)?)\s*%", policy,
+                )
+                fee_match = re.search(
+                    r"(?:扣除|收取)[^。；\n%]{0,20}(\d+(?:\.\d+)?)\s*%[^。；\n]{0,10}(?:手续费|服务费)",
+                    policy,
+                )
+                if actual_paid_amount not in (None, ""):
+                    try:
+                        paid_amount = Decimal(str(actual_paid_amount))
+                    except InvalidOperation:
+                        paid_amount = Decimal("0")
+                else:
+                    paid_amount = self._paid_amount_from_text(message) or Decimal("0")
+                if (rate_match or fee_match) and paid_amount > 0:
+                    if rate_match:
+                        rate_percent = Decimal(rate_match.group(1))
+                    else:
+                        rate_percent = Decimal("100") - Decimal(fee_match.group(1))
+                    rate = rate_percent / Decimal("100")
+                    calculated = (paid_amount * rate).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP,
+                    )
+                    guidance += (
+                        f"按政策中的{rate_percent:g}%计算，订单实付{paid_amount:.2f}元"
+                        f"对应{calculated:.2f}元。"
+                    )
                 return {
-                    "reply": self._personal_refund_reply(message, actual_paid_amount),
+                    "reply": (policy.rstrip() + "\n\n" if policy else "") + guidance,
                     "source": "已确认的非卡券质量退款流程",
                     "decision": "allow",
                     "kind": "refund_process",
@@ -11057,8 +11328,9 @@ class V2Store(AppStore):
 
             if payment_state == "paid":
                 prompt = "请问退款原因是暂时不用了，还是到店后券码无法核销？两种情况的处理方式不同。"
+                policy = policy_text()
                 return {
-                    "reply": prompt,
+                    "reply": (policy.rstrip() + "\n\n" if policy else "") + prompt,
                     "source": "已付款退款请求缺少退款原因",
                     "decision": "allow",
                     "kind": "aftersale_clarify",

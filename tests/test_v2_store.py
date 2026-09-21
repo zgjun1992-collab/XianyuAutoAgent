@@ -692,6 +692,8 @@ class V2StoreTests(unittest.TestCase):
             "300的可以用吗": ("300元代金券不能使用", True),
             "请问300代金券支持吗": ("300元代金券不能使用", True),
             "300有吗": ("300元代金券不能使用", True),
+            "206那个不能用吗": ("300元代金券不能使用", True),
+            "139那个能用吗": ("200元代金券可以使用", False),
         }
         for question, (expected, should_offer_supported) in cases.items():
             with self.subTest(question=question):
@@ -719,6 +721,15 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertNotEqual("stores_sku_recommendation", price["kind"])
         self.assertIn("206元", price["reply"])
+
+        for question in ("300的代金券我拍下来是206元吗", "206是300的券吗"):
+            with self.subTest(question=question):
+                confirmation = self.store.resolve_deterministic(
+                    "10001", question, store_context=context,
+                )
+                self.assertEqual("voucher_value", confirmation["kind"])
+                self.assertIn("300元代金券", confirmation["reply"])
+                self.assertIn("售价206元", confirmation["reply"])
 
     def test_different_store_amount_wording_uses_current_store_skus_and_limits(self):
         self.store.save_v2_product(
@@ -1142,10 +1153,10 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("郑州万象城", result["reply"])
         self.assertNotIn("退款", result["reply"])
 
-    def test_actual_paid_coupon_failure_still_uses_aftersales(self):
+    def test_actual_paid_coupon_failure_without_refund_intent_uses_troubleshooting(self):
         result = self.store.resolve_deterministic("10001", "我已经付款，券码在万象城核销失败")
-        self.assertIn(result["kind"], {"refund_quality", "code_operation_review"})
-        self.assertIn("72小时", result["reply"])
+        self.assertEqual("coupon_troubleshooting", result["kind"])
+        self.assertNotIn("退款", result["reply"])
 
     def test_unspecified_day_defaults_to_store_business_hours(self):
         self.store.save_v2_product("10001", "测试券", "100元代金券售价68.8元。")
@@ -1613,7 +1624,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("除上述明确不可用日期外，适用门店营业时间内可用。", first_reply)
         self.assertIn("仅限堂食；不可用包间；不支持免费打包", first_reply)
         self.assertIn("【发券方式】\n付款后发电子券码，门店扫码核销。", first_reply)
-        self.assertIn("请当天购买、当天使用", first_reply)
+        self.assertNotIn("请当天购买、当天使用", first_reply)
         self.assertNotIn("\n\n", first_reply)
         self.store.save_v2_product(
             "10001", product["title"], product["raw_text"],
@@ -1999,7 +2010,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("allow", ordinary["decision"])
         self.assertIn("非卡券质量问题", ordinary["reply"])
         self.assertIn("64.51元", ordinary["reply"])
-        self.assertIn("已收到货", ordinary["reply"])
+        self.assertIn("当前商品规则", ordinary["reply"])
 
         quality = self.store.resolve_deterministic("10001", "券码不能用怎么退款")
         self.assertEqual("review", quality["decision"])
@@ -2202,8 +2213,9 @@ class V2StoreTests(unittest.TestCase):
         })
         self.store.save_synced_summary("20002", "AI初始知识", {"summary": "AI初始知识", "time_rules": []})
         initial = self.store.get_v2_product("20002")
-        self.assertTrue(initial["raw_text"].startswith("AI初始知识"))
-        self.assertIn("适用门店营业时间内可用", initial["raw_text"])
+        self.assertEqual("闲鱼文案第一版", initial["raw_text"])
+        self.assertTrue(initial["ai_summary"])
+        self.assertIn("适用门店营业时间内可用", initial["ai_summary"])
         self.store.save_v2_product("20002", "同步商品", "我人工修改后的权威知识")
         self.store.upsert_synced_product({
             "item_id": "20002",
@@ -2215,7 +2227,7 @@ class V2StoreTests(unittest.TestCase):
         self.store.save_synced_summary("20002", "新的AI初始知识", {"summary": "新的AI初始知识", "time_rules": []})
         updated = self.store.get_v2_product("20002")
         self.assertEqual("我人工修改后的权威知识", updated["raw_text"])
-        self.assertTrue(updated["ai_summary"].startswith("新的AI初始知识"))
+        self.assertTrue(updated["ai_summary"])
         self.assertIn("适用门店营业时间内可用", updated["ai_summary"])
         self.assertEqual("source_updated", updated["sync_status"])
 
@@ -2597,11 +2609,10 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("剩余100元", result["reply"])
         self.assertIn("到店自行支付", result["reply"])
 
-    def test_quality_failure_refund_mentions_72_hours(self):
+    def test_quality_failure_without_refund_intent_uses_troubleshooting(self):
         result = self.store.resolve_deterministic("10001", "买了不能用怎么办")
-        self.assertEqual("refund_quality", result["kind"])
-        self.assertIn("仅退款", result["reply"])
-        self.assertIn("72小时", result["reply"])
+        self.assertEqual("coupon_troubleshooting", result["kind"])
+        self.assertNotIn("仅退款", result["reply"])
 
     def test_historical_version_can_be_restored(self):
         self.store.save_v2_product("10001", "测试券", "旧知识", note="旧版本")
@@ -2923,14 +2934,14 @@ class V2StoreTests(unittest.TestCase):
                 self.assertIn("72小时", result["reply"])
                 self.assertNotIn("帮您补发", result["reply"])
 
-    def test_code_anomaly_is_one_of_the_real_manual_review_cases(self):
+    def test_code_anomaly_without_refund_intent_starts_troubleshooting(self):
         for message in ("核销失败", "券码无效", "无法核销"):
             with self.subTest(message=message):
                 result = self.store.resolve_deterministic("10001", message)
-                self.assertEqual("review", result["decision"])
-                self.assertEqual("code_operation_review", result["kind"])
-                self.assertIn("人工核实", result["reply"])
-                self.assertIn("72小时", result["reply"])
+                self.assertEqual("allow", result["decision"])
+                self.assertEqual("coupon_troubleshooting", result["kind"])
+                self.assertIn("核销", result["reply"])
+                self.assertNotIn("退款", result["reply"])
 
     def test_mixed_denomination_negation_is_never_reversed(self):
         self.store.save_v2_product(
@@ -3359,7 +3370,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("4. 使用限制", result["reply"])
         self.assertIn("查询到可用门店", result["reply"])
         self.assertIn("深圳壹方城店", result["reply"])
-        self.assertIn("是的，售价108元", result["reply"])
+        self.assertIn("是的，200元代金券售价108元", result["reply"])
         self.assertIn("2张100元代金券", result["reply"])
         self.assertIn("一桌最多代200元", result["reply"])
         self.assertNotIn("无法准确回答", result["reply"])
@@ -3372,7 +3383,7 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "108抵200吗")
         self.assertEqual("voucher_value", result["kind"])
         self.assertEqual(
-            "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+            "是的，200元代金券售价108元，购买后发放2张100元代金券，共可抵扣200元。",
             result["reply"],
         )
         self.assertNotIn("无法", result["reply"])
@@ -3445,8 +3456,8 @@ class V2StoreTests(unittest.TestCase):
         mismatch = self.store.resolve_deterministic(
             "10001", "刚刚店里把券退了，现在发了三张500的，发错了吧",
         )
-        self.assertEqual("delivery_mismatch_review", mismatch["kind"])
-        self.assertEqual("review", mismatch["decision"])
+        self.assertEqual("coupon_troubleshooting", mismatch["kind"])
+        self.assertEqual("allow", mismatch["decision"])
         self.assertIn("发券", mismatch["reply"])
         self.assertNotIn("可用门店", mismatch["reply"])
 
@@ -3479,7 +3490,7 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "108拍下直接代200吗")
         self.assertEqual("voucher_value", result["kind"])
         self.assertEqual(
-            "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+            "是的，100元代金券购买2张共支付108元，购买后发放2张100元代金券，共可抵扣200元。",
             result["reply"],
         )
 
@@ -3496,7 +3507,7 @@ class V2StoreTests(unittest.TestCase):
             ),
             "108拍下直接代200吗": (
                 "voucher_value",
-                "是的，售价108元，购买后发放2张100元代金券，共可抵扣200元。",
+                "是的，100元代金券购买2张共支付108元，购买后发放2张100元代金券，共可抵扣200元。",
             ),
             "消费235咋拍": (
                 "consumption_plan",
@@ -5331,6 +5342,100 @@ class V2StoreTests(unittest.TestCase):
         result = self.store.resolve_deterministic("10001", "今天一个人多少钱")
         self.assertEqual("deny", result["decision"])
         self.assertIn("不可用日期范围", result["reply"])
+
+    def test_amount_question_matrix_covers_prefix_suffix_and_chinese_forms(self):
+        self.store.save_v2_product(
+            "amount-matrix", "代金券",
+            "100元代金券：售价57.9元，最多叠加2张\n"
+            "300元代金券：售价212.8元，每次限用1张",
+        )
+        for message in (
+            "拍200的", "买200的", "要200的", "来200的", "给我200的",
+            "下单200的", "200拍几张", "两百怎么拍",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("amount-matrix", message)
+                self.assertIsNotNone(result)
+                self.assertIn("2张100元代金券", result["reply"])
+                self.assertIn("抵扣200元", result["reply"])
+
+    def test_paid_price_and_face_relationship_matrix_uses_full_sku_name(self):
+        self.store.save_v2_product(
+            "relation-matrix", "平台代金券",
+            "美团200（可叠加2张）：售价108元",
+        )
+        for message in (
+            "108是200的券吗", "108可以买200吗", "200的券是108吗",
+            "200卖108吗", "108买200", "108得200", "108发200",
+            "108换200", "108/200", "108→200", "108能抵200吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("relation-matrix", message)
+                self.assertIsNotNone(result)
+                self.assertEqual("voucher_value", result["kind"])
+                self.assertIn("美团200元代金券（可叠加2张）售价108元", result["reply"])
+
+    def test_near_price_relationship_corrects_actual_sku_price(self):
+        self.store.save_v2_product(
+            "near-price", "平台代金券", "美团200元代金券：售价115.8元",
+        )
+        result = self.store.resolve_deterministic("near-price", "115代200")
+        self.assertEqual("voucher_value", result["kind"])
+        self.assertIn("不是", result["reply"])
+        self.assertIn("115.8元", result["reply"])
+
+    def test_bare_positive_stack_rules_mean_unlimited_and_cover_quantity_phrasings(self):
+        self.store.save_v2_product(
+            "unlimited", "100元代金券",
+            "100元代金券：售价66元\n仅支持同面额代金券叠加\n可叠加",
+        )
+        product = self.store.get_v2_product("unlimited")
+        for message in ("一次几张", "最多叠几张", "限几张"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("unlimited", message)
+                self.assertEqual("stacking", result["kind"])
+                self.assertIn("不限制使用张数", result["reply"])
+        self.assertIn("不限制使用张数", self.store.build_knowledge_summary(product))
+
+    def test_explicit_stack_limit_answers_requested_quantity_phrasings(self):
+        self.store.save_v2_product(
+            "limited", "100元代金券", "100元代金券：售价69元，可叠加2张",
+        )
+        over = self.store.resolve_deterministic("limited", "可以用3张吗")
+        same = self.store.resolve_deterministic("limited", "两张同时核销吗")
+        self.assertIn("最多使用2张", over["reply"])
+        self.assertIn("可以", same["reply"])
+
+    def test_first_reply_does_not_invent_same_day_or_expiry_policy(self):
+        self.store.save_v2_product(
+            "first-no-invention", "100元代金券", "100元代金券：售价69元",
+        )
+        reply = self.store.build_first_reply_text(
+            self.store.get_v2_product("first-no-invention")
+        )
+        self.assertNotIn("当天购买", reply)
+        self.assertNotIn("过期不退不补", reply)
+
+    def test_buffet_identity_first_counts_and_fare_table(self):
+        self.store.save_v2_product(
+            "buffet-natural", "自助餐",
+            "工作日午餐成人票：售价88元\n"
+            "工作日午餐老人票：售价68元\n"
+            "工作日午餐儿童票：售价48元",
+        )
+        plan = self.store.resolve_deterministic(
+            "buffet-natural", "工作日午餐成人2个老人1个孩子1个怎么买",
+        )
+        self.assertIn("合计292元", plan["reply"])
+        xplan = self.store.resolve_deterministic(
+            "buffet-natural", "工作日午餐成人x2老人x1儿童x1",
+        )
+        self.assertIn("合计292元", xplan["reply"])
+        fares = self.store.resolve_deterministic(
+            "buffet-natural", "工作日午餐老人和小孩怎么收费",
+        )
+        self.assertIn("老人票", fares["reply"])
+        self.assertIn("儿童票", fares["reply"])
 
 
 if __name__ == "__main__":
