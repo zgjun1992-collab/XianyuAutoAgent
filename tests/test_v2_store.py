@@ -269,8 +269,7 @@ class V2StoreTests(unittest.TestCase):
             "supported_skus": [meituan, douyin], "unknown_skus": [],
         }]
         reply = self.store._format_store_sku_matrix("天河店", matrix)
-        self.assertIn("支持使用下面卡券", reply)
-        self.assertIn("美团200（可叠加2张）（售价119.8元）；\n", reply)
+        self.assertIn("可用规格为", reply)
         self.assertIn("美团200（可叠加2张）（售价119.8元）", reply)
         self.assertIn("抖音200（可叠加4张）（售价138元）", reply)
         selected_reply = self.store._format_store_sku_matrix(
@@ -279,7 +278,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("美团200（可叠加2张）、抖音200（可叠加4张）可以使用", selected_reply)
         self.assertNotIn("200元、200元代金券", selected_reply)
 
-    def test_store_reply_keeps_each_store_and_its_skus_in_one_segment(self):
+    def test_store_reply_keeps_all_stores_and_skus_in_one_answer(self):
         first_sku = {
             "sku_key": "first", "sku_name": "美团100（可叠加2张）",
             "face_value": "100", "sale_price": "69", "option_type": "voucher",
@@ -299,14 +298,14 @@ class V2StoreTests(unittest.TestCase):
             },
         ])
 
-        segments = reply.split("\n\n")
-        self.assertEqual(4, len(segments))
-        self.assertIn("青岛凯德MALL·新都心店", segments[1])
-        self.assertIn("美团100（可叠加2张）（售价69元）", segments[1])
-        self.assertNotIn("青岛崂山万象汇店", segments[1])
-        self.assertIn("青岛崂山万象汇店", segments[2])
-        self.assertIn("抖音200（售价129元）", segments[2])
-        self.assertNotIn("青岛凯德MALL·新都心店", segments[2])
+        self.assertEqual(
+            "根据“青岛”查询结果：\n\n"
+            "【青岛凯德MALL·新都心店】：可用规格为"
+            "美团100（可叠加2张）（售价69元）。\n\n"
+            "【青岛崂山万象汇店】：可用规格为抖音200（售价129元）。\n\n"
+            "请按对应门店支持的规格拍下。",
+            reply,
+        )
 
     def test_multi_sku_specific_store_uses_product_union_without_city_fallback(self):
         self.store.save_v2_product(
@@ -337,9 +336,9 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("200元代金券", result["reply"])
         self.assertNotIn("根据“合肥”", result["reply"])
         self.assertEqual(
-            "根据“合肥之心城店”查询到以下可用门店及规格：\n\n"
-            "1. 【合肥之心城店】：支持使用下面卡券\n"
-            "100元代金券（售价64元）；\n300元代金券（售价192元）。\n\n"
+            "根据“合肥之心城店”查询结果：\n\n"
+            "【合肥之心城店】：可用规格为100元代金券（售价64元）、"
+            "300元代金券（售价192元）。\n\n"
             "请按对应门店支持的规格拍下。",
             result["reply"],
         )
@@ -417,7 +416,8 @@ class V2StoreTests(unittest.TestCase):
         followup = self.store.resolve_deterministic(
             "10001", "多少钱", store_context=first["query_context_update"],
         )
-        self.assertIn("抖音500元代金券（可叠加4张）（售价328元）", followup["reply"])
+        self.assertIn("抖音500元代金券（售价328元）", followup["reply"])
+        self.assertNotIn("抖音500元代金券（可叠加4张）", followup["reply"])
 
     def test_city_plus_unique_homophone_store_name_can_auto_match(self):
         self.store.save_v2_product(
@@ -623,10 +623,10 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("200元代金券", matrix["郑州大卫城店"])
         self.assertIn("100元代金券", matrix["郑州二七万达店"])
         self.assertIn("200元代金券", matrix["郑州二七万达店"])
-        self.assertIn("\n\n1. 【", result["reply"])
+        self.assertIn("\n\n【郑州大卫城店】：可用规格为", result["reply"])
         self.assertIn("100元代金券（售价64元）", result["reply"])
         self.assertIn("200元代金券（售价120元）", result["reply"])
-        self.assertIn("；", result["reply"])
+        self.assertEqual([], result["reply_parts"])
         self.assertNotIn("&#x20;", result["reply"])
 
     def test_multi_sku_store_matrix_supports_amount_followup(self):
@@ -5238,7 +5238,7 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("1位老人需要购买1张午餐老人票，共68元", result["reply"])
         self.assertIn("合计286元", result["reply"])
 
-    def test_store_reply_adds_sku_stack_limit_to_full_sku_name(self):
+    def test_store_reply_never_adds_stack_limit_outside_sku_name(self):
         self.store.save_v2_product("10001", "平台代金券", "")
         self.store.save_ai_summary("10001", "平台代金券规格", {
             "products": [
@@ -5261,7 +5261,8 @@ class V2StoreTests(unittest.TestCase):
             "10001", "青岛凯德MALL新都心店多少？",
         )
         self.assertEqual("multi_intent", result["kind"])
-        self.assertIn("美团100（可叠加2张）（售价69元）", result["reply"])
+        self.assertIn("美团100（售价69元）", result["reply"])
+        self.assertNotIn("美团100（可叠加2张）", result["reply"])
         self.assertNotIn("抖音300", result["reply"])
 
     def test_store_configuration_reads_synced_platform_skus_without_ai_summary(self):
