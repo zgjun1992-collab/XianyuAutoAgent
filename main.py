@@ -313,6 +313,7 @@ class XianyuLive:
         if not isinstance(payload, (dict, list)):
             return ""
         values = []
+        coordinates = {}
         stack = [payload]
         visited = 0
         location_hint = False
@@ -337,6 +338,12 @@ class XianyuLive:
                     ))
                 if isinstance(value, (dict, list)):
                     stack.append(value)
+                elif key_norm in {"latitude", "lat"}:
+                    coordinates["lat"] = str(value).strip()
+                    location_hint = True
+                elif key_norm in {"longitude", "lng", "lon"}:
+                    coordinates["lng"] = str(value).strip()
+                    location_hint = True
                 elif isinstance(value, str) and key_norm in location_value_keys | generic_value_keys:
                     text = value.strip()
                     if text:
@@ -362,6 +369,13 @@ class XianyuLive:
             match = re.search(r"([^\n，,。]{2,40}(?:店|商场|广场|MALL|Mall|mall))", value)
             if match:
                 return match.group(1).strip("()（）[]【】 ")
+        for priority, value in sorted(values, key=lambda item: item[0]):
+            if priority >= 2 and re.search(
+                r"(?:省|市|区|县|镇|街道|路|街|大道|巷|号|商场|广场|购物中心)", value,
+            ):
+                return value[:100]
+        if coordinates.get("lat") and coordinates.get("lng"):
+            return f"[位置坐标]{coordinates['lat']},{coordinates['lng']}"
         return ""
 
     @staticmethod
@@ -911,17 +925,23 @@ class XianyuLive:
 
     @staticmethod
     def is_aftersale_entry_message(message="", order_context=None):
-        """Enter aftersales only after the platform confirms a paid/current order."""
+        """Enter refund flow only for a verified purchase plus refund intent."""
         text = re.sub(r"\s+", "", str(message or ""))
         order_status = str((order_context or {}).get("status") or "")
-        if re.search(r"退款|退货|售后|纠纷", order_status):
-            return True
-        paid_order = bool(re.search(
+        refund_order = bool(re.search(r"退款|退货|售后|纠纷", order_status))
+        paid_order = refund_order or bool(re.search(
             r"已付款|买家已付款|等待卖家发货|待发货|已发货|等待买家收货|"
             r"确认收货|交易成功|已完成",
             order_status,
         )) and not bool(re.search(r"待付款|等待买家付款|未付款|已取消|交易关闭", order_status))
         if not text or not paid_order:
+            return False
+        policy_only = bool(re.search(
+            r"退款(?:规则|政策|条件)|退换(?:货)?政策|可以退吗|能退吗|支持退款吗|"
+            r"怎么退款|如何退款|怎么申请退款|如何申请退款|如果.{0,8}(?:不能用|不想要).{0,6}怎么办",
+            text,
+        )) and not bool(re.search(r"我要|我想|给我|帮我|申请了|已申请|处理中|不到账|金额不对", text))
+        if policy_only:
             return False
         # Questions about how to use/redeem a purchased coupon are normal
         # pre-use consultations, not proof that an aftersales incident occurred.
@@ -933,37 +953,28 @@ class XianyuLive:
         ))
         if operational_question and not re.search(r"失败|不了|不能用|无效|错误|拒绝|过期|失效", text):
             return False
-        intrinsic_fault = bool(re.search(
-            r"券码(?:无效|失效|错误|不能用|用不了)|卡券(?:无效|失效|不能用|用不了)|"
-            r"(?:但是|但|已经|现在)(?:不能用|用不了)|"
-            r"核销(?:失败|不了|不成功)|无法核销|不能核销|"
-            r"发错(?:券|码|商品)|少发|漏发|没收到(?:券|码)|未收到(?:券|码)|"
-            r"收到(?:的|了)?.{0,8}(?:过期|失效)|发来(?:的)?.{0,8}(?:过期|失效)",
-            text,
-        ))
-        completed_problem = bool(re.search(
-            r"(?:卡券|券码|这个券|这张券).{0,8}(?:已经|过期了|失效了)|"
-            r"(?:退款|退货|售后)(?:申请)?(?:已提交|提交了|申请了|处理中|不到账|金额不对)",
-            text,
-        ))
         explicit_refund = bool(re.search(
-            r"我要退款|申请退款|已经申请退款|退款不到账|退款金额不对|退货|售后申请",
+            r"我要退款|我想退款|想退(?:款|掉)?|给我退|帮我退|申请退款|已经申请退款|"
+            r"退款(?:不到账|金额不对|进度|状态|到哪|多久)|退货|售后申请|"
+            r"(?:不能用|用不了|无效|发错|少发|没收到|过期).{0,12}(?:退款|退钱|退掉)",
             text,
-        ))
-        return intrinsic_fault or completed_problem or explicit_refund
+        )) or (refund_order and bool(re.search(r"进度|状态|怎么样|到哪|多久|到账", text)))
+        return explicit_refund
 
     async def send_aftersale_state_reply(
         self, websocket, chat_id, send_user_id, send_user_name, scope_id,
         item_id, user_message, policies, url_info="", *, first=False,
     ):
-        """Send the live configured policy once, then a fixed human-processing receipt."""
+        """Show the effective policy first, then let deterministic routing classify."""
         if first:
-            reply = str(
+            effective = getattr(self.app_store, "effective_aftersale_policy", None)
+            reply = str(effective(item_id) if effective else "").strip() or str(
                 policies.get("aftersale_policy_summary")
                 or policies.get("aftersale_policy_raw")
-                or DEFAULT_POLICIES.get("aftersale_policy_summary")
-                or ""
+                or DEFAULT_POLICIES.get("aftersale_policy_summary") or ""
             ).strip()
+            reason_prompt = "请再说明退款原因：是买错、买多或行程变化，还是券码未收到、发错、无效或无法核销？"
+            reply = (reply.rstrip("。\n") + "。\n\n" + reason_prompt).strip()
         else:
             reply = self.AFTERSALE_FOLLOWUP_NOTICE
 
@@ -988,9 +999,15 @@ class XianyuLive:
                 scope_id, self.myid, item_id, "assistant", reply
             )
         if first:
-            pause = getattr(self.app_store, "pause_conversation", None)
-            if pause:
-                pause(scope_id, "aftersale")
+            context = {
+                "intent": "aftersale", "aftersale_stage": "awaiting_reason",
+                "aftersale_prompt": reason_prompt, "aftersale_payment_state": "paid",
+                "aftersale_policy_shown": True,
+            }
+            self._query_contexts[scope_id] = context
+            updater = getattr(self.app_store, "update_query_context", None)
+            if updater:
+                updater(scope_id, context)
         self.emit_event(
             "aftersale_started" if first else "aftersale_followup",
             audit_id=audit_id, chat_id=chat_id, item_id=item_id, scope_id=scope_id,
@@ -1547,11 +1564,14 @@ class XianyuLive:
                     if locations is None:
                         self._recent_buyer_locations = locations = {}
                     locations[scope_id] = (time.monotonic(), location_card)
-                    # A shared POI card supplies context rather than a complete
-                    # question. Wait for the buyer's following “可以用吗”.
-                    if not re.search(r"(?:可以|能|可)(?:使用|用)|支持吗|适用吗", send_message):
-                        logger.info(f"已记录买家发送的门店位置卡：{location_card}")
-                        return
+                    # A recognizable POI/address is already a complete store
+                    # query. Pure coordinates cannot be reverse-geocoded by the
+                    # local rules, so immediately request a store/address.
+                    if location_card.startswith("[位置坐标]"):
+                        send_message = "我发送了位置坐标，附近有可用门店吗"
+                    else:
+                        send_message = f"{location_card}可以使用吗"
+                    logger.info(f"已识别并立即查询买家位置卡：{location_card}")
 
             if self.is_recall_message(send_message):
                 self._message_generations[scope_id] = self._message_generations.get(scope_id, 0) + 1
@@ -1688,26 +1708,18 @@ class XianyuLive:
             ):
                 return
 
-            # Aftersales owns the conversation before the normal product welcome.
-            # The first entry sends the policy currently saved in the backend;
-            # later buyer messages receive only the human-processing receipt.
+            # Old versions locked every later message into a fixed aftersales
+            # receipt. Migrate that state and let the structured query context
+            # keep the current refund step instead.
             conversation_state = str(
                 conversation.get("state")
                 or (getattr(self.app_store, "get_conversation_state", lambda _scope: "")(scope_id))
                 or ""
             )
-            if conversation_state == "aftersale":
-                await self.send_aftersale_state_reply(
-                    websocket, chat_id, send_user_id, send_user_name, scope_id,
-                    item_id, send_message, policies, url_info, first=False,
-                )
-                return
-            if conversation_state == "aftersale_pending":
-                await self.send_aftersale_state_reply(
-                    websocket, chat_id, send_user_id, send_user_name, scope_id,
-                    item_id, send_message, policies, url_info, first=True,
-                )
-                return
+            if conversation_state in {"aftersale", "aftersale_pending"}:
+                resume = getattr(self.app_store, "resume_conversation", None)
+                if resume:
+                    resume(scope_id)
             order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
             if self.is_aftersale_entry_message(send_message, order_context):
                 await self.send_aftersale_state_reply(

@@ -70,6 +70,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.event_callback = None
         live._order_notice_scopes = set()
         live._buyer_routes = {"buyer-1": ("chat-1", "item-1")}
+        live._query_contexts = {}
         live._first_reply_locks = {}
         live.manual_mode_conversations = set()
         live.send_msg = AsyncMock()
@@ -308,6 +309,17 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual("汉阳摩尔城店", XianyuLive.inbound_location_card(payload))
 
+    def test_location_card_falls_back_to_address_or_coordinate_context(self):
+        address = {
+            "contentType": "location",
+            "cardData": {"address": "深圳市南山区科技园路1号"},
+        }
+        coordinate = {
+            "messageType": "map", "latitude": 22.5401, "longitude": 113.9345,
+        }
+        self.assertEqual("深圳市南山区科技园路1号", XianyuLive.inbound_location_card(address))
+        self.assertEqual("[位置坐标]22.5401,113.9345", XianyuLive.inbound_location_card(coordinate))
+
     def test_normal_product_card_is_not_treated_as_location(self):
         payload = {"contentType": 1, "title": "半秋山100元代金券", "price": "79.5"}
         self.assertEqual("", XianyuLive.inbound_location_card(payload))
@@ -490,7 +502,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         for message in ("券码核销失败", "我已经付款了但是不能用", "发来的券已经过期"):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.is_aftersale_entry_message(message))
-                self.assertTrue(XianyuLive.is_aftersale_entry_message(
+                self.assertFalse(XianyuLive.is_aftersale_entry_message(
                     message, {"status": "已付款"}
                 ))
         for message in ("可以退款吗", "退款政策是什么", "如果不能用怎么办", "锅底能用吗"):
@@ -503,27 +515,23 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "券码核销失败", {"status": "等待买家付款"}
         ))
         self.assertTrue(XianyuLive.is_aftersale_entry_message(
+            "券码核销失败，我要退款", {"status": "已付款"}
+        ))
+        self.assertTrue(XianyuLive.is_aftersale_entry_message(
             "进度怎么样", {"status": "退款申请处理中"}
         ))
 
-    async def test_aftersale_first_reply_uses_live_backend_policy_then_fixed_receipt(self):
+    async def test_aftersale_first_reply_shows_policy_then_keeps_reason_context_active(self):
         live = self.make_live()
-        live.app_store.pause_conversation = lambda scope, state: setattr(
-            live.app_store, "paused", (scope, state)
-        )
         policy = "后台刚刚修改的退款政策"
         first = await live.send_aftersale_state_reply(
             object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
             "券码核销失败", {"aftersale_policy_summary": policy}, first=True,
         )
-        followup = await live.send_aftersale_state_reply(
-            object(), "chat-1", "buyer-1", "买家", "scope-1", "item-1",
-            "怎么处理", {"aftersale_policy_summary": "另一个政策"}, first=False,
-        )
-        self.assertEqual(policy, first)
-        self.assertEqual(XianyuLive.AFTERSALE_FOLLOWUP_NOTICE, followup)
-        self.assertEqual(("scope-1", "aftersale"), live.app_store.paused)
-        self.assertEqual(policy, live.send_msg.await_args_list[0].args[3])
+        self.assertIn(policy, first)
+        self.assertIn("退款原因", first)
+        self.assertEqual("awaiting_reason", live._query_contexts["scope-1"]["aftersale_stage"])
+        self.assertEqual(first, live.send_msg.await_args_list[0].args[3])
 
     async def test_offline_product_never_sends_first_reply(self):
         live = self.make_live()

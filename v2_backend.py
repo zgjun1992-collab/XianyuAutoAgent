@@ -30,6 +30,8 @@ SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供
 整理的目标是调整结构和表达，不是压缩信息。原文每一条独立事实、限制、例外、提醒和咨询要求都必须保留，
 不得因为内容看似次要、重复或无法归类而删除；无法归入固定栏目时放入“其他说明”。
 生成summary前必须逐句核对原文，确认每条规则都能在summary或结构化字段中找到对应内容。
+输入JSON中的sku是当前商品真实在售规格，优先级高于description文案。SKU名称、售价、库存和在售状态必须原样保留；
+description只用于补充使用规则。文案价格与SKU冲突时以SKU为准，并把冲突写入risk_fields；文案出现但SKU中不存在的规格不得作为可售规格输出。
 输出一个JSON对象，字段必须为：
 summary: 适合客服快速阅读的中文分点摘要字符串；在原文有对应内容时，应完整包含商品规格、适用门店范围、
 有效期和不可用日期、使用时间、堂食/外带/外卖、预约和等位、优惠互斥、叠加与限用数量、发券核销、
@@ -52,6 +54,9 @@ stores: 商品文案明确列出的适用门店数组，每项字段为brand、b
 不得把多个面额和售价合并到同一个字符串，不得遗漏括号中的发券组成。
 叠加规则要与发券组成分开。默认仅支持同面额叠加；只有原文明写“不同面额可叠加”时，
 才可以在facts.叠加规则中写不同面额叠加，禁止自行扩展；
+“100×4/发4张”是发券组成，不是叠加上限。明确“可叠加N张/最多N张”才是有限上限；
+写“可叠加/支持叠加使用/同面额可叠加”但没有张数，以及“无限叠加/不限制使用张数”时，均整理为不限制使用张数；
+“不可叠加/每次限用1张”分别按禁止叠加或上限1张整理，不能与每日不限次数、限购数量、单品优惠数量混淆。
 time_rules: 数组，每项包含label、day_type(any/weekday/weekend)、start_time(HH:MM)、end_time(HH:MM)、allowed(boolean)、reply、next_hint。
 时间规则只能从当前商品原文提取；若同一商品的不同规格分别适用于工作日、周末或餐段，
 reply必须写明当前时段对应可用的规格名称/面额和售价，不得推荐其他商品。
@@ -206,7 +211,12 @@ class BackendState:
         product = self.store.get_v2_product(item_id)
         if not product:
             raise ValueError("商品不存在")
-        source_text = product["raw_text"].strip() or product.get("platform_summary", "").strip()
+        platform_source = str(product.get("platform_summary") or "").strip()
+        manual_source = str(product.get("raw_text") or "").strip() if product.get("manual_edited") else ""
+        source_text = "\n".join(value for value in (
+            platform_source,
+            ("【人工补充资料】\n" + manual_source) if manual_source else "",
+        ) if value) or str(product.get("raw_text") or "").strip()
         if not source_text:
             raise ValueError("当前商品没有可归纳的资料")
         summary, structured = self._generate_summary(source_text)
