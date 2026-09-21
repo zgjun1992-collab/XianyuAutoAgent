@@ -6897,10 +6897,11 @@ class V2Store(AppStore):
     def _sku_public_label(sku: Dict) -> str:
         name = str(sku.get("sku_name") or "该规格").strip()
         price = str(sku.get("sale_price") or "").strip()
-        maximum = V2Store._normalize_stack_limit(sku.get("max_stack"))
-        has_limit = bool(re.search(r"(?:叠加|使用|限用)[^）\n]{0,8}\d+\s*张", name))
-        limit = f"（可叠加{maximum}张）" if maximum and not has_limit else ""
-        return f"{name}{limit}（售价{price}元）" if price else f"{name}{limit}（售价待同步）"
+        # Buyer-facing purchase options must preserve the marketplace SKU name
+        # verbatim. max_stack is a usage rule, not part of the SKU name; adding
+        # it here invents labels such as “抖音50x4（可叠加4张）”. If stacking
+        # text really belongs to the SKU, it is already present in sku_name.
+        return f"{name}（售价{price}元）" if price else f"{name}（售价待同步）"
 
     def reverse_store_sku_matches(self, item_id: str, query: str,
                                   product: Optional[Dict] = None) -> List[Dict]:
@@ -7026,7 +7027,7 @@ class V2Store(AppStore):
         selected_skus = list(selected_skus or [])
         selected_keys = {str(sku.get("sku_key") or "") for sku in selected_skus}
         lines = []
-        for index, row in enumerate(matrix, start=1):
+        for row in matrix:
             store_name = cls._store_display_name(row.get("store") or {})
             supported = list(row.get("supported_skus") or [])
             supported_keys = {str(sku.get("sku_key") or "") for sku in supported}
@@ -7063,10 +7064,9 @@ class V2Store(AppStore):
             else:
                 if supported:
                     labels = [cls._sku_public_label(sku) for sku in supported]
-                    catalog = "；\n".join(labels) + "。"
-                    line = f"{index}. 【{store_name}】：支持使用下面卡券\n{catalog}"
+                    line = f"【{store_name}】：可用规格为{'、'.join(labels)}。"
                 else:
-                    line = f"{index}. 【{store_name}】：暂无已确认的可用规格。"
+                    line = f"【{store_name}】：暂无已确认的可用规格。"
             unknown = [
                 sku for sku in row.get("unknown_skus") or []
                 if not selected_keys or str(sku.get("sku_key") or "") in selected_keys
@@ -7076,12 +7076,7 @@ class V2Store(AppStore):
             lines.append(line)
         if selected_skus and len(lines) == 1:
             return lines[0]
-        heading = (
-            f"根据“{query}”查询结果："
-            if selected_skus else f"根据“{query}”查询到以下可用门店及规格："
-        )
-        # Double newlines are message delimiters in the sending layer.  Each
-        # store is one segment; its heading and SKU catalog use single newlines.
+        heading = f"根据“{query}”查询结果："
         return "\n\n".join((heading, *lines, "请按对应门店支持的规格拍下。"))
 
     @classmethod
@@ -7508,13 +7503,11 @@ class V2Store(AppStore):
             }
         matrix = self._store_sku_matrix(item_id, matches, scope)
         reply = self._format_store_sku_matrix(resolved_query, matrix, selected_skus)
-        reply_parts = []
-        if not selected_skus and 1 < len(matrix) <= 3:
-            sections = reply.split("\n\n")
-            reply_parts = [sections[0], *sections[1].splitlines(), *sections[2:]]
         return {
             "reply": reply,
-            "reply_parts": reply_parts,
+            # Store, SKU and price are one answer. Do not split paragraphs into
+            # separate Xianyu messages or the buyer loses their relationship.
+            "reply_parts": [],
             "source": "多规格商品级门店与规格对应关系",
             "decision": "allow", "kind": "stores_sku_recommendation",
             "store_matches": matches, "store_query": resolved_query,
