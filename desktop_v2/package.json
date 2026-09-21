@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.32",
+  "version": "0.11.33",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.32：补齐金额、门店、叠加、自助餐与退款上下文问法；优先使用真实SKU，位置卡可直接查店，并按自定义发货退款政策引导售后。"
+      "releaseNotes": "0.11.33：真实在售SKU优先于页面文案；每个SKU独立归档适用时间、门店、叠加、人群和限制规则；未标注差异的规则默认全规格通用；AI草稿确认前不影响客服回复。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
