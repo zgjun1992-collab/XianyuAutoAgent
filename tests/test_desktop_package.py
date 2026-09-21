@@ -24,15 +24,15 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_auto_update_channel_is_configured(self):
         package = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.11.30", package["version"])
+        self.assertEqual("0.11.31", package["version"])
         self.assertIn("electron-updater", package["dependencies"])
         self.assertEqual(
             [{"provider": "generic", "url": "https://download.yituan123.com/v3.6"}],
             package["build"]["publish"],
         )
-        self.assertIn("直接读取同步SKU", package["build"]["releaseInfo"]["releaseNotes"])
-        self.assertIn("每家门店及其可用SKU独立分段", package["build"]["releaseInfo"]["releaseNotes"])
-        self.assertIn("不再将xN套餐数量误判", package["build"]["releaseInfo"]["releaseNotes"])
+        self.assertIn("合并为一条完整回复", package["build"]["releaseInfo"]["releaseNotes"])
+        self.assertIn("严格使用真实SKU名称", package["build"]["releaseInfo"]["releaseNotes"])
+        self.assertIn("不再把叠加规则自动拼进SKU名称", package["build"]["releaseInfo"]["releaseNotes"])
         self.assertIn("esbuild electron/updater-entry.cjs", package["scripts"]["build:updater"])
         self.assertTrue((DESKTOP / "electron" / "updater-entry.cjs").is_file())
         self.assertTrue((DESKTOP / "electron" / "update-policy.cjs").is_file())

@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.30",
+  "version": "0.11.31",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.30：商品配置直接读取同步SKU；门店查询按每家门店及其可用SKU独立分段；仅在SKU或规则明确说明时展示叠加上限，不再将xN套餐数量误判为可叠加张数；保留金额凑单与自助餐购票计算。"
+      "releaseNotes": "0.11.31：门店与全部可用SKU合并为一条完整回复；价格、门店及可购买选项严格使用真实SKU名称，不再把叠加规则自动拼进SKU名称。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
