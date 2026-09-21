@@ -6705,7 +6705,39 @@ class V2Store(AppStore):
                     == str(option.get("sale_price") or "")
                 )
             ), None)
+            if not same:
+                # Older versions could save a store binding against the
+                # normalized knowledge name (for example “100元代金券”) before
+                # the real marketplace SKU payload arrived.  Match that old
+                # option to a real SKU only when face value, paid price and
+                # delivered composition identify exactly one marketplace row.
+                # The unique-match rule avoids guessing between same-priced
+                # Meituan/Douyin variants.
+                commercial_matches = [
+                    existing for existing in options
+                    if existing.get("_platform_sku")
+                    and str(existing.get("option_type") or "") == "voucher"
+                    and str(option.get("option_type") or "") == "voucher"
+                    and self._format_number(existing.get("face_value") or "")
+                    == self._format_number(option.get("face_value") or "")
+                    and bool(self._format_number(option.get("face_value") or ""))
+                    and self._format_number(existing.get("sale_price") or "")
+                    == self._format_number(option.get("sale_price") or "")
+                    and bool(self._format_number(option.get("sale_price") or ""))
+                    and normalize_text(existing.get("composition") or "")
+                    == normalize_text(option.get("composition") or "")
+                ]
+                if len(commercial_matches) == 1:
+                    same = commercial_matches[0]
             if same:
+                same_key = self.sku_key_for_option(same)
+                if key != same_key:
+                    aliases = same.setdefault("_configuration_alias_keys", [])
+                    if key not in aliases:
+                        aliases.append(key)
+                    # Do not append the same normalized knowledge option again
+                    # in the later configuration-only pass.
+                    known_keys.add(key)
                 for field in (
                     "face_value", "sale_price", "composition", "max_stack", "option_type",
                     "people_counts", "audience_types", "day_types", "meal_periods",
@@ -6739,8 +6771,13 @@ class V2Store(AppStore):
             legacy_option = dict(option)
             legacy_option.pop("sku_id", None)
             legacy_key = self.sku_key_for_option(legacy_option)
-            if key not in rules and (legacy_key in rules or legacy_key in bindings):
-                key = legacy_key
+            configuration_keys = [key, legacy_key, *(
+                str(value) for value in option.get("_configuration_alias_keys") or []
+            )]
+            key = next((
+                candidate for candidate in configuration_keys
+                if candidate in rules or candidate in bindings
+            ), key)
             rule = rules.get(key) or {}
             source_sale_price = str(option.get("sale_price") or "").strip()
             sale_price_override = str(rule.get("sale_price_override") or "").strip()

@@ -5241,6 +5241,61 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("美团100（可叠加2张）", result["reply"])
         self.assertNotIn("抖音300", result["reply"])
 
+    def test_synced_marketplace_sku_name_reuses_legacy_generic_store_binding(self):
+        self.store.save_v2_product(
+            "10001", "宁波小馆代金券",
+            "100元代金券：售价69元，最多使用2张",
+        )
+        self.store.save_ai_summary("10001", "通用知识规格", {
+            "products": [{
+                "name": "100元代金券", "option_type": "代金券",
+                "face_value": "100", "sale_price": "69",
+                "composition": "100元券1张", "max_stack": 2,
+            }],
+        })
+        store_list = self.store.import_store_text(
+            "【山东省】\n【青岛】青岛凯德MALL·新都心店", "美团100门店", [],
+        )
+        legacy_sku = self.store.get_v2_product("10001")["skus"][0]
+        self.assertEqual("100元代金券", legacy_sku["sku_name"])
+        self.store.set_sku_store_rule(
+            "10001", legacy_sku["sku_key"], legacy_sku["sku_name"],
+            "custom", [store_list["id"]],
+        )
+
+        platform_summary = json.dumps({
+            "title": "宁波小馆代金券", "description": "餐饮代金券",
+            "sku": [
+                {
+                    "skuId": "meituan-100", "priceInCent": 6900,
+                    "propertyList": [{"actualValueText": "美团100（可叠加2张）"}],
+                },
+                {
+                    "skuId": "meituan-100x2", "priceInCent": 13800,
+                    "propertyList": [{"actualValueText": "美团100x2"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "10001", "title": "宁波小馆代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "69",
+        })
+
+        skus = self.store.get_v2_product("10001")["skus"]
+        real_sku = next(sku for sku in skus if sku["sku_name"] == "美团100（可叠加2张）")
+        self.assertEqual(legacy_sku["sku_key"], real_sku["sku_key"])
+        self.assertEqual([store_list["id"]], real_sku["effective_list_ids"])
+        self.assertNotIn("100元代金券", [sku["sku_name"] for sku in skus])
+
+        result = self.store.resolve_deterministic("10001", "青岛凯德店可以用吗")
+        self.assertEqual("stores_sku_recommendation", result["kind"])
+        self.assertIn(
+            "【青岛凯德MALL·新都心店】：可用规格为"
+            "美团100（可叠加2张）（售价69元）。",
+            result["reply"],
+        )
+        self.assertNotIn("可用规格为100元代金券", result["reply"])
+
     def test_store_configuration_reads_synced_platform_skus_without_ai_summary(self):
         platform_summary = json.dumps({
             "title": "COMMUNE幻师自助餐",
