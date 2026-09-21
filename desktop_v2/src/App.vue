@@ -15,7 +15,7 @@ const snapshot = reactive({
   products: [], store_lists: [], reviews: [], service: { status: 'stopped', message: '' },
   conversations: [], config: {}, policies: {}
 })
-const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
+const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', ai_draft_summary: '', structured: {}, ai_draft_structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
 const licenseDraft = reactive({ server_url: 'https://api.yituan123.com', username: '', password: '' })
 const license = reactive({ active: false, logged_in: false, mode: '', user: null, entitlement: null, error: '', device_id: '', server_url: '' })
@@ -175,7 +175,9 @@ function selectProduct(product) {
     raw_text: product.raw_text || '',
     enabled: Boolean(product.enabled),
     ai_summary: product.ai_summary || '',
+    ai_draft_summary: product.ai_draft_summary || product.ai_summary || '',
     structured: product.structured || {},
+    ai_draft_structured: product.ai_draft_structured || {},
     source_update: product.source_update || {},
     time_rules: product.time_rules || [],
     store_lists: product.store_lists || [],
@@ -215,7 +217,7 @@ function openProductKnowledge(product) {
 }
 
 function newProduct() {
-  Object.assign(productDraft, { item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
+  Object.assign(productDraft, { item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', ai_draft_summary: '', structured: {}, ai_draft_structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
   selectStoreSku(null)
   resetImageDraft()
   productTab.value = 'knowledge'
@@ -372,11 +374,12 @@ async function summarizeProduct() {
 }
 
 async function adoptEditedAiSummary() {
-  const text = String(productDraft.ai_summary || '').trim()
+  const text = String(productDraft.ai_draft_summary || '').trim()
   if (!text) return notify('当前没有可保存的归纳知识', 'error')
-  productDraft.raw_text = text
-  await saveProduct()
-  notify('修改后的归纳知识已保存为当前最高优先级知识')
+  const product = await call('POST', `/products/${encodeURIComponent(productDraft.item_id)}/ai-draft/adopt`, { summary: text })
+  selectProduct(product)
+  await refresh()
+  notify('归纳草稿及逐SKU规则已采纳为当前生效知识')
 }
 
 async function loadVersions() {
@@ -965,7 +968,7 @@ onBeforeUnmount(() => {
               <pre>{{ productDraft.platform_summary || '当前没有同步到闲鱼页面资料。' }}</pre>
             </div>
             <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea><div class="button-row end"><button class="primary" @click="saveProduct">保存当前生效知识</button></div></article>
-            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>仅用于核对；重新归纳不会自动覆盖上方人工知识。确认无误后可人工采纳为当前知识，并保留历史版本</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_summary" v-model="productDraft.ai_summary" rows="16" placeholder="AI会尽量整理规格、价格、时间、适用限制、发券核销及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="productDraft.structured?.risk_fields?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in productDraft.structured.risk_fields" :key="field">{{ field }}</span></div></article>
+            <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>真实在售SKU的名称、售价和发券内容优先；每个SKU单独归档时间、门店、叠加和人群规则。草稿确认采纳前不会影响客服回复</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_draft_summary" v-model="productDraft.ai_draft_summary" rows="16" placeholder="AI会按真实SKU分别整理品牌、名称、价格、日期/餐段、门店、叠加、人群、核销、退款及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">同步商品后自动生成。</div><div v-if="productDraft.ai_draft_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="(productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in (productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)" :key="field">{{ field }}</span></div></article>
           </div>
 
           <div v-else-if="productTab === 'firstReply'" class="product-tab-body">

@@ -27,24 +27,39 @@ from utils.xianyu_utils import trans_cookies
 from v2_store import V2Store, extract_store_query
 
 
-SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供任意格式的原始资料。
+SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供一个JSON资料包。
 只能整理原文明确出现的内容，禁止补充常识、猜测门店、价格、有效期或退款承诺。
 整理的目标是调整结构和表达，不是压缩信息。原文每一条独立事实、限制、例外、提醒和咨询要求都必须保留，
 不得因为内容看似次要、重复或无法归类而删除；无法归入固定栏目时放入“其他说明”。
 生成summary前必须逐句核对原文，确认每条规则都能在summary或结构化字段中找到对应内容。
-输入JSON中的sku是当前商品真实在售规格，优先级高于description文案。SKU名称、售价、库存和在售状态必须原样保留；
-description只用于补充使用规则。文案价格与SKU冲突时以SKU为准，并把冲突写入risk_fields；文案出现但SKU中不存在的规格不得作为可售规格输出。
+资料优先级固定为：canonical_skus（当前页面真实在售SKU）> effective_knowledge（人工当前生效知识）> page_description（页面文案）。
+canonical_skus中的sku_key、名称、售价、券面额、发券组成、库存和在售状态是不可改写的主数据；其他来源只能补充规则，
+不能覆盖或新增可售SKU。文案价格与SKU冲突时以SKU为准，并把冲突写入source_conflicts和risk_fields；
+文案出现但canonical_skus中不存在的规格不得作为可售规格输出。canonical_skus为空时，才允许从文字中提取规格和售价。
+页面同时售卖多个SKU时，必须为每个SKU建立一条独立sku_profiles档案；不同SKU的适用日期、餐段、不可用日期、
+门店、人群、叠加上限、附加费等规则不得合并或互相继承。文案没有标注规格差异时，页面级规则默认写入common_rules并适用于全部SKU，
+不要求原文额外写“全规格通用”；一旦文案明确某个或多个SKU使用不同规则，相应字段必须拆入各自档案，公共规则不得覆盖差异项。
+确实无法判断规则归属时放入risk_fields，不要强行分配。
 输出一个JSON对象，字段必须为：
 summary: 适合客服快速阅读的中文分点摘要字符串；在原文有对应内容时，应完整包含商品规格、适用门店范围、
 有效期和不可用日期、使用时间、堂食/外带/外卖、预约和等位、优惠互斥、叠加与限用数量、发券核销、
 退款、发票及下单前提醒；禁止输出Python对象、JSON片段或字段字典；
 risk_fields: 需要人工确认的高风险或矛盾字段数组；
-facts: 对象，按原文明确信息尽量完整提取，允许包含商品类型、有效期、适用日期、不可用日期、
+source_conflicts: 数据冲突数组，每项包含field、sku_key、higher_priority_value、lower_priority_value、chosen_value、reason；
+facts: 仅存放页面级公共事实的对象，按原文明确信息尽量完整提取，允许包含品牌、商品类型、有效期、适用日期、不可用日期、
 使用时间、预约要求、堂食限制、外带限制、外卖限制、包间限制、酒水限制、锅底限制、服务费限制、
 优惠同享、叠加规则、不同面额混用、单次或每桌限用数量、退款规则、发码平台、发码方式、领取方式、
-核销方式、发票规则、适用人群、人数限制和下单前提醒；原文未说明的内容不得猜测；
-products: 仅填写代金券规格数组，每个规格必须独立一项，字段为name、option_type、face_value、sale_price、applicable_time、composition、max_stack。
-sale_options: 仅填写套餐、自助餐、人数餐等非代金券商品选项数组，每项字段为name、option_type、sale_price、people_count、applicable_day、meal_period、applicable_time；
+核销方式、发票规则、购买限制、使用次数、适用人群、身高年龄、人数限制、额外收费和下单前提醒；原文未说明的内容不得猜测；
+common_rules: 未标注规格差异时默认适用于全部SKU的页面级公共规则对象，键名沿用sku_profiles中的规则字段；
+sku_profiles: 每个canonical_skus必须且只能对应一项，字段为sku_key、sku_name、option_type、sale_price、face_value、composition、stock、sellable、brand、product_name、
+validity、available_dates、unavailable_dates、applicable_stores、applicable_regions、applicable_day、meal_period、use_hours、applicable_time、
+audience、height_age_rule、people_count、stack_rule、max_stack、mixed_denomination、benefit_combination、reservation、waiting、dine_in、takeout、delivery、
+usage_scope、excluded_items、extra_fees、delivery_platform、delivery_method、claim_method、redeem_method、refund_rule、invoice_rule、purchase_limit、usage_limit、notes、source_evidence；
+还应尽量提取package_contents、minimum_spend、change_cash_rule、per_table_limit、per_order_limit、daily_limit、usage_frequency、
+advance_booking、holiday_policy、branch_price_difference、substitution_rule、expiry_rule；没有原文依据时保持为空。
+没有资料的字段写空字符串或空数组。未标注规格差异的页面级规则通过common_rules供全部SKU继承；明确指向某个SKU的适用时间、叠加、门店等规则只写入该SKU档案。
+products: 仅填写代金券规格数组，每个规格必须独立一项，字段为sku_key、name、option_type、face_value、sale_price、applicable_time、composition、max_stack；
+sale_options: 仅填写套餐、自助餐、人数餐等非代金券商品选项数组，每项字段为sku_key、name、option_type、sale_price、people_count、applicable_day、meal_period、applicable_time；
 stores: 商品文案明确列出的适用门店数组，每项字段为brand、branch、province、city、district、address、phone；
 只有原文出现具体门店名称时才可填写，不能把“全国通用”“全国60店”等概括描述推测为门店。
 其中face_value是券面额，sale_price是售价，composition是实际发券组成。例如“200元：135.8（发两张100）”必须写成
@@ -61,7 +76,7 @@ stores: 商品文案明确列出的适用门店数组，每项字段为brand、b
 “不可叠加/每次限用1张”分别按禁止叠加或上限1张整理，不能与每日不限次数、限购数量、单品优惠数量混淆。
 time_rules: 数组，每项包含label、day_type(any/weekday/weekend)、start_time(HH:MM)、end_time(HH:MM)、allowed(boolean)、reply、next_hint。
 时间规则只能从当前商品原文提取；若同一商品的不同规格分别适用于工作日、周末或餐段，
-reply必须写明当前时段对应可用的规格名称/面额和售价，不得推荐其他商品。
+每项还必须写sku_key和sku_name，reply必须写明当前时段对应可用的规格名称/面额和售价，不得推荐其他商品。
 原文没有明确时间规则时time_rules必须为空数组。不要输出Markdown。"""
 
 AFTERSALE_POLICY_PROMPT = """你是餐饮电子卡券售后政策整理员。
@@ -195,7 +210,7 @@ class BackendState:
                 {"role": "user", "content": source_text},
             ],
             "temperature": 0,
-            "max_tokens": 3200,
+            "max_tokens": 6000,
             "timeout": 45,
         }
         try:
@@ -209,20 +224,149 @@ class BackendState:
             result = self.ai_client().chat.completions.create(**request)
         return self._parse_summary(result.choices[0].message.content or "")
 
+    @staticmethod
+    def _summary_sku_record(row):
+        """Keep only buyer-visible canonical SKU facts in the model input."""
+        return {
+            "sku_key": str(row.get("sku_key") or row.get("sku_id") or ""),
+            "sku_name": str(row.get("sku_name") or row.get("name") or "商品规格"),
+            "option_type": str(row.get("option_type") or ""),
+            "sale_price": str(row.get("sale_price") or ""),
+            "face_value": str(row.get("face_value") or ""),
+            "composition": str(row.get("composition") or ""),
+            "stock": str(row.get("stock") or ""),
+            "sellable": bool(row.get("sellable", row.get("availability", "available") == "available")),
+            "applicable_time_in_sku_name": str(row.get("applicable_time") or ""),
+            "day_types_in_sku_name": list(row.get("day_types") or []),
+            "meal_periods_in_sku_name": list(row.get("meal_periods") or []),
+            "audience_types_in_sku_name": list(row.get("audience_types") or []),
+            "people_counts_in_sku_name": row.get("people_counts") or [],
+            "max_stack_in_sku_data": str(row.get("max_stack") or ""),
+        }
+
+    def _summary_source_payload(self, product):
+        platform_options = self.store._platform_configuration_options(product)
+        if platform_options:
+            canonical_skus = []
+            for option in platform_options:
+                row = dict(option)
+                row["sku_key"] = self.store.sku_key_for_option(option)
+                row["sku_name"] = option.get("name") or "商品规格"
+                row["sellable"] = str(option.get("availability") or "available") == "available"
+                canonical_skus.append(self._summary_sku_record(row))
+        else:
+            canonical_skus = [self._summary_sku_record(row) for row in product.get("skus") or []]
+
+        manual = bool(product.get("manual_edited"))
+        payload = {
+            "source_priority": [
+                "canonical_skus",
+                "effective_knowledge",
+                "page_description",
+            ],
+            "product_identity": {
+                "item_id": str(product.get("item_id") or ""),
+                "listing_title": str(product.get("title") or ""),
+            },
+            "canonical_skus": canonical_skus,
+            "effective_knowledge": str(product.get("raw_text") or "").strip(),
+            # Once the operator has edited effective knowledge, deletion is also
+            # an intentional edit. Re-feeding the old page copy would resurrect it.
+            "page_description": "" if manual else self.store._platform_description(product),
+            "provenance_note": (
+                "人工知识已编辑：不得从旧页面文案恢复被人工删除的规则。"
+                if manual else "页面文案仅补充SKU未携带的使用规则。"
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2), canonical_skus
+
+    @staticmethod
+    def _normalize_summary_structure(structured, canonical_skus):
+        """Force model output back onto the real SKU catalogue."""
+        normalized = dict(structured or {}) if isinstance(structured, dict) else {}
+        if not canonical_skus:
+            return normalized
+        profiles = normalized.get("sku_profiles")
+        profiles = profiles if isinstance(profiles, list) else []
+        by_key = {
+            str(row.get("sku_key") or ""): row
+            for row in profiles if isinstance(row, dict) and row.get("sku_key")
+        }
+        by_name = {
+            re.sub(r"\s+", "", str(row.get("sku_name") or row.get("name") or "")).lower(): row
+            for row in profiles if isinstance(row, dict)
+        }
+        fixed_profiles = []
+        products = []
+        sale_options = []
+        common = normalized.get("common_rules")
+        common = common if isinstance(common, dict) else {}
+        for sku in canonical_skus:
+            name = str(sku.get("sku_name") or "商品规格")
+            profile = dict(
+                by_key.get(str(sku.get("sku_key") or ""))
+                or by_name.get(re.sub(r"\s+", "", name).lower())
+                or {}
+            )
+            profile.update({
+                "sku_key": sku.get("sku_key") or "",
+                "sku_name": name,
+                "name": name,
+                "option_type": sku.get("option_type") or "",
+                "sale_price": sku.get("sale_price") or "",
+                "face_value": sku.get("face_value") or "",
+                "composition": sku.get("composition") or "",
+                "stock": sku.get("stock") or "",
+                "sellable": bool(sku.get("sellable", True)),
+            })
+            inherited = []
+            for key, value in common.items():
+                if value not in (None, "", [], {}) and profile.get(key) in (None, "", [], {}):
+                    profile[key] = value
+                    inherited.append(key)
+            profile["inherited_common_fields"] = inherited
+            if sku.get("max_stack_in_sku_data"):
+                profile["max_stack"] = sku["max_stack_in_sku_data"]
+            fixed_profiles.append(profile)
+            option = {
+                "sku_key": profile["sku_key"],
+                "name": name,
+                "option_type": profile["option_type"],
+                "sale_price": profile["sale_price"],
+                "face_value": profile["face_value"],
+                "composition": profile["composition"],
+                "stock": profile["stock"],
+                "sellable": profile["sellable"],
+                "applicable_time": profile.get("applicable_time") or "",
+                "max_stack": profile.get("max_stack") or "",
+            }
+            if profile["option_type"] == "voucher" or profile["face_value"]:
+                products.append(option)
+            else:
+                option.update({
+                    "people_count": profile.get("people_count") or "",
+                    "applicable_day": profile.get("applicable_day") or "",
+                    "meal_period": profile.get("meal_period") or "",
+                })
+                sale_options.append(option)
+        normalized["sku_profiles"] = fixed_profiles
+        normalized["products"] = products
+        normalized["sale_options"] = sale_options
+        return normalized
+
     def summarize_product(self, item_id: str):
         product = self.store.get_v2_product(item_id)
         if not product:
             raise ValueError("商品不存在")
-        platform_source = str(product.get("platform_summary") or "").strip()
-        manual_source = str(product.get("raw_text") or "").strip() if product.get("manual_edited") else ""
-        source_text = "\n".join(value for value in (
-            platform_source,
-            ("【人工补充资料】\n" + manual_source) if manual_source else "",
-        ) if value) or str(product.get("raw_text") or "").strip()
-        if not source_text:
+        source_text, canonical_skus = self._summary_source_payload(product)
+        if not canonical_skus and not str(product.get("raw_text") or "").strip() and not self.store._platform_description(product):
             raise ValueError("当前商品没有可归纳的资料")
         summary, structured = self._generate_summary(source_text)
-        return self.store.save_ai_summary(item_id, summary, structured)
+        structured = self._normalize_summary_structure(structured, canonical_skus)
+        normalized_product = dict(product)
+        normalized_product["structured"] = structured
+        summary = self.store.build_knowledge_summary(normalized_product) or summary
+        return self.store.save_ai_draft(item_id, summary, structured)
 
     def summarize_aftersale_policy(self, text: str) -> str:
         text = str(text or "").strip()
@@ -417,7 +561,19 @@ class BackendState:
                         continue
                     description = str(item_do.get("desc") or "")
                     try:
-                        summary, structured = self._generate_summary(platform_summary)
+                        synced_product = self.store.get_v2_product(item_id) or {}
+                        source_product = dict(synced_product)
+                        # A source refresh is summarized from the refreshed page,
+                        # not from the operator's still-effective manual knowledge.
+                        source_product["manual_edited"] = False
+                        source_product["raw_text"] = ""
+                        source_text, canonical_skus = self._summary_source_payload(source_product)
+                        summary, structured = self._generate_summary(source_text)
+                        structured = self._normalize_summary_structure(structured, canonical_skus)
+                        rendered_product = dict(source_product)
+                        rendered_product["raw_text"] = description
+                        rendered_product["structured"] = structured
+                        summary = self.store.build_knowledge_summary(rendered_product) or summary
                     except Exception as summary_exc:
                         # Page acquisition and AI condensation are independent.
                         # A model timeout must not discard rules/stores already
@@ -868,6 +1024,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path.startswith("/products/") and path.endswith("/summarize"):
                 item_id = unquote(path.split("/")[2])
                 return self._ok(self.state.summarize_product(item_id))
+            if path.startswith("/products/") and path.endswith("/ai-draft/adopt"):
+                item_id = unquote(path.split("/")[2])
+                return self._ok(self.state.store.adopt_ai_draft(item_id, body.get("summary", "")))
             if path.startswith("/products/") and path.endswith("/first-reply/regenerate"):
                 item_id = unquote(path.split("/")[2])
                 return self._ok(self.state.store.refresh_first_reply(item_id, force=True))

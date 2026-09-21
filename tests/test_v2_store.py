@@ -99,6 +99,54 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("售价89元", merged)
         self.assertIn("禁止推荐任何其他商品", merged)
 
+    def test_ai_draft_is_inert_until_adopted_and_promotes_matching_profiles(self):
+        original = self.store.get_v2_product("10001")
+        draft = {
+            "sku_profiles": [{
+                "sku_key": "sku-100", "sku_name": "100元代金券",
+                "sale_price": "69", "face_value": "100", "meal_period": "午餐",
+            }],
+            "time_rules": [{
+                "label": "午餐", "day_type": "any", "start_time": "11:00",
+                "end_time": "14:00", "allowed": True, "reply": "100元代金券午餐可用",
+            }],
+        }
+        pending = self.store.save_ai_draft("10001", "AI待采纳草稿", draft)
+        self.assertEqual(original["raw_text"], pending["raw_text"])
+        self.assertEqual(original["structured"], pending["structured"])
+        self.assertEqual([], self.store.list_time_rules("10001"))
+        self.assertEqual("AI待采纳草稿", pending["ai_draft_summary"])
+
+        adopted = self.store.adopt_ai_draft("10001", "AI待采纳草稿")
+        self.assertEqual("AI待采纳草稿", adopted["raw_text"])
+        self.assertEqual("100元代金券", adopted["structured"]["sku_profiles"][0]["sku_name"])
+        self.assertEqual(1, len(self.store.list_time_rules("10001")))
+
+    def test_editing_visible_ai_draft_discards_hidden_structure(self):
+        self.store.save_ai_draft("10001", "含隐藏旧规则的草稿", {
+            "facts": {"不可用日期": "国庆不可用"},
+            "time_rules": [{
+                "label": "旧规则", "day_type": "weekday", "start_time": "00:00",
+                "end_time": "23:59", "allowed": False, "reply": "不可用",
+            }],
+        })
+        adopted = self.store.adopt_ai_draft("10001", "人工删除旧规则后的正文")
+        self.assertEqual({}, adopted["structured"])
+        self.assertEqual([], self.store.list_time_rules("10001"))
+
+    def test_each_sku_profile_inherits_common_rules_but_keeps_own_difference(self):
+        text = self.store._sku_profile_summary({
+            "common_rules": {"stack_rule": "同面额可无限叠加", "meal_period": "全天"},
+            "sku_profiles": [
+                {"sku_key": "a", "sku_name": "工作日午餐", "sale_price": "135", "meal_period": "午餐"},
+                {"sku_key": "b", "sku_name": "周末晚餐", "sale_price": "157", "meal_period": "晚餐"},
+            ],
+        })
+        self.assertEqual(2, text.count("叠加规则：同面额可无限叠加"))
+        self.assertIn("〔工作日午餐〕\n售价135元\n餐段：午餐", text)
+        self.assertIn("〔周末晚餐〕\n售价157元\n餐段：晚餐", text)
+        self.assertNotIn("餐段：全天", text)
+
     def test_question_relevant_knowledge_is_trimmed_before_model_call(self):
         self.store.save_v2_product(
             "10001",
