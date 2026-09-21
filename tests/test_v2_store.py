@@ -2955,6 +2955,41 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("不限制使用张数", summary)
         self.assertNotIn("仅支持同面额", summary)
 
+        reply = self.store.stacking_reply(
+            self.store.get_v2_product("10001"), "可以叠加使用吗？"
+        )
+        self.assertEqual(
+            "可以，同面额及不同面额代金券均可叠加使用，不限制使用张数。",
+            reply,
+        )
+
+    def test_same_denomination_unlimited_stack_rule_answers_follow_up(self):
+        self.store.save_v2_product(
+            "10001", "大树餐厅100元代金券",
+            "100元代金券：售价66元，发100元券1张\n"
+            "【叠加规则】\n仅支持同面额代金券叠加\n可无限叠加\n"
+            "单次或每桌限用数量：每日不限使用次数\n"
+            "可叠加2个单品优惠",
+        )
+        product = self.store.get_v2_product("10001")
+
+        self.assertEqual(
+            "可以，同面额代金券支持叠加使用，不限制使用张数；不同面额不能混用。",
+            self.store.stacking_reply(product, "可以叠加使用吗？"),
+        )
+        self.assertIn("仅支持同面额代金券叠加，不限制使用张数", self.store.build_knowledge_summary(product))
+
+    def test_unlimited_stack_negation_is_not_reversed(self):
+        self.store.save_v2_product(
+            "10001", "100元代金券",
+            "100元代金券：售价69元\n仅支持同面额使用，不支持无限叠加",
+        )
+        reply = self.store.stacking_reply(
+            self.store.get_v2_product("10001"), "可以叠加使用吗？"
+        )
+        self.assertIn("暂未明确说明", reply)
+        self.assertNotIn("不限制使用张数", reply)
+
     def test_denomination_specific_stack_limits_override_collapsed_ai_summary(self):
         self.store.save_v2_product(
             "10001", "多面额代金券",

@@ -5379,7 +5379,16 @@ class V2Store(AppStore):
         quantity_reply = self.coupon_quantity_limit_reply(product, message)
         if quantity_reply:
             return quantity_reply
+        # The old path only understood numeric limits such as "最多3张".
+        # Read the authoritative raw rule plus the dedicated structured fact,
+        # but do not let an AI-expanded summary invent cross-denomination use.
         knowledge = str(product.get("raw_text") or "")
+        facts = (product.get("structured") or {}).get("facts") or {}
+        stacking_fact = self._first_fact(
+            facts,
+            ("叠加规则", "代金券叠加", "使用张数", "最多使用", "stacking", "stack_rule"),
+        )
+        unlimited_evidence = f"{knowledge}\n{stacking_fact}"
         values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*元", message)))
         if not values:
             values = list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\s*张)", message)))
@@ -5437,6 +5446,7 @@ class V2Store(AppStore):
             r"(?:支持|可以|可)[^。；\n]{0,10}不同面额[^。；\n]{0,8}叠加|不同面额[^。；\n]{0,10}(?:可以|可|支持)[^。；\n]{0,8}叠加|混合叠加",
             knowledge,
         ))
+        unlimited_stack = self._supports_unlimited_stacking(unlimited_evidence)
         max_match = re.search(r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*(\d+)\s*张", knowledge)
         max_text = f"，每次最多使用{max_match.group(1)}张" if max_match else ""
         if different and not allows_mixed:
@@ -5447,6 +5457,8 @@ class V2Store(AppStore):
             detail = "；" + "；".join(mentioned_limits) if mentioned_limits else max_text
             return f"{values[0]}元和{values[1]}元属于不同面额，不能一起使用；当前仅支持同面额代金券叠加{detail}。"
         if allows_mixed:
+            if unlimited_stack and not max_match:
+                return "可以，同面额及不同面额代金券均可叠加使用，不限制使用张数。"
             return f"支持不同面额代金券一起叠加使用{max_text}。"
         denomination = values[0] if values else ""
         if not denomination and len(set(sku_limits.values())) > 1:
@@ -5472,6 +5484,9 @@ class V2Store(AppStore):
                     f"合计可抵扣{self._format_number(total)}元；每次最多使用{maximum}张。"
                 )
             return f"{denomination + '元代金券' if denomination else '同面额代金券'}可以叠加，每次最多使用{maximum}张；不同面额不能混用。"
+        if unlimited_stack:
+            target = f"{self._format_number(denomination)}元代金券" if denomination else "同面额代金券"
+            return f"可以，{target}支持叠加使用，不限制使用张数；不同面额不能混用。"
         return "当前商品资料暂未明确说明每次可以使用几张，暂时无法准确确认叠加数量。"
 
     @classmethod
@@ -5633,6 +5648,21 @@ class V2Store(AppStore):
                 limits[face] = max(limits.get(face, 0), count)
         return limits
 
+    @staticmethod
+    def _supports_unlimited_stacking(text: str) -> bool:
+        """Return True only for an explicit, non-negated unlimited-stack rule."""
+        evidence = str(text or "")
+        unlimited = (
+            r"无限叠加|"
+            r"不限(?:制)?(?:使用|叠加)?(?:数量|张数)|"
+            r"不限制(?:使用|叠加)?(?:数量|张数)|"
+            r"(?:使用|叠加)(?:数量|张数)不限(?:制)?"
+        )
+        denied = rf"(?:不可|不能|不支持|禁止|并非|不是)[^。；\n]{{0,6}}(?:{unlimited})"
+        if re.search(denied, evidence):
+            return False
+        return bool(re.search(unlimited, evidence))
+
     @classmethod
     def _stack_rule(cls, facts: Dict, raw_text: str, options: List[Dict]) -> str:
         explicit = cls._first_fact(
@@ -5692,9 +5722,11 @@ class V2Store(AppStore):
                 return f"支持同面额或不同面额代金券叠加，每次最多使用{count}张。"
             return f"仅支持同面额代金券叠加，每次最多使用{count}张。"
         if allows_mixed:
-            if re.search(r"无限叠加|不限(?:制)?(?:使用)?(?:数量|张数)|不限制(?:使用)?(?:数量|张数)", combined):
+            if cls._supports_unlimited_stacking(combined):
                 return "支持同面额及不同面额代金券互相叠加，不限制使用张数。"
             return "支持同面额及不同面额代金券互相叠加。"
+        if cls._supports_unlimited_stacking(combined):
+            return "仅支持同面额代金券叠加，不限制使用张数。"
         # Never inherit an AI-expanded mixed-denomination claim unless the
         # authoritative user/page text says so explicitly.
         return "仅支持同面额代金券叠加。" if options else ""
