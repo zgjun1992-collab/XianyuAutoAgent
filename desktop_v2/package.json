@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.33",
+  "version": "0.11.34",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.33：真实在售SKU优先于页面文案；每个SKU独立归档适用时间、门店、叠加、人群和限制规则；未标注差异的规则默认全规格通用；AI草稿确认前不影响客服回复。"
+      "releaseNotes": "0.11.34：AI草稿与历史生效知识严格隔离；自助餐纯人数默认成人；支持按日期、餐段和人数组合真实SKU并计算总价。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
