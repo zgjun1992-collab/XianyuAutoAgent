@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -112,6 +113,56 @@ class BackendSyncTests(unittest.TestCase):
         product = self.state.store.get_v2_product("30003")
         self.assertEqual("人工修改后的最高优先级资料", product["raw_text"])
         self.assertEqual(1, product["manual_edited"])
+
+    def test_resummarize_locks_real_skus_and_builds_one_profile_per_sku(self):
+        platform = json.dumps({
+            "title": "测试品牌多规格券",
+            "description": "页面旧规则：100券限工作日；200券限周末。页面误写100券售价88元。",
+            "sku": [
+                {"skuId": "sku-100", "priceInCent": 6900, "quantity": 8,
+                 "propertyList": [{"valueText": "美团100元代金券"}]},
+                {"skuId": "sku-200", "priceInCent": 13800, "quantity": 5,
+                 "propertyList": [{"valueText": "美团200元代金券"}]},
+            ],
+        }, ensure_ascii=False)
+        self.state.store.upsert_synced_product({
+            "item_id": "sku-profile", "title": "测试品牌多规格券",
+            "platform_summary": platform, "item_status": "onsale",
+        })
+        self.state.store.save_v2_product(
+            "sku-profile", "测试品牌多规格券",
+            "人工规则：100券午餐可用、最多2张；200券晚餐可用、最多1张。",
+        )
+        captured = []
+
+        def summarize(source_text):
+            payload = json.loads(source_text)
+            captured.append(payload)
+            first, second = payload["canonical_skus"]
+            return "模型草稿", {
+                "summary": "模型草稿",
+                "common_rules": {"refund_rule": "未使用可退"},
+                "sku_profiles": [
+                    {"sku_key": first["sku_key"], "sku_name": "伪造名称", "sale_price": "1", "meal_period": "午餐", "max_stack": "2"},
+                    {"sku_key": second["sku_key"], "sku_name": "伪造名称", "sale_price": "2", "meal_period": "晚餐", "max_stack": "1"},
+                ],
+                "time_rules": [],
+            }
+
+        self.state._generate_summary = summarize
+        before = self.state.store.get_v2_product("sku-profile")
+        result = self.state.summarize_product("sku-profile")
+        self.assertEqual("", captured[0]["page_description"])
+        self.assertIn("人工规则", captured[0]["effective_knowledge"])
+        self.assertEqual(["69", "138"], [row["sale_price"] for row in captured[0]["canonical_skus"]])
+        profiles = result["ai_draft_structured"]["sku_profiles"]
+        self.assertEqual(["美团100元代金券", "美团200元代金券"], [row["sku_name"] for row in profiles])
+        self.assertEqual(["69", "138"], [row["sale_price"] for row in profiles])
+        self.assertEqual(["未使用可退", "未使用可退"], [row["refund_rule"] for row in profiles])
+        self.assertEqual([["refund_rule"], ["refund_rule"]], [row["inherited_common_fields"] for row in profiles])
+        self.assertIn("【逐SKU规则档案】", result["ai_draft_summary"])
+        self.assertEqual(before["structured"], result["structured"])
+        self.assertEqual(before["raw_text"], result["raw_text"])
 
     def test_sync_without_mtop_token_shows_login_message_before_api_call(self):
         self.state.configure({"cookie": "unb=seller-1"})

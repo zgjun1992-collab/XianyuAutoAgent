@@ -273,6 +273,8 @@ class V2Store(AppStore):
                     raw_text TEXT NOT NULL DEFAULT '',
                     ai_summary TEXT NOT NULL DEFAULT '',
                     structured_json TEXT NOT NULL DEFAULT '{}',
+                    ai_draft_summary TEXT NOT NULL DEFAULT '',
+                    ai_draft_structured_json TEXT NOT NULL DEFAULT '{}',
                     platform_summary TEXT NOT NULL DEFAULT '',
                     thumbnail_url TEXT NOT NULL DEFAULT '',
                     image_urls_json TEXT NOT NULL DEFAULT '[]',
@@ -457,6 +459,8 @@ class V2Store(AppStore):
                 "first_reply_generated_at": "TEXT NOT NULL DEFAULT ''",
                 "first_reply_template_version": "INTEGER NOT NULL DEFAULT 0",
                 "source_update_json": "TEXT NOT NULL DEFAULT '{}'",
+                "ai_draft_summary": "TEXT NOT NULL DEFAULT ''",
+                "ai_draft_structured_json": "TEXT NOT NULL DEFAULT '{}'",
                 "coupon_type": "TEXT NOT NULL DEFAULT ''",
                 "coupon_type_custom": "TEXT NOT NULL DEFAULT ''",
                 "coupon_instructions": "TEXT NOT NULL DEFAULT ''",
@@ -551,6 +555,7 @@ class V2Store(AppStore):
                 ) VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(item_id) DO UPDATE SET title=excluded.title,
                     raw_text=excluded.raw_text,enabled=excluded.enabled,
+                    ai_draft_summary='',ai_draft_structured_json='{}',
                     manual_edited=1,sync_status='manual_edited',updated_at=excluded.updated_at""",
                 (
                     item_id,
@@ -937,6 +942,75 @@ class V2Store(AppStore):
         if isinstance(structured, dict) and isinstance(structured.get("time_rules"), list):
             self.replace_time_rules(item_id, structured["time_rules"])
         self.refresh_first_reply(item_id, force=False)
+        return self.get_v2_product(item_id)
+
+    def save_ai_draft(self, item_id: str, summary: str, structured: Dict) -> Dict:
+        """Save a review-only AI draft without changing live customer knowledge."""
+        current = self.get_v2_product(item_id)
+        if not current:
+            raise ValueError("商品不存在")
+        summary = str(summary or "").strip()
+        if not summary:
+            raise ValueError("模型未返回可用的归纳结果")
+        structured_text = json.dumps(structured or {}, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE v2_products SET ai_draft_summary=?,ai_draft_structured_json=?,
+                   updated_at=? WHERE item_id=?""",
+                (summary, structured_text, self._now(), item_id),
+            )
+        self.add_event(
+            "ai_knowledge_draft", f"生成商品 {item_id} 的AI知识草稿（尚未生效）",
+            {"sku_profile_count": len((structured or {}).get("sku_profiles") or [])},
+        )
+        return self.get_v2_product(item_id)
+
+    def adopt_ai_draft(self, item_id: str, summary: str) -> Dict:
+        """Atomically promote the reviewed text and its matching structure."""
+        current = self.get_v2_product(item_id)
+        if not current:
+            raise ValueError("商品不存在")
+        reviewed = str(summary or "").strip()
+        if not reviewed:
+            raise ValueError("当前没有可采纳的归纳知识")
+        generated = str(current.get("ai_draft_summary") or "").strip()
+        draft_structured = current.get("ai_draft_structured") or {}
+        baseline = generated or str(current.get("ai_summary") or "").strip()
+        edited = bool(baseline) and reviewed != baseline
+        if edited:
+            adopted_structured = {}
+        elif draft_structured:
+            adopted_structured = draft_structured
+        else:
+            adopted_structured = current.get("structured") or {}
+        now = self._now()
+        structured_text = json.dumps(adopted_structured, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE v2_products SET raw_text=?,ai_summary=?,structured_json=?,
+                   ai_draft_summary=?,ai_draft_structured_json=?,manual_edited=1,
+                   sync_status='manual_edited',updated_at=? WHERE item_id=?""",
+                (reviewed, reviewed, structured_text, reviewed, structured_text, now, item_id),
+            )
+            conn.execute(
+                """INSERT INTO knowledge_versions(
+                    item_id,raw_text,ai_summary,structured_json,note,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (item_id, reviewed, reviewed, structured_text,
+                 "采纳人工编辑的AI草稿" if edited else "采纳AI整理草稿", now),
+            )
+        self.replace_time_rules(
+            item_id,
+            adopted_structured.get("time_rules")
+            if isinstance(adopted_structured, dict) and isinstance(adopted_structured.get("time_rules"), list)
+            else [],
+        )
+        self.save_product(item_id, current.get("title", ""), reviewed, bool(current.get("enabled", True)))
+        self.refresh_first_reply(item_id, force=False)
+        self.add_event(
+            "ai_knowledge_adopted", f"采纳商品 {item_id} 的AI知识草稿",
+            {"edited": edited, "sku_profile_count": len(adopted_structured.get("sku_profiles") or []) if isinstance(adopted_structured, dict) else 0},
+        )
         return self.get_v2_product(item_id)
 
     @staticmethod
@@ -1597,7 +1671,7 @@ class V2Store(AppStore):
             if not isinstance(container, dict):
                 continue
             for key in (
-                "products", "product_options", "skus", "sku", "商品规格", "商品列表",
+                "sku_profiles", "products", "product_options", "skus", "sku", "商品规格", "商品列表",
                 "规格", "价格", "售价", "代金券规格",
             ):
                 value = container.get(key)
@@ -1609,21 +1683,49 @@ class V2Store(AppStore):
             option for option in (cls._normalize_product_option(record) for record in candidates)
             if option
         ]
-        # Manual knowledge remains authoritative when it already contains real
-        # prices. If it only lists denominations and rules, recover the missing
-        # sale facts from the marketplace's current SKU payload.
-        if not raw_options:
-            structured_options.extend(cls._platform_product_options(product))
-        # For automatically synced products the real SKU payload is the price
-        # authority; listing prose is only a supplement. A human-edited product
-        # keeps the manually saved text as the highest authority.
-        sku_authoritative = bool(structured_options) and not bool(product.get("manual_edited"))
-        output = list(structured_options if sku_authoritative else raw_options)
+        platform_options = cls._platform_product_options(product)
+        # Real marketplace SKUs are always the authority for sellable identity
+        # and price, including after a manual prose edit. Text and AI may enrich
+        # a matching SKU's usage rules but may not create another sellable SKU.
+        if platform_options:
+            output = list(platform_options)
+            supplements = structured_options + raw_options
+            for option in supplements:
+                name_key = normalize_text(option.get("name") or "").lower()
+                exact = next((
+                    current for current in output
+                    if name_key and normalize_text(current.get("name") or "").lower() == name_key
+                ), None)
+                if exact is None:
+                    face = cls._format_number(option.get("face_value") or "")
+                    matches = [
+                        current for current in output
+                        if face and cls._format_number(current.get("face_value") or "") == face
+                    ]
+                    exact = matches[0] if len(matches) == 1 else None
+                if exact is None:
+                    continue
+                for field in ("applicable_time", "composition", "max_stack"):
+                    if not exact.get(field) and option.get(field):
+                        exact[field] = option[field]
+                if option.get("availability_explicit"):
+                    exact.update({
+                        "availability": option.get("availability") or "available",
+                        "stock": option.get("stock") or "",
+                        "availability_explicit": True,
+                    })
+            sku_authoritative = True
+            supplements = []
+        else:
+            if not raw_options:
+                structured_options.extend(platform_options)
+            sku_authoritative = bool(structured_options) and not bool(product.get("manual_edited"))
+            output = list(structured_options if sku_authoritative else raw_options)
+            supplements = raw_options if sku_authoritative else structured_options
         seen = {
             (item.get("face_value", ""), item.get("applicable_time", ""), item.get("sale_price", ""))
             for item in output
         }
-        supplements = raw_options if sku_authoritative else structured_options
         for option in supplements:
             key = (option.get("face_value", ""), option.get("applicable_time", ""), option.get("sale_price", ""))
             if key in seen and option.get("availability_explicit"):
@@ -2182,7 +2284,7 @@ class V2Store(AppStore):
             if not isinstance(container, dict):
                 continue
             for key in (
-                "sale_options", "packages", "package_options", "套餐规格", "套餐列表",
+                "sku_profiles", "sale_options", "packages", "package_options", "套餐规格", "套餐列表",
                 "products", "product_options", "skus", "sku", "商品规格", "商品列表", "规格",
             ):
                 value = container.get(key)
@@ -5851,6 +5953,80 @@ class V2Store(AppStore):
         # authoritative user/page text says so explicitly.
         return "仅支持同面额代金券叠加。" if options else ""
 
+    @classmethod
+    def _sku_profile_summary(cls, structured: Dict) -> str:
+        """Render one self-contained archive per SKU, inheriting common rules by default."""
+        profiles = structured.get("sku_profiles") if isinstance(structured, dict) else []
+        if not isinstance(profiles, list):
+            return ""
+        common = structured.get("common_rules") if isinstance(structured, dict) else {}
+        common = common if isinstance(common, dict) else {}
+        labels = {
+            "brand": "品牌", "product_name": "商品名称", "validity": "有效期",
+            "available_dates": "可用日期", "unavailable_dates": "不可用日期",
+            "applicable_stores": "适用门店", "applicable_regions": "适用地区",
+            "applicable_day": "适用日期", "meal_period": "餐段", "use_hours": "使用时段",
+            "applicable_time": "适用时间", "audience": "适用人群",
+            "height_age_rule": "身高/年龄", "people_count": "人数",
+            "stack_rule": "叠加规则", "max_stack": "最多使用张数",
+            "mixed_denomination": "不同面额混用", "benefit_combination": "优惠同享",
+            "reservation": "预约", "waiting": "等位", "dine_in": "堂食",
+            "takeout": "外带", "delivery": "外卖", "usage_scope": "适用范围",
+            "excluded_items": "不适用项目", "extra_fees": "额外收费",
+            "delivery_platform": "发券平台", "delivery_method": "发券方式",
+            "claim_method": "领取方式", "redeem_method": "核销方式",
+            "refund_rule": "退款规则", "invoice_rule": "发票规则",
+            "purchase_limit": "购买限制", "usage_limit": "使用限制", "notes": "其他说明",
+            "package_contents": "套餐内容", "minimum_spend": "最低消费",
+            "change_cash_rule": "找零/兑现金", "per_table_limit": "每桌限用",
+            "per_order_limit": "每单限用", "daily_limit": "每日限用",
+            "usage_frequency": "使用次数", "advance_booking": "提前预约",
+            "holiday_policy": "节假日规则", "branch_price_difference": "门店差价",
+            "substitution_rule": "替换规则", "expiry_rule": "过期规则",
+        }
+        ignored = {
+            "sku_key", "sku_name", "name", "option_type", "sale_price", "face_value",
+            "composition", "stock", "sellable", "source_evidence", "inherited_common_fields",
+        }
+        blocks = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            name = str(profile.get("sku_name") or profile.get("name") or "商品规格").strip()
+            core = []
+            if str(profile.get("sale_price") or "").strip():
+                core.append(f"售价{cls._format_number(profile.get('sale_price'))}元")
+            if str(profile.get("face_value") or "").strip():
+                core.append(f"面额{cls._format_number(profile.get('face_value'))}元")
+            if str(profile.get("composition") or "").strip():
+                core.append(f"发券{profile.get('composition')}")
+            if str(profile.get("stock") or "").strip():
+                core.append(f"库存{profile.get('stock')}")
+            if profile.get("sellable") is False:
+                core.append("当前不可售")
+            merged = dict(common)
+            merged.update({key: value for key, value in profile.items() if value not in (None, "", [], {})})
+            details = []
+            for key, label in labels.items():
+                if key in ignored:
+                    continue
+                value = merged.get(key)
+                text = cls._fact_value_text(value)
+                if text:
+                    details.append(f"{label}：{text.rstrip('。；; ')}")
+            for key, value in merged.items():
+                if key in ignored or key in labels:
+                    continue
+                text = cls._fact_value_text(value)
+                if text:
+                    details.append(f"{key}：{text.rstrip('。；; ')}")
+            body = [f"〔{name}〕"]
+            if core:
+                body.append("；".join(core))
+            body.extend(details)
+            blocks.append("\n".join(body))
+        return "\n\n".join(blocks)
+
     def build_knowledge_summary(self, product: Dict) -> str:
         facts = (product.get("structured") or {}).get("facts") or {}
         options = self.extract_product_options(product)
@@ -5858,6 +6034,9 @@ class V2Store(AppStore):
         sections = []
         if lines:
             sections.append("【商品规格】\n" + "\n".join(lines))
+        profile_summary = self._sku_profile_summary(product.get("structured") or {})
+        if profile_summary:
+            sections.append("【逐SKU规则档案】\n" + profile_summary)
         stack_rule = self._stack_rule(facts, str(product.get("raw_text") or ""), options)
         if stack_rule:
             sections.append("【叠加规则】\n" + stack_rule)
@@ -6036,6 +6215,11 @@ class V2Store(AppStore):
             result["structured"] = {}
             result.pop("structured_json", None)
         try:
+            result["ai_draft_structured"] = json.loads(result.pop("ai_draft_structured_json") or "{}")
+        except json.JSONDecodeError:
+            result["ai_draft_structured"] = {}
+            result.pop("ai_draft_structured_json", None)
+        try:
             result["source_update"] = json.loads(result.pop("source_update_json") or "{}")
         except json.JSONDecodeError:
             result["source_update"] = {}
@@ -6064,6 +6248,11 @@ class V2Store(AppStore):
             except json.JSONDecodeError:
                 item["structured"] = {}
                 item.pop("structured_json", None)
+            try:
+                item["ai_draft_structured"] = json.loads(item.pop("ai_draft_structured_json") or "{}")
+            except json.JSONDecodeError:
+                item["ai_draft_structured"] = {}
+                item.pop("ai_draft_structured_json", None)
             try:
                 item["source_update"] = json.loads(item.pop("source_update_json") or "{}")
             except json.JSONDecodeError:
@@ -6785,7 +6974,7 @@ class V2Store(AppStore):
         if not isinstance(structured, dict):
             return []
         records = []
-        for key in ("products", "product_options", "skus", "sku", "商品规格", "商品列表", "规格"):
+        for key in ("sku_profiles", "products", "product_options", "skus", "sku", "商品规格", "商品列表", "规格"):
             value = structured.get(key)
             if isinstance(value, list):
                 records.extend(item for item in value if isinstance(item, dict))
@@ -6922,7 +7111,26 @@ class V2Store(AppStore):
                 and str(existing.get("sale_price") or "")
                 == str(option.get("sale_price") or "")
             ), None)
+            if not same:
+                commercial_matches = [
+                    existing for existing in options
+                    if existing.get("_platform_sku")
+                    and str(existing.get("option_type") or "") == "voucher"
+                    and self._format_number(existing.get("face_value") or "")
+                    == self._format_number(option.get("face_value") or "")
+                    and bool(self._format_number(option.get("face_value") or ""))
+                    and self._format_number(existing.get("sale_price") or "")
+                    == self._format_number(option.get("sale_price") or "")
+                    and normalize_text(existing.get("composition") or "")
+                    == normalize_text(option.get("composition") or "")
+                ]
+                same = commercial_matches[0] if len(commercial_matches) == 1 else None
             if same:
+                same_key = self.sku_key_for_option(same)
+                if key != same_key:
+                    aliases = same.setdefault("_configuration_alias_keys", [])
+                    if key not in aliases:
+                        aliases.append(key)
                 for field in ("face_value", "composition", "max_stack"):
                     if not same.get(field) and option.get(field):
                         same[field] = option[field]
