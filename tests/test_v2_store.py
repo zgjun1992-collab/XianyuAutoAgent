@@ -133,6 +133,13 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual({}, adopted["structured"])
         self.assertEqual([], self.store.list_time_rules("10001"))
 
+    def test_ai_draft_cannot_fall_back_to_stale_effective_summary(self):
+        self.store.save_ai_summary(
+            "10001", "页面旧摘要289元", {"facts": {"价格": "289元"}},
+        )
+        with self.assertRaisesRegex(ValueError, "没有已生成的AI草稿"):
+            self.store.adopt_ai_draft("10001", "页面旧摘要289元")
+
     def test_each_sku_profile_inherits_common_rules_but_keeps_own_difference(self):
         text = self.store._sku_profile_summary({
             "common_rules": {"stack_rule": "同面额可无限叠加", "meal_period": "全天"},
@@ -3984,6 +3991,22 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("88元", result["reply"])
         self.assertNotIn("118元", result["reply"])
 
+    def test_tomorrow_evening_party_combines_compatible_buffet_skus(self):
+        self.store.save_v2_product(
+            "10001", "经典自助餐",
+            "工作日午市单人经典自助：售价135元\n"
+            "全周通用单人经典自助：售价157元\n"
+            "工作日双人经典自助：售价297元",
+        )
+        result = self.store.resolve_deterministic("10001", "明晚三人多少钱")
+        self.assertEqual("price", result["kind"])
+        self.assertIn("明天晚餐3人购买建议", result["reply"])
+        self.assertIn("工作日双人经典自助", result["reply"])
+        self.assertIn("全周通用单人经典自助", result["reply"])
+        self.assertIn("合计454元", result["reply"])
+        self.assertNotIn("午市单人经典自助", result["reply"])
+        self.assertNotIn("暂时无法准确报价", result["reply"])
+
     def test_in_store_purchase_question_is_not_a_store_name(self):
         result = self.store.resolve_deterministic("10001", "现在在门店，能买吗")
         self.assertEqual("stock", result["kind"])
@@ -5278,24 +5301,19 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("儿童票，共58元", followup["reply"])
         self.assertIn("合计352元", followup["reply"])
 
-    def test_buffet_total_people_asks_composition_then_calculates(self):
+    def test_buffet_bare_people_count_defaults_to_adults(self):
         self.store.save_v2_product(
             "10001", "身份票自助餐",
             """工作日午餐成人票：售价88元
 工作日午餐老人票：售价68元
 工作日午餐儿童票：售价48元""",
         )
-        first = self.store.resolve_deterministic(
-            "10001", "工作日午餐4人自助怎么买",
+        result = self.store.resolve_deterministic(
+            "10001", "工作日午餐3人自助怎么买",
         )
-        self.assertIn("分别有几位成人、老人、儿童", first["reply"])
-        self.assertEqual("audience_mix", first["query_context_update"]["price_filters"]["awaiting"])
-
-        followup = self.store.resolve_deterministic(
-            "10001", "2位成人1位老人1位儿童",
-            store_context=first["query_context_update"],
-        )
-        self.assertIn("合计292元", followup["reply"])
+        self.assertIn("3位成人需要购买3张工作日午餐成人票", result["reply"])
+        self.assertIn("共264元", result["reply"])
+        self.assertNotIn("分别有几位", result["reply"])
 
     def test_family_package_does_not_drop_extra_senior(self):
         self.store.save_v2_product(

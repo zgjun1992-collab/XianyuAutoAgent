@@ -974,9 +974,10 @@ class V2Store(AppStore):
         if not reviewed:
             raise ValueError("当前没有可采纳的归纳知识")
         generated = str(current.get("ai_draft_summary") or "").strip()
+        if not generated:
+            raise ValueError("当前没有已生成的AI草稿，请先重新归纳")
         draft_structured = current.get("ai_draft_structured") or {}
-        baseline = generated or str(current.get("ai_summary") or "").strip()
-        edited = bool(baseline) and reviewed != baseline
+        edited = reviewed != generated
         if edited:
             adopted_structured = {}
         elif draft_structured:
@@ -2393,7 +2394,7 @@ class V2Store(AppStore):
         meal_periods = cls._meal_periods(text)
         if re.search(r"今天|今日|今晚|今早|今晨|今中午", text):
             day_types = ["weekend" if datetime.now(CHINA_TZ).weekday() >= 5 else "weekday"]
-        elif "明天" in text or "明日" in text:
+        elif re.search(r"明天|明日|明早|明晨|明中午|明午|明晚", text):
             tomorrow = datetime.now(CHINA_TZ) + timedelta(days=1)
             day_types = ["weekend" if tomorrow.weekday() >= 5 else "weekday"]
         target_date = cls._query_date(text)
@@ -2415,7 +2416,7 @@ class V2Store(AppStore):
             "meal_periods": meal_periods,
             "date_label": (
                 "今天" if re.search(r"今天|今日|今晚|今早|今晨|今中午", text)
-                else "明天" if re.search(r"明天|明日", text)
+                else "明天" if re.search(r"明天|明日|明早|明晨|明中午|明午|明晚", text)
                 else f"{target_date.month}月{target_date.day}日" if target_date else ""
             ),
             "target_amount": target_amount,
@@ -2529,7 +2530,7 @@ class V2Store(AppStore):
         now = datetime.now(CHINA_TZ)
         if re.search(r"今天|今日|今晚|今早|今晨|今中午", text):
             return now
-        if re.search(r"明天|明日", text):
+        if re.search(r"明天|明日|明早|明晨|明中午|明午|明晚", text):
             return now + timedelta(days=1)
         if "后天" in text:
             return now + timedelta(days=2)
@@ -2660,7 +2661,10 @@ class V2Store(AppStore):
             if explicit and not compatible:
                 return {"reply": f"{target.month}月{target.day}日没有可用的商品选项哦。",
                         "source": "当前商品日期适用范围", "decision": "allow", "kind": "date_use"}
-            prefix = "明天" if re.search(r"明天|明日", text) else f"{target.month}月{target.day}日"
+            prefix = (
+                "明天" if re.search(r"明天|明日|明早|明晨|明中午|明午|明晚", text)
+                else f"{target.month}月{target.day}日"
+            )
             if explicit and compatible:
                 brand = self.extract_brand(product)
                 choices = "\n".join(
@@ -2909,6 +2913,15 @@ class V2Store(AppStore):
         }
         party_counts = self._people_counts(text)
         party_count = party_counts[0] if len(party_counts) == 1 else None
+
+        # A bare party count such as “三人” means three adults by business rule.
+        # Only explicit child/senior/student wording switches to identity fares.
+        # This default also applies when the catalogue contains those fares.
+        if (
+            not counts and party_count and "adult" in option_audiences
+            and (price_intent or availability_intent or plan_intent)
+        ):
+            counts = {"adult": party_count}
 
         # “老人和小孩怎么收费” asks for the fare table, not for an assumed
         # one-senior/one-child order. Quote every requested real SKU and wait
@@ -3465,10 +3478,11 @@ class V2Store(AppStore):
         ]
         package_matches = [option for option in matched if option.get("option_type") == "package"]
 
-        # Prefer an exact people-count package. If none exists, a clearly
-        # identified unrestricted single-person option can safely be multiplied
-        # by the requested party size. Identity fares and explicit one-item
-        # purchase limits are deliberately excluded.
+        # Prefer an exact people-count package. If none exists, combine compatible
+        # one-/multi-person packages from the same product family. This covers
+        # natural buffet questions such as “明晚三人多少钱” with one double ticket
+        # plus one single ticket, while keeping unrelated buffet tiers isolated.
+        # Identity fares and explicit one-item purchase limits are excluded.
         people_count = slots.get("people_count")
         if (
             people_count and int(people_count) > 1 and not matched
@@ -3481,46 +3495,123 @@ class V2Store(AppStore):
                     holiday_covers_weekend,
                 )
             ]
-            if slots.get("day_type"):
-                specific = [
-                    option for option in time_compatible
-                    if slots["day_type"] in (option.get("day_types") or [])
-                    or (holiday_covers_weekend and "holiday" in (option.get("day_types") or []))
-                ]
-                if specific:
-                    time_compatible = specific
-            if slots.get("meal_period"):
-                specific = [
-                    option for option in time_compatible
-                    if slots["meal_period"] in (option.get("meal_periods") or [])
-                ]
-                if specific:
-                    time_compatible = specific
-            single_options = []
+            package_options = []
             for option in time_compatible:
                 evidence = " ".join(str(option.get(key) or "") for key in ("name", "applicable_time"))
+                people_values = sorted(set(option.get("people_counts") or []))
                 if (
                     option.get("option_type") == "package"
-                    and (option.get("people_counts") or []) == [1]
+                    and len(people_values) == 1
+                    and 0 < people_values[0] <= int(people_count)
                     and not (option.get("audience_types") or [])
                     and not re.search(r"(?:每单|每人|限购|仅限购买|最多购买)\s*1\s*(?:份|张|套|个)", evidence)
                 ):
-                    single_options.append(option)
-            if len(single_options) == 1:
-                option = single_options[0]
-                total = Decimal(str(option.get("sale_price"))) * int(people_count)
-                name = str(option.get("name") or "单人商品").strip()
-                selected_context = {
-                    "selected_sku_key": self.sku_key_for_option(option),
-                    "selected_sku_name": name,
-                }
-                return {
-                    "reply": (
-                        f"{people_count}人需要购买{people_count}份{name}，"
+                    package_options.append(option)
+
+            def package_family(option: Dict) -> str:
+                name = normalize_text(option.get("name") or "")
+                return re.sub(
+                    r"全周(?:通用)?|每天|每日|工作日|平日|周末|节假日|法定假日|"
+                    r"早餐|早市|午餐|午市|晚餐|晚市|下午茶|全天|全时段|"
+                    r"单人|双人|三人|四人|五人|六人|七人|八人|九人|十人|\d+人",
+                    "", name,
+                ) or name
+
+            plans = []
+            for family in dict.fromkeys(package_family(item) for item in package_options):
+                family_options = [
+                    item for item in package_options if package_family(item) == family
+                ]
+                by_capacity = {}
+                for option in family_options:
+                    capacity = int((option.get("people_counts") or [0])[0])
+                    by_capacity.setdefault(capacity, []).append(option)
+                choices = []
+                for capacity, rows in by_capacity.items():
+                    preferred = rows
+                    if slots.get("day_type"):
+                        specific = [
+                            item for item in preferred
+                            if slots["day_type"] in (item.get("day_types") or [])
+                            or (holiday_covers_weekend and "holiday" in (item.get("day_types") or []))
+                        ]
+                        if specific:
+                            preferred = specific
+                    if slots.get("meal_period"):
+                        specific = [
+                            item for item in preferred
+                            if slots["meal_period"] in (item.get("meal_periods") or [])
+                        ]
+                        if specific:
+                            preferred = specific
+                    option = min(preferred, key=lambda item: Decimal(str(item.get("sale_price"))))
+                    choices.append((capacity, option))
+
+                best = {0: (Decimal("0"), 0, [])}
+                for covered in range(1, int(people_count) + 1):
+                    candidates = []
+                    for capacity, option in choices:
+                        previous_plan = best.get(covered - capacity)
+                        if not previous_plan:
+                            continue
+                        candidates.append((
+                            previous_plan[0] + Decimal(str(option.get("sale_price"))),
+                            previous_plan[1] + 1,
+                            previous_plan[2] + [(capacity, option)],
+                        ))
+                    if candidates:
+                        best[covered] = min(candidates, key=lambda item: (item[0], item[1]))
+                if int(people_count) in best:
+                    plans.append(best[int(people_count)])
+
+            if plans:
+                total, item_count, selected = min(plans, key=lambda item: (item[0], item[1]))
+                grouped = []
+                for capacity, option in selected:
+                    key = self.sku_key_for_option(option)
+                    existing = next((row for row in grouped if row[0] == key), None)
+                    if existing:
+                        existing[3] += 1
+                    else:
+                        grouped.append([key, option, capacity, 1])
+                if len(grouped) == 1 and grouped[0][2] == 1:
+                    _, option, _, quantity = grouped[0]
+                    name = str(option.get("name") or "单人商品").strip()
+                    reply = (
+                        f"{people_count}人需要购买{quantity}份{name}，"
                         f"单价{self._format_number(option.get('sale_price'))}元，"
                         f"共{self._format_number(total)}元。"
-                    ),
-                    "source": "当前日期可用的单人商品规格与人数换算",
+                    )
+                    selected_context = {
+                        "selected_sku_key": self.sku_key_for_option(option),
+                        "selected_sku_name": name,
+                    }
+                else:
+                    parts = []
+                    for _, option, capacity, quantity in grouped:
+                        subtotal = Decimal(str(option.get("sale_price"))) * quantity
+                        name = str(option.get("name") or "当前商品").strip()
+                        if quantity == 1:
+                            parts.append(
+                                f"购买1份{name}（适用{capacity}人），{self._format_number(subtotal)}元"
+                            )
+                        else:
+                            parts.append(
+                                f"购买{quantity}份{name}（每份适用{capacity}人），"
+                                f"单价{self._format_number(option.get('sale_price'))}元，"
+                                f"小计{self._format_number(subtotal)}元"
+                            )
+                    subject = self._conditional_subject({
+                        "date_label": slots.get("date_label", ""),
+                        "day_type": slots.get("day_type", ""),
+                        "meal_period": slots.get("meal_period", ""),
+                        "people_count": people_count,
+                    })
+                    reply = f"{subject}购买建议：" + "；".join(parts) + f"，合计{self._format_number(total)}元。"
+                    selected_context = {}
+                return {
+                    "reply": reply,
+                    "source": "当前日期和餐段可用的真实套餐组合",
                     "decision": "allow", "kind": "price",
                     "query_context_update": {**context_update, **selected_context},
                 }
@@ -9383,7 +9474,8 @@ class V2Store(AppStore):
             or grounded_store_match
         )
         temporal_subject = bool(re.search(
-            r"今天|今日|明天|明日|后天|周末|工作日|平日|节假日|法定假日|"
+            r"今天|今日|今晚|今早|今中午|明天|明日|明早|明晨|明中午|明午|明晚|后天|"
+            r"周末|工作日|平日|节假日|法定假日|"
             r"中秋(?:节|期间)?|国庆(?:节|期间)?|春节|元旦|劳动节|"
             r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?",
             message_key,
@@ -10306,13 +10398,13 @@ class V2Store(AppStore):
 
             condition_match = re.search(
                 r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
-                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市|"
+                r"今天|今晚|明天|明早|明中午|明晚|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市|"
                 r"\d+\s*(?:人|位)|[一二两三四五六七八九十]+\s*(?:个)?(?:人|位)",
                 text,
             )
             explicit_calendar_or_meal = bool(re.search(
                 r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
-                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
+                r"今天|今晚|明天|明早|明中午|明晚|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
                 text,
             ))
             # “单人满贯全天” can be the exact SKU name. When the buyer asks to
@@ -10346,7 +10438,7 @@ class V2Store(AppStore):
         if purchase_reply and not has_store_task:
             condition_match = re.search(
                 r"(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}(?:日|号)?|"
-                r"今天|今晚|明天|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
+                r"今天|今晚|明天|明早|明中午|明晚|后天|周末|工作日|平日|节假日|早餐|中午|午餐|晚上|晚餐|晚市",
                 text,
             )
             if condition_match:
@@ -12378,7 +12470,7 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         " ", text,
     )
     text = re.sub(
-        r"本周末|周末|工作日|平日|节假日|法定假日|今天|明天|后天|"
+        r"本周末|周末|工作日|平日|节假日|法定假日|今天|今晚|明天|明早|明中午|明晚|后天|"
         r"早餐|中午|午餐|晚上|晚餐|"
         r"成人|大人|儿童|小孩|学生|老人|女士|"
         r"代金券|现金券|抵扣券|套餐券|团购券|电子券|美团券|卡券|券",
