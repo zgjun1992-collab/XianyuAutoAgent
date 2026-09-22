@@ -93,6 +93,35 @@ class BackendSyncTests(unittest.TestCase):
         self.assertIn("工作日午餐可用", self.summary_calls[0])
         self.assertNotIn("image_url", self.summary_calls[0])
 
+    @patch("v2_backend.XianyuApis", FakeXianyuApis)
+    def test_lists_lightweight_onsale_products_for_selective_sync(self):
+        options = self.state.list_onsale_products()
+
+        self.assertEqual(1, len(options))
+        self.assertEqual("30003", options[0]["item_id"])
+        self.assertEqual("小江溪125元代金券", options[0]["title"])
+        self.assertFalse(options[0]["imported"])
+        self.assertFalse(options[0]["ignored"])
+        self.assertEqual([], self.summary_calls)
+
+    @patch("v2_backend.XianyuApis", FakeXianyuApis)
+    def test_selective_sync_only_updates_requested_product(self):
+        self.state.store.save_v2_product("keep-online", "保留商品", "人工资料")
+
+        result = self.state.sync_products(["30003"])
+
+        self.assertEqual(1, result["synced"])
+        self.assertEqual("onsale", self.state.store.get_v2_product("keep-online")["item_status"])
+        self.assertIsNotNone(self.state.store.get_v2_product("30003"))
+
+    @patch("v2_backend.XianyuApis", FakeXianyuApis)
+    def test_selective_sync_reports_missing_onsale_product(self):
+        result = self.state.sync_products(["missing-item"])
+
+        self.assertEqual(0, result["synced"])
+        self.assertEqual("missing-item", result["failed"][0]["item_id"])
+        self.assertIn("未在当前闲鱼在售商品中找到", result["failed"][0]["error"])
+
     @unittest.skipUnless(os.name == "nt", "Windows named mutex only")
     def test_only_one_live_service_can_own_the_same_data_directory(self):
         other = BackendState(self.temp.name)
@@ -226,6 +255,33 @@ class BackendSyncTests(unittest.TestCase):
         self.state.configure({"cookie": cookie})
         self.assertEqual([cookie], self.state.live.updated)
         self.assertEqual("reconnecting", self.state.service_status)
+
+    def test_promotion_qr_upload_refreshes_first_reply_and_test_preview(self):
+        self.state.store.save_v2_product(
+            "promo-1", "推广商品", "推广购买链接：https://example.invalid/buy",
+            coupon_type="promotion",
+        )
+        source = os.path.join(self.temp.name, "qr.png")
+        with open(source, "wb") as handle:
+            handle.write(b"qr-image")
+        asset = self.state.save_image_asset({
+            "item_id": "promo-1",
+            "source_path": source,
+            "name": "推广购买二维码",
+            "purpose": "promotion_qr",
+            "trigger_words": "推广购买二维码",
+            "reply_text": "",
+            "enabled": True,
+        })
+        product = self.state.store.get_v2_product("promo-1")
+        self.assertIn(f"{{$图片:{asset['id']}}}", product["first_reply_text"])
+        preview = self.state.test_reply({"item_id": "promo-1", "message": "下单链接发我"})
+        self.assertEqual("allow", preview["action"])
+        self.assertEqual(asset["id"], preview["image_asset"]["id"])
+
+        self.state.delete_image_asset(asset["id"])
+        product = self.state.store.get_v2_product("promo-1")
+        self.assertNotIn(f"{{$图片:{asset['id']}}}", product["first_reply_text"])
 
 
 if __name__ == "__main__":

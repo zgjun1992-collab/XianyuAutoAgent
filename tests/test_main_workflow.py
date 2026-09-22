@@ -469,6 +469,35 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
         self.assertEqual("assistant", live.context_manager.messages[0][3])
 
+    async def test_promotion_purchase_question_uses_only_the_sales_reply_path(self):
+        live = self.make_live()
+        live.app_store.promotion_purchase_intent = lambda message: message == "怎么买"
+        live.send_message_template = AsyncMock()
+        product = {
+            "coupon_type": "promotion", "item_status": "onsale",
+            "first_reply_enabled": True,
+            "first_reply_text": "推广首次回复{$图片:7}", "first_reply_manual": False,
+        }
+
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-1", "item-1", product,
+            {"first_reply_sent": 0}, "怎么买",
+        )
+
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
+        self.assertEqual({"scope-1"}, live.app_store.first_reply_scopes)
+
+        ordinary_live = self.make_live()
+        ordinary_live.app_store.promotion_purchase_intent = lambda _message: False
+        ordinary_live.send_message_template = AsyncMock(return_value="推广首次回复")
+        sent = await ordinary_live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-2", "item-1", product,
+            {"first_reply_sent": 0}, "门店能用吗",
+        )
+        self.assertTrue(sent)
+        ordinary_live.send_message_template.assert_awaited_once()
+
     async def test_purchase_order_first_message_sends_only_configured_welcome(self):
         live = self.make_live()
         live.send_message_template = AsyncMock()

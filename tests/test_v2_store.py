@@ -2071,6 +2071,58 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("review", quality["decision"])
         self.assertIn("卡券质量问题", quality["reply"])
 
+    def test_mixed_coupon_delivery_uses_sku_knowledge_without_fixed_platform(self):
+        self.store.save_ai_summary("10001", "双渠道规格", {
+            "facts": {},
+            "common_rules": {},
+            "sku_profiles": [
+                {
+                    "sku_key": "mt-100", "sku_name": "美团100元代金券",
+                    "face_value": "100", "sale_price": "69",
+                    "delivery_platform": "美团", "delivery_method": "付款后发送美团券领取信息",
+                    "claim_method": "在美团账户领取", "redeem_method": "到店出示美团券核销",
+                },
+                {
+                    "sku_key": "dy-200", "sku_name": "抖音200元代金券",
+                    "face_value": "200", "sale_price": "138",
+                    "delivery_platform": "抖音", "delivery_method": "付款后发送抖音券领取信息",
+                    "claim_method": "在抖音账户领取", "redeem_method": "到店出示抖音券核销",
+                },
+            ],
+            "time_rules": [],
+        })
+        product = self.store.save_v2_product(
+            "10001", "测试双渠道代金券", "美团100元69元；抖音200元138元",
+            coupon_type="mixed",
+        )
+        self.assertEqual("混合发卡", self.store.coupon_type_display(product))
+        self.assertNotIn("当前商品为美团电子券", product["first_reply_text"])
+        self.assertNotIn("当前商品为电子券码", product["first_reply_text"])
+        self.assertIn("美团100元代金券：发券平台：美团", product["first_reply_text"])
+        self.assertIn("抖音200元代金券：发券平台：抖音", product["first_reply_text"])
+
+        all_channels = self.store.resolve_deterministic("10001", "这是美团还是抖音券")
+        self.assertEqual("coupon_type", all_channels["kind"])
+        self.assertIn("美团100元代金券", all_channels["reply"])
+        self.assertIn("抖音200元代金券", all_channels["reply"])
+        self.assertNotIn("当前商品发放的是混合发卡", all_channels["reply"])
+
+        selected = self.store.resolve_deterministic("10001", "100元的是美团券吗")
+        self.assertEqual("coupon_type", selected["kind"])
+        self.assertIn("美团100元代金券", selected["reply"])
+        self.assertNotIn("抖音200元代金券", selected["reply"])
+
+    def test_mixed_coupon_missing_channel_asks_for_sku_without_guessing(self):
+        product = self.store.save_v2_product(
+            "10001", "测试代金券", "100元代金券售价69元", coupon_type="mixed",
+        )
+        self.assertNotIn("【发券方式】", product["first_reply_text"])
+        result = self.store.resolve_deterministic("10001", "发的什么券")
+        self.assertEqual("coupon_type", result["kind"])
+        self.assertIn("暂未标明", result["reply"])
+        self.assertNotIn("美团", result["reply"])
+        self.assertNotIn("电子券码", result["reply"])
+
     def test_unredeemed_statement_clarifies_instead_of_inventing_expiry(self):
         result = self.store.resolve_deterministic("10001", "我没验")
         self.assertEqual("aftersale_clarify", result["kind"])
@@ -2316,6 +2368,61 @@ class V2StoreTests(unittest.TestCase):
         )
         cooldown = self.store.resolve_image_asset("10001", "再发一次套餐图", "scope-a")
         self.assertEqual("cooldown", cooldown["status"])
+
+    def test_promotion_mode_routes_purchase_intents_to_link_and_qr(self):
+        self.store.save_v2_product(
+            "10001", "测试推广商品",
+            "推广下单链接：https://example.invalid/promo\n周末可用。",
+            coupon_type="promotion",
+        )
+        image_path = os.path.join(self.temp.name, "promotion-qr.png")
+        with open(image_path, "wb") as handle:
+            handle.write(b"promotion-qr")
+        asset = self.store.save_image_asset({
+            "item_id": "10001",
+            "name": "推广购买二维码",
+            "purpose": "promotion_qr",
+            "trigger_words": ["推广购买二维码"],
+            "reply_text": "",
+            "file_path": image_path,
+            "enabled": True,
+        })
+        product = self.store.refresh_first_reply("10001", force=True)
+        self.assertIn("请不要在闲鱼页面下单或付款", product["first_reply_text"])
+        self.assertIn("https://example.invalid/promo", product["first_reply_text"])
+        self.assertIn(f"{{$图片:{asset['id']}}}", product["first_reply_text"])
+
+        for question in (
+            "这个多少钱", "怎么买", "把二维码发我", "发我个购买链接", "二维码呢",
+            "我去哪扫", "可以在闲鱼直接下单吗", "能拍吗", "想买三张", "拍哪个",
+            "购买链接打不开",
+        ):
+            result = self.store.resolve_deterministic("10001", question)
+            self.assertIsNotNone(result, question)
+            self.assertEqual("promotion_purchase", result["kind"], question)
+            self.assertEqual(asset["id"], result["image_asset_id"])
+            self.assertIn("https://example.invalid/promo", result["reply"])
+            self.assertIn("不要在闲鱼页面下单或付款", result["reply"])
+
+        # The reserved QR must not leak into ordinary keyword-image matching.
+        self.assertIsNone(self.store.resolve_image_asset(
+            "10001", "推广购买二维码", "promotion-scope",
+        ))
+
+    def test_promotion_mode_never_invents_a_missing_purchase_entry(self):
+        self.store.save_v2_product(
+            "10001", "未配置入口的推广商品", "仅限堂食。", coupon_type="promotion",
+        )
+        result = self.store.resolve_deterministic("10001", "购买链接发我")
+        self.assertEqual("promotion_purchase", result["kind"])
+        self.assertNotIn("http", result["reply"])
+        self.assertIn("尚未配置", result["reply"])
+
+        aftersale = self.store.resolve_deterministic(
+            "10001", "已经付款但不想要了，怎么退款",
+            order_context={"status": "已付款"},
+        )
+        self.assertNotEqual("promotion_purchase", aftersale["kind"])
 
     def test_keyword_rule_can_send_text_without_an_image(self):
         asset = self.store.save_image_asset({
@@ -2882,6 +2989,68 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("2张100元代金券", result["reply"])
         self.assertIn("共支付108元", result["reply"])
         self.assertIn("剩余100元", result["reply"])
+
+    def test_bundle_amount_and_quantity_followup_use_delivered_coupon_count(self):
+        self.store.save_v2_product(
+            "10001", "美团代金券", "仅支持同面额代金券叠加，每次最多使用5张。",
+        )
+        platform = json.dumps({
+            "title": "美团代金券",
+            "sku": [
+                {"priceInCent": 14980, "propertyList": [
+                    {"actualValueText": "美团100（100x2）"},
+                ]},
+                {"priceInCent": 22470, "propertyList": [
+                    {"actualValueText": "美团100（100x3）"},
+                ]},
+            ],
+        }, ensure_ascii=False)
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE v2_products SET platform_summary=? WHERE item_id=?",
+                (platform, "10001"),
+            )
+
+        first = self.store.resolve_deterministic("10001", "300多少钱")
+        self.assertIn("美团100（100x3）", first["reply"])
+        self.assertIn("售价224.7元", first["reply"])
+        self.assertIn("发100元券3张", first["reply"])
+        self.assertNotIn("没有300元代金券", first["reply"])
+
+        # Exercise the contextual path as well: a prior 300-yuan target must
+        # be replaced by the new delivered-coupon quantity, not multiplied.
+        context = {
+            "price_filters": {
+                "target_amount": "300", "amount_kind": "option", "intent": "price",
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            },
+        }
+        followup = self.store.resolve_deterministic("10001", "3张多少钱", context)
+        self.assertIn("美团100（100x3）", followup["reply"])
+        self.assertIn("售价224.7元", followup["reply"])
+        self.assertIn("发3张100元代金券", followup["reply"])
+        self.assertIn("抵扣300元", followup["reply"])
+        self.assertNotIn("6张", followup["reply"])
+        self.assertNotIn("449.4", followup["reply"])
+
+        skus = self.store.list_product_skus("10001")
+        self.assertEqual(2, len({sku["sku_key"] for sku in skus}))
+
+    def test_sku_name_bundle_overrides_single_face_fallback(self):
+        product = {
+            "title": "NEED韩国料理代金券",
+            "structured": {"products": [{
+                "name": "NEED韩国料理200（100x2）",
+                "option_type": "voucher", "face_value": "200", "sale_price": "132",
+            }]},
+        }
+        options = self.store.extract_product_options(product)
+        self.assertEqual("100元券2张", options[0]["composition"])
+        reply = self.store.price_reply(product, "200多少钱")
+        self.assertIn("NEED韩国料理200（100x2）", reply)
+        self.assertIn("售价132元", reply)
+        self.assertIn("发100元券2张", reply)
+        self.assertNotIn("发200元券1张", reply)
 
     def test_how_much_offsets_value_queries_the_existing_option(self):
         self.store.save_v2_product("10001", "测试代金券", "300元代金券：售价235元")
@@ -5502,6 +5671,44 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertIn("老人票", fares["reply"])
         self.assertIn("儿童票", fares["reply"])
+
+    def test_knowledge_summary_separates_purchase_combinations_and_rule_sections(self):
+        raw_text = (
+            "幻师COMMUNE代金券\n"
+            "①250元代金券：173.8（最多叠加2张）\n"
+            "②300元代金券：211.8（最多叠加2张）\n"
+            "③500（250x2）：347.6。\n"
+            "④600（300x2）：427.6。\n"
+            "2026年9月25日、9月30日及国庆节10月1日至10月7日不可用。\n"
+            "仅适用于餐品、酒水。\n"
+            "仅限堂食。\n"
+            "无需预约，消费高峰期可能需要等位。"
+        )
+        product = {
+            "title": "幻师COMMUNE代金券",
+            "raw_text": raw_text,
+            "platform_summary": json.dumps({
+                "title": "幻师COMMUNE代金券",
+                "description": raw_text,
+                "sku": [
+                    {"skuName": "250元代金券", "priceInCent": 17380},
+                    {"skuName": "300元代金券", "priceInCent": 21180},
+                ],
+            }, ensure_ascii=False),
+            "structured": {"facts": {}},
+        }
+
+        summary = self.store.build_knowledge_summary(product)
+
+        self.assertIn("【组合购买方案】", summary)
+        self.assertIn("500元方案：购买250元代金券×2，共支付347.6元", summary)
+        self.assertIn("600元方案：购买300元代金券×2，按当前SKU售价应付423.6元", summary)
+        self.assertIn("原文写427.6元，价格冲突，需人工确认", summary)
+        self.assertIn("【不可用日期】", summary)
+        self.assertIn("【适用范围】", summary)
+        self.assertIn("【使用规则】", summary)
+        self.assertNotIn("③500", summary)
+        self.assertNotIn("④600", summary)
 
 
 if __name__ == "__main__":

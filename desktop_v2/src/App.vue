@@ -23,6 +23,7 @@ const updater = reactive({ status: 'idle', currentVersion: '', availableVersion:
 const policyDraft = reactive({ reply_mode: 'auto', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
 const imageDraft = reactive({ id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
+const promotionQrDraft = reactive({ source_path: '' })
 const imagePreviews = reactive({})
 const testDraft = reactive({ item_id: '', message: '', store_query: '', at: '' })
 const testResult = ref(null)
@@ -31,6 +32,10 @@ const showVersions = ref(false)
 const productTab = ref('knowledge')
 const productSearch = ref('')
 const syncReport = ref(null)
+const showProductSyncPicker = ref(false)
+const onsaleSyncProducts = ref([])
+const selectedSyncProductIds = ref([])
+const syncPickerSearch = ref('')
 const aftersaleProductId = ref('')
 const storeListSelection = ref('')
 const selectedStoreSkuKey = ref('')
@@ -63,6 +68,13 @@ const filteredProducts = computed(() => {
   if (!query) return snapshot.products
   return snapshot.products.filter((item) => `${item.title} ${item.item_id}`.toLowerCase().includes(query))
 })
+const filteredOnsaleSyncProducts = computed(() => {
+  const query = syncPickerSearch.value.trim().toLowerCase()
+  if (!query) return onsaleSyncProducts.value
+  return onsaleSyncProducts.value.filter((item) => `${item.title} ${item.item_id}`.toLowerCase().includes(query))
+})
+const promotionQrAsset = computed(() => productDraft.image_assets.find((item) => item.purpose === 'promotion_qr') || null)
+const keywordImageAssets = computed(() => productDraft.image_assets.filter((item) => item.purpose !== 'promotion_qr'))
 const firstReplyParts = computed(() => {
   const source = String(productDraft.first_reply_text || '')
   const parts = []
@@ -211,6 +223,7 @@ function selectProduct(product) {
   selectStoreSku(selected)
   importDraft.item_ids = [product.item_id]
   testDraft.item_id = product.item_id
+  promotionQrDraft.source_path = ''
   loadImagePreviews(product.image_assets || [])
 }
 
@@ -223,6 +236,7 @@ function newProduct() {
   Object.assign(productDraft, { item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', ai_draft_summary: '', structured: {}, ai_draft_structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '' })
   selectStoreSku(null)
   resetImageDraft()
+  promotionQrDraft.source_path = ''
   productTab.value = 'knowledge'
 }
 
@@ -274,6 +288,32 @@ async function syncProducts() {
   await refresh()
   if (snapshot.products.length) selectProduct(snapshot.products[0])
   notify(`同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${syncReport.value.failed.length ? `，失败 ${syncReport.value.failed.length} 个` : ''}`)
+}
+
+async function openProductSyncPicker() {
+  const login = await desktop.syncCookie()
+  if (!login.saved) return notify('尚未检测到闲鱼登录，请先在内置闲鱼页面登录', 'error')
+  onsaleSyncProducts.value = await call('POST', '/products/onsale-options', {})
+  selectedSyncProductIds.value = []
+  syncPickerSearch.value = ''
+  showProductSyncPicker.value = true
+}
+
+function selectAllVisibleSyncProducts() {
+  selectedSyncProductIds.value = filteredOnsaleSyncProducts.value
+    .filter((item) => !item.ignored)
+    .map((item) => item.item_id)
+}
+
+async function syncSelectedProducts() {
+  const itemIds = [...selectedSyncProductIds.value]
+  if (!itemIds.length) return notify('请先选择需要同步的在售商品', 'error')
+  syncReport.value = await call('POST', '/products/sync-selected', { item_ids: itemIds })
+  showProductSyncPicker.value = false
+  await refresh()
+  const selected = snapshot.products.find((item) => item.item_id === itemIds[0])
+  if (selected) selectProduct(selected)
+  notify(`选中商品同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${syncReport.value.failed.length ? `，失败 ${syncReport.value.failed.length} 个` : ''}`)
 }
 
 async function applySourceUpdate(section) {
@@ -714,6 +754,44 @@ async function toggleService() {
   refresh(true).catch(() => {})
 }
 
+async function choosePromotionQr() {
+  const file = await desktop.chooseImage()
+  if (!file) return
+  promotionQrDraft.source_path = file
+}
+
+async function savePromotionQr() {
+  if (!productDraft.item_id.trim()) return notify('请先填写并保存商品ID', 'error')
+  if (!promotionQrDraft.source_path && !promotionQrAsset.value) return notify('请先选择推广二维码图片', 'error')
+  if (!snapshot.products.some((item) => item.item_id === productDraft.item_id)) await saveProduct()
+  await call('POST', `/products/${encodeURIComponent(productDraft.item_id)}/images`, {
+    id: promotionQrAsset.value?.id || null,
+    source_path: promotionQrDraft.source_path,
+    name: '推广购买二维码',
+    purpose: 'promotion_qr',
+    trigger_words: '推广购买二维码',
+    reply_text: '',
+    enabled: true
+  })
+  promotionQrDraft.source_path = ''
+  await refresh()
+  const product = snapshot.products.find((item) => item.item_id === productDraft.item_id)
+  if (product) selectProduct(product)
+  notify('推广购买二维码已保存')
+}
+
+async function deletePromotionQr() {
+  const asset = promotionQrAsset.value
+  if (!asset || !window.confirm('确定删除当前推广购买二维码吗？')) return
+  await call('DELETE', `/images/${asset.id}`)
+  delete imagePreviews[asset.id]
+  promotionQrDraft.source_path = ''
+  await refresh()
+  const product = snapshot.products.find((item) => item.item_id === productDraft.item_id)
+  if (product) selectProduct(product)
+  notify('推广购买二维码已删除')
+}
+
 async function openXianyuVerification() {
   route.value = 'workspace'
   await nextTick()
@@ -928,15 +1006,19 @@ onBeforeUnmount(() => {
 
       <section v-else-if="route === 'products'" class="page split-page">
         <aside class="list-panel">
-          <div class="list-head"><div><span class="eyebrow">在售商品</span><h3>{{ snapshot.products.length }} 个商品</h3></div><button class="square primary" @click="newProduct">＋</button></div>
-          <button class="sync-products" @click="syncProducts">↻ 同步闲鱼在售商品</button>
-          <input v-model="productSearch" class="search-input" placeholder="搜索商品名称或ID" />
-          <div v-for="product in filteredProducts" :key="product.item_id" :class="['product-row', { active: productDraft.item_id === product.item_id }]" @click="openProductKnowledge(product)">
-            <span class="product-thumb image"><img v-if="product.thumbnail_url" :src="product.thumbnail_url" /><b v-else>券</b></span>
-            <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? '闲鱼来源有更新' : product.sync_status === 'summary_failed' ? 'AI归纳失败·已保留页面资料' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
-            <span class="product-row-actions"><button class="ai-toggle" :class="{ off: !product.enabled }" :title="product.enabled ? '点击关闭当前商品AI客服' : '点击开启当前商品AI客服'" @click.stop="setProductAiEnabled(product)">{{ product.enabled ? 'AI开' : 'AI关' }}</button><button title="打开商品页面" @click.stop="confirmOpenProductPage(product)">↗</button><button class="danger-icon" title="删除本地商品" @click.stop="deleteProduct(product)">删</button></span>
+          <div class="product-list-toolbar">
+            <div class="list-head"><div><span class="eyebrow">在售商品</span><h3>{{ snapshot.products.length }} 个商品</h3></div><button class="square primary" @click="newProduct">＋</button></div>
+            <input v-model="productSearch" class="search-input" placeholder="搜索商品标题或ID" />
+            <div class="product-sync-actions"><button class="sync-products" @click="syncProducts">↻ 同步全部</button><button class="sync-products selected" @click="openProductSyncPicker">✓ 同步选中</button></div>
           </div>
-          <div v-if="!filteredProducts.length" class="empty-card">登录闲鱼后点击“同步闲鱼在售商品”。</div>
+          <div class="product-list-scroll">
+            <div v-for="product in filteredProducts" :key="product.item_id" :class="['product-row', { active: productDraft.item_id === product.item_id }]" @click="openProductKnowledge(product)">
+              <span class="product-thumb image"><img v-if="product.thumbnail_url" :src="product.thumbnail_url" /><b v-else>券</b></span>
+              <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? '闲鱼来源有更新' : product.sync_status === 'summary_failed' ? 'AI归纳失败·已保留页面资料' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
+              <span class="product-row-actions"><button class="ai-toggle" :class="{ off: !product.enabled }" :title="product.enabled ? '点击关闭当前商品AI客服' : '点击开启当前商品AI客服'" @click.stop="setProductAiEnabled(product)">{{ product.enabled ? 'AI开' : 'AI关' }}</button><button title="打开商品页面" @click.stop="confirmOpenProductPage(product)">↗</button><button class="danger-icon" title="删除本地商品" @click.stop="deleteProduct(product)">删</button></span>
+            </div>
+            <div v-if="!filteredProducts.length" class="empty-card">{{ productSearch ? '没有找到匹配标题或ID的商品。' : '登录闲鱼后点击“同步全部”或“同步选中”。' }}</div>
+          </div>
         </aside>
         <div class="editor-panel scroll-panel">
           <div class="product-hero">
@@ -944,7 +1026,7 @@ onBeforeUnmount(() => {
             <div><span class="eyebrow">商品卡片</span><h2>{{ productDraft.title || '新建商品' }}</h2><p>ID {{ productDraft.item_id || '—' }} · ¥{{ productDraft.price || '—' }} · {{ productDraft.item_status === 'offline' ? '已下架' : '在售' }}</p></div>
             <div class="button-row"><button :class="productDraft.enabled ? '' : 'danger'" @click="setProductAiEnabled(productDraft)">{{ productDraft.enabled ? '关闭本商品AI客服' : '开启本商品AI客服' }}</button><button @click="confirmOpenProductPage()">打开商品页面</button><button @click="loadVersions">版本记录</button><button class="danger" @click="deleteProduct(productDraft)">删除</button><button class="primary" @click="saveProduct">保存人工修改</button></div>
           </div>
-          <div class="product-tabs"><button :class="{ active: productTab === 'knowledge' }" @click="productTab = 'knowledge'">商品资料与知识</button><button :class="{ active: productTab === 'firstReply' }" @click="productTab = 'firstReply'">首次回复</button><button :class="{ active: productTab === 'stores' }" @click="productTab = 'stores'">适用门店 <b>{{ productDraft.store_lists.reduce((sum, item) => sum + item.store_count, 0) }}</b></button><button :class="{ active: productTab === 'images' }" @click="productTab = 'images'">关键词触发 <b>{{ productDraft.image_assets.length }}</b></button></div>
+          <div class="product-tabs"><button :class="{ active: productTab === 'knowledge' }" @click="productTab = 'knowledge'">商品资料与知识</button><button :class="{ active: productTab === 'firstReply' }" @click="productTab = 'firstReply'">首次回复</button><button :class="{ active: productTab === 'stores' }" @click="productTab = 'stores'">适用门店 <b>{{ productDraft.store_lists.reduce((sum, item) => sum + item.store_count, 0) }}</b></button><button :class="{ active: productTab === 'images' }" @click="productTab = 'images'">关键词触发 <b>{{ keywordImageAssets.length }}</b></button></div>
 
           <article v-if="productDraft.sync_status === 'source_updated'" class="knowledge-card source-update-card">
             <div class="knowledge-head"><div><span class="number">新</span><div><strong>闲鱼页面发现更新</strong><small>当前生效知识、门店和首次回复均未被覆盖；只有你确认的项目才会修改。</small></div></div><span class="authority">等待人工允许</span></div>
@@ -964,13 +1046,22 @@ onBeforeUnmount(() => {
               <label>闲鱼商品ID<input v-model="productDraft.item_id" :readonly="snapshot.products.some((item) => item.item_id === productDraft.item_id)" placeholder="粘贴商品链接中的 itemId" /></label>
               <label>商品名称<input v-model="productDraft.title" placeholder="例如：小江溪125元代金券" /></label>
             </div>
-            <article class="knowledge-card coupon-settings"><div class="knowledge-head"><div><span class="number">券</span><div><strong>卡券类型与领取方式</strong><small>新商品默认使用美团卡券，也可在此为特殊商品单独修改</small></div></div><span class="authority">人工确定</span></div><div class="form-grid two"><label>卡券类型<select v-model="productDraft.coupon_type"><option value="meituan">美团卡券（默认）</option><option value="douyin">抖音卡券</option><option value="merchant_miniapp">商家小程序券</option><option value="electronic_code">普通电子券码</option><option value="purchase_order">代买单</option><option value="other">其他卡券</option></select></label><label v-if="productDraft.coupon_type === 'other'">其他卡券名称<input v-model="productDraft.coupon_type_custom" placeholder="例如：支付宝卡券" /></label><label class="wide">领取、查看与核销说明<textarea v-model="productDraft.coupon_instructions" rows="3" placeholder="留空使用当前卡券类型的默认说明；也可填写你的真实发券与核销流程。"></textarea></label></div></article>
+            <article class="knowledge-card coupon-settings"><div class="knowledge-head"><div><span class="number">券</span><div><strong>卡券类型与领取方式</strong><small>不同 SKU 来自不同渠道选“混合发卡”；只引导微信推广购买选“推广模式”</small></div></div><span class="authority">人工确定</span></div><div class="form-grid two"><label>卡券类型<select v-model="productDraft.coupon_type"><option value="meituan">美团卡券（默认）</option><option value="douyin">抖音卡券</option><option value="merchant_miniapp">商家小程序券</option><option value="electronic_code">普通电子券码</option><option value="mixed">混合发卡（按 SKU 知识）</option><option value="promotion">推广模式（微信链接/二维码）</option><option value="purchase_order">代买单</option><option value="other">其他卡券</option></select></label><label v-if="productDraft.coupon_type === 'other'">其他卡券名称<input v-model="productDraft.coupon_type_custom" placeholder="例如：支付宝卡券" /></label><label class="wide">领取、查看与核销说明<textarea v-model="productDraft.coupon_instructions" rows="3" :placeholder="productDraft.coupon_type === 'mixed' ? '可选填；留空时按各 SKU 商品知识中的发券渠道、领取和核销方式回复。' : productDraft.coupon_type === 'promotion' ? '可选填实际领取与核销方式；推广链接请填写到下方人工知识中。' : '留空使用当前卡券类型的默认说明；也可填写你的真实发券与核销流程。'"></textarea></label></div></article>
             <div class="source-panel">
               <div class="knowledge-head"><div><span class="number">1</span><div><strong>闲鱼页面原始资料</strong><small>自动读取商品文案；图片只作界面预览，不会交给AI识别 · 最后同步 {{ productDraft.last_synced_at || '尚未同步' }}</small></div></div><span class="authority secondary">自动来源</span></div>
               <div class="source-images"><img v-for="url in productDraft.image_urls.slice(0, 8)" :key="url" :src="url" /></div>
               <pre>{{ productDraft.platform_summary || '当前没有同步到闲鱼页面资料。' }}</pre>
             </div>
-            <article class="knowledge-card raw"><div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div><textarea v-model="productDraft.raw_text" rows="16" placeholder="在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。"></textarea><div class="button-row end"><button class="primary" @click="saveProduct">保存当前生效知识</button></div></article>
+            <article class="knowledge-card raw">
+              <div class="knowledge-head"><div><span class="number">2</span><div><strong>人工补充与当前生效知识</strong><small>可直接增加、纠正或删除细节；保存后作为客服最高优先级知识，闲鱼同步和AI归纳不会自动覆盖</small></div></div><span class="authority">最高优先级</span></div>
+              <textarea v-model="productDraft.raw_text" rows="16" :placeholder="productDraft.coupon_type === 'promotion' ? '请在这里填写推广下单链接，并补充商品规格、使用规则、领取与核销方式。客服只读取这里明确提供的推广链接。' : '在这里补充规格、价格、发券组成、有效期、不可用日期、堂食/外带、预约、优惠同享、退款及其他真实规则。'"></textarea>
+              <div v-if="productDraft.coupon_type === 'promotion'" class="promotion-qr-box">
+                <div class="promotion-qr-copy"><strong>推广购买二维码</strong><small>买家咨询购买、价格、下单、链接或二维码时，将劝阻其在闲鱼付款，并发送这里的二维码引导微信购买。</small><span>{{ promotionQrDraft.source_path ? promotionQrDraft.source_path.split(/[\\/]/).pop() : promotionQrAsset ? '已上传推广二维码' : '尚未上传二维码' }}</span></div>
+                <div v-if="promotionQrAsset" class="promotion-qr-preview"><img v-if="imagePreviews[promotionQrAsset.id]" :src="imagePreviews[promotionQrAsset.id]" /><span v-else>二维码</span></div>
+                <div class="button-row"><button type="button" @click="choosePromotionQr">{{ promotionQrAsset ? '更换二维码' : '选择二维码' }}</button><button class="primary" type="button" @click="savePromotionQr">保存二维码</button><button v-if="promotionQrAsset" class="danger" type="button" @click="deletePromotionQr">删除</button></div>
+              </div>
+              <div class="button-row end"><button class="primary" @click="saveProduct">保存当前生效知识</button></div>
+            </article>
             <article class="knowledge-card ai"><div class="knowledge-head"><div><span class="number">3</span><div><strong>AI整理草稿</strong><small>真实在售SKU的名称、售价和发券内容优先；每个SKU单独归档时间、门店、叠加和人群规则。草稿确认采纳前不会影响客服回复</small></div></div><button class="primary soft" @click="summarizeProduct">✦ 根据当前知识重新归纳</button></div><textarea v-if="productDraft.ai_draft_summary" v-model="productDraft.ai_draft_summary" rows="16" placeholder="AI会按真实SKU分别整理品牌、名称、价格、日期/餐段、门店、叠加、人群、核销、退款及风险字段；资料未说明的内容不得猜测。"></textarea><div v-else class="empty-summary">尚未生成AI草稿，请点击上方按钮重新归纳。</div><div v-if="productDraft.ai_draft_summary" class="button-row end"><button class="primary" @click="adoptEditedAiSummary">确认并采纳为当前知识</button></div><div v-if="(productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)?.length" class="risk-box"><strong>需要人工核对</strong><span v-for="field in (productDraft.ai_draft_structured?.risk_fields || productDraft.structured?.risk_fields)" :key="field">{{ field }}</span></div></article>
           </div>
 
@@ -1017,7 +1108,7 @@ onBeforeUnmount(() => {
                 <button class="primary large" @click="saveImageAsset">{{ imageDraft.id ? '保存修改' : '添加到当前商品' }}</button>
               </div>
             </article>
-            <div class="asset-grid"><article v-for="asset in productDraft.image_assets" :key="asset.id" class="asset-card"><div class="asset-preview"><img v-if="imagePreviews[asset.id]" :src="imagePreviews[asset.id]" /><span v-else>图片</span></div><div class="asset-copy"><div><strong>{{ asset.name }}</strong><em :class="{ off: !asset.enabled }">{{ asset.enabled ? '已启用' : '已停用' }}</em></div><p>{{ asset.purpose || '未填写用途说明' }}</p><small>触发词：{{ asset.trigger_words.join('、') }}</small><span>{{ asset.reply_text || '使用默认随图回复' }}</span></div><div class="asset-actions"><button @click="editImageAsset(asset)">编辑</button><button class="danger" @click="deleteImageAsset(asset)">删除</button></div></article><div v-if="!productDraft.image_assets.length" class="empty-card wide">当前商品还没有套餐图片。添加后，客服只会在这个商品的会话中匹配和发送。</div></div>
+            <div class="asset-grid"><article v-for="asset in keywordImageAssets" :key="asset.id" class="asset-card"><div class="asset-preview"><img v-if="imagePreviews[asset.id]" :src="imagePreviews[asset.id]" /><span v-else>图片</span></div><div class="asset-copy"><div><strong>{{ asset.name }}</strong><em :class="{ off: !asset.enabled }">{{ asset.enabled ? '已启用' : '已停用' }}</em></div><p>{{ asset.purpose || '未填写用途说明' }}</p><small>触发词：{{ asset.trigger_words.join('、') }}</small><span>{{ asset.reply_text || '使用默认随图回复' }}</span></div><div class="asset-actions"><button @click="editImageAsset(asset)">编辑</button><button class="danger" @click="deleteImageAsset(asset)">删除</button></div></article><div v-if="!keywordImageAssets.length" class="empty-card wide">当前商品还没有套餐图片。添加后，客服只会在这个商品的会话中匹配和发送。</div></div>
           </div>
 
         </div>
@@ -1069,6 +1160,22 @@ onBeforeUnmount(() => {
 
     <div v-if="loading && route !== 'workspace'" class="loading-overlay"><div class="spinner"></div><span>正在处理…</span></div>
     <transition name="toast"><div v-if="toast.visible" :class="['toast', toast.kind]">{{ toast.text }}</div></transition>
+    <div v-if="showProductSyncPicker" class="modal-backdrop" @click.self="showProductSyncPicker = false">
+      <div class="modal sync-picker-modal">
+        <div class="modal-head"><div><h3>选择要同步的在售商品</h3><small>这里只读取在售商品清单；确认后仅抓取并归纳选中的商品。</small></div><button @click="showProductSyncPicker = false">×</button></div>
+        <div class="sync-picker-tools"><input v-model="syncPickerSearch" placeholder="搜索闲鱼商品标题或ID" /><button @click="selectAllVisibleSyncProducts">选择当前结果</button><button @click="selectedSyncProductIds = []">清空</button></div>
+        <div class="sync-picker-list">
+          <label v-for="product in filteredOnsaleSyncProducts" :key="product.item_id" :class="{ ignored: product.ignored }">
+            <input v-model="selectedSyncProductIds" type="checkbox" :value="product.item_id" :disabled="product.ignored" />
+            <span class="product-thumb image"><img v-if="product.thumbnail_url" :src="product.thumbnail_url" /><b v-else>券</b></span>
+            <span><strong>{{ product.title }}</strong><small>ID {{ product.item_id }} · ¥{{ product.price || '—' }}</small></span>
+            <em>{{ product.ignored ? '已忽略' : product.imported ? '已导入' : '新商品' }}</em>
+          </label>
+          <div v-if="!filteredOnsaleSyncProducts.length" class="empty-card">没有找到匹配的在售商品。</div>
+        </div>
+        <div class="sync-picker-footer"><span>已选择 {{ selectedSyncProductIds.length }} 个</span><div><button @click="showProductSyncPicker = false">取消</button><button class="primary" :disabled="!selectedSyncProductIds.length" @click="syncSelectedProducts">同步选中商品</button></div></div>
+      </div>
+    </div>
     <div v-if="showVersions" class="modal-backdrop" @click.self="showVersions = false"><div class="modal"><div class="modal-head"><h3>知识库版本记录</h3><button @click="showVersions = false">×</button></div><div class="version-list"><article v-for="version in versions" :key="version.id"><strong>{{ version.note }}</strong><time>{{ version.created_at }}</time><p>{{ version.raw_text.slice(0, 220) || '空资料' }}{{ version.raw_text.length > 220 ? '…' : '' }}</p><div class="button-row end"><button class="primary" @click="restoreVersion(version)">启用此版本</button></div></article></div></div></div>
   </div>
 </template>

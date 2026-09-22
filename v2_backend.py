@@ -24,7 +24,7 @@ from XianyuApis import XianyuApis
 from app_store import PolicyEngine
 from main import XianyuLive
 from utils.xianyu_utils import trans_cookies
-from v2_store import V2Store, extract_store_query
+from v2_store import PROMOTION_QR_PURPOSE, V2Store, extract_store_query
 
 
 SUMMARY_PROMPT = """你是餐饮电子券商品资料整理员。用户会提供一个JSON资料包。
@@ -37,7 +37,9 @@ canonical_skus中的sku_key、名称、售价、券面额、发券组成、库�
 不能覆盖或新增可售SKU。文案价格与SKU冲突时以SKU为准，并把冲突写入source_conflicts和risk_fields；
 文案出现但canonical_skus中不存在的规格不得作为可售规格输出。canonical_skus为空时，才允许从文字中提取规格和售价。
 页面同时售卖多个SKU时，必须为每个SKU建立一条独立sku_profiles档案；不同SKU的适用日期、餐段、不可用日期、
-门店、人群、叠加上限、附加费等规则不得合并或互相继承。文案没有标注规格差异时，页面级规则默认写入common_rules并适用于全部SKU，
+门店、人群、叠加上限、附加费、发券平台、发券方式、领取方式和核销方式等规则不得合并或互相继承。同一商品不同SKU来自不同发券渠道时，
+必须分别写入各SKU的delivery_platform、delivery_method、claim_method和redeem_method，禁止归纳成一个商品级固定卡券类型。
+文案没有标注规格差异时，页面级规则默认写入common_rules并适用于全部SKU，
 不要求原文额外写“全规格通用”；一旦文案明确某个或多个SKU使用不同规则，相应字段必须拆入各自档案，公共规则不得覆盖差异项。
 确实无法判断规则归属时放入risk_fields，不要强行分配。
 输出一个JSON对象，字段必须为：
@@ -46,6 +48,9 @@ summary: 适合客服快速阅读的中文分点摘要字符串；在原文有�
 退款、发票及下单前提醒；禁止输出Python对象、JSON片段或字段字典；
 risk_fields: 需要人工确认的高风险或矛盾字段数组；
 source_conflicts: 数据冲突数组，每项包含field、sku_key、higher_priority_value、lower_priority_value、chosen_value、reason；
+purchase_combinations: 文案明确列出的组合购买方案数组，不属于可售SKU。每项字段为target_face_value、composition、sale_price、source_evidence；
+例如“500（250x2）：347.6”表示购买2份250元规格的组合方案，不得把500元新增为可售SKU；组合售价与canonical_skus按份数计算的价格不一致时，
+必须保留原文价格，同时把冲突写入source_conflicts和risk_fields，不得静默选择其中一个价格；
 facts: 仅存放页面级公共事实的对象，按原文明确信息尽量完整提取，允许包含品牌、商品类型、有效期、适用日期、不可用日期、
 使用时间、预约要求、堂食限制、外带限制、外卖限制、包间限制、酒水限制、锅底限制、服务费限制、
 优惠同享、叠加规则、不同面额混用、单次或每桌限用数量、退款规则、发码平台、发码方式、领取方式、
@@ -485,10 +490,10 @@ class BackendState:
         walk(value)
         return found
 
-    def sync_products(self):
+    def _xianyu_sync_client(self, require_ai=True):
         if not self.runtime["cookie"]:
             raise ValueError("请先在内置闲鱼页面登录")
-        if not self.runtime["api_key"]:
+        if require_ai and not self.runtime["api_key"]:
             raise ValueError("请先保存百炼API Key，才能根据商品文案生成初始知识")
         api = XianyuApis(interactive=False)
         cookies = trans_cookies(self.runtime["cookie"])
@@ -498,20 +503,72 @@ class BackendState:
         user_id = cookies.get("unb")
         if not user_id:
             raise ValueError("登录信息中缺少闲鱼账号ID，请重新登录后同步")
+        return api, user_id
+
+    @staticmethod
+    def _onsale_card_data(card):
+        data = card.get("cardData") if isinstance(card, dict) else None
+        data = data if isinstance(data, dict) else (card if isinstance(card, dict) else {})
+        status = data.get("itemStatus", 0)
+        if str(status).lower() not in {"0", "onsale", "on_sale", "selling"}:
+            return None
+        detail = data.get("detailParams") or {}
+        item_id = str(detail.get("itemId") or data.get("id") or "").strip()
+        if not item_id:
+            return None
+        thumbnail = str((data.get("picInfo") or {}).get("picUrl") or "").strip()
+        if thumbnail.startswith("//"):
+            thumbnail = "https:" + thumbnail
+        return {
+            "item_id": item_id,
+            "title": str(data.get("title") or detail.get("title") or item_id).strip(),
+            "price": str((data.get("priceInfo") or {}).get("price") or detail.get("soldPrice") or ""),
+            "thumbnail_url": thumbnail,
+            "card": card,
+        }
+
+    def list_onsale_products(self):
+        """Return the lightweight seller catalogue without fetching every detail page."""
+        api, user_id = self._xianyu_sync_client(require_ai=False)
+        output = []
+        for card in api.get_all_user_items(user_id):
+            item = self._onsale_card_data(card)
+            if not item:
+                continue
+            local = self.store.get_v2_product(item["item_id"])
+            output.append({
+                "item_id": item["item_id"],
+                "title": item["title"],
+                "price": item["price"],
+                "thumbnail_url": item["thumbnail_url"],
+                "imported": bool(local),
+                "ignored": self.store.is_product_ignored(item["item_id"]),
+            })
+        return output
+
+    def sync_products(self, item_ids=None):
+        api, user_id = self._xianyu_sync_client(require_ai=True)
         cards = api.get_all_user_items(user_id)
+        requested = {
+            str(item_id or "").strip() for item_id in (item_ids or [])
+            if str(item_id or "").strip()
+        }
+        selected_only = item_ids is not None
+        if selected_only and not requested:
+            raise ValueError("请至少选择一个在售商品")
         synced = []
         skipped = []
         failed = []
         for card in cards:
+            listed = self._onsale_card_data(card)
+            if not listed:
+                continue
+            item_id = listed["item_id"]
+            if selected_only and item_id not in requested:
+                continue
             data = card.get("cardData") if isinstance(card, dict) else None
             data = data if isinstance(data, dict) else (card if isinstance(card, dict) else {})
-            status = data.get("itemStatus", 0)
-            if str(status).lower() not in {"0", "onsale", "on_sale", "selling"}:
-                continue
             detail = data.get("detailParams") or {}
-            item_id = str(detail.get("itemId") or data.get("id") or "").strip()
-            if not item_id:
-                continue
             if self.store.is_product_ignored(item_id):
                 skipped.append(item_id)
                 continue
@@ -607,11 +664,20 @@ class BackendState:
                 time.sleep(0.12)
             except Exception as exc:
                 failed.append({"item_id": item_id, "error": str(exc)})
+        if selected_only:
+            found = set(synced) | set(skipped) | {
+                str(entry.get("item_id") or "") for entry in failed
+            }
+            for missing_id in sorted(requested - found):
+                failed.append({"item_id": missing_id, "error": "未在当前闲鱼在售商品中找到"})
         seen = synced + skipped + [entry["item_id"] for entry in failed]
-        self.store.mark_unsynced_products(seen)
+        if not selected_only:
+            self.store.mark_unsynced_products(seen)
+        event_type = "selected_product_sync" if selected_only else "product_sync"
+        scope_label = "选中商品" if selected_only else "闲鱼在售商品"
         self.store.add_event(
-            "product_sync",
-            f"闲鱼在售商品同步完成：更新 {len(synced)}，未变化 {len(skipped)}，失败 {len(failed)}",
+            event_type,
+            f"{scope_label}同步完成：更新 {len(synced)}，未变化 {len(skipped)}，失败 {len(failed)}",
             {"synced": synced, "skipped": skipped, "failed": failed},
         )
         return {"synced": len(synced), "unchanged": len(skipped), "failed": failed, "total": len(seen)}
@@ -625,7 +691,10 @@ class BackendState:
         previous = self.store.get_image_asset(int(payload["id"])) if payload.get("id") else None
         if source_path and not os.path.isfile(source_path):
             raise FileNotFoundError("关键词规则图片不存在")
-        if not source_path and not str(payload.get("reply_text") or "").strip():
+        if (
+            not source_path and not str(payload.get("reply_text") or "").strip()
+            and not str((previous or {}).get("file_path") or "").strip()
+        ):
             raise ValueError("请至少填写一段触发后发送的文字或选择图片")
         extension = os.path.splitext(source_path)[1].lower() if source_path else ""
         if extension and extension not in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -651,6 +720,8 @@ class BackendState:
                     os.remove(previous["file_path"])
                 except OSError:
                     pass
+            if str(saved.get("purpose") or "") == PROMOTION_QR_PURPOSE:
+                self.store.refresh_first_reply(item_id, force=False)
             return saved
         except Exception:
             try:
@@ -668,6 +739,8 @@ class BackendState:
             os.remove(asset["file_path"])
         except OSError:
             pass
+        if str(asset.get("purpose") or "") == PROMOTION_QR_PURPOSE:
+            self.store.refresh_first_reply(str(asset.get("item_id") or ""), force=False)
         return {"id": int(asset_id)}
 
     def test_ai(self):
@@ -721,10 +794,16 @@ class BackendState:
             }
         deterministic = self.store.resolve_deterministic(item_id, message)
         if deterministic:
+            image_asset = None
+            if deterministic.get("image_asset_id"):
+                asset = self.store.get_image_asset(int(deterministic["image_asset_id"]))
+                if asset:
+                    image_asset = {"id": asset["id"], "name": asset["name"]}
             return {
                 "reply": deterministic["reply"],
                 "action": deterministic.get("decision", "allow"),
                 "reason": deterministic.get("source", "本地固定规则"),
+                **({"image_asset": image_asset} if image_asset else {}),
                 "time": self.store.evaluate_time(item_id, payload.get("at")),
                 "evidence": [{
                     "source": deterministic.get("source", "本地固定规则"),
@@ -1016,6 +1095,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(product)
             if path == "/products/sync":
                 return self._ok(self.state.sync_products())
+            if path == "/products/onsale-options":
+                return self._ok(self.state.list_onsale_products())
+            if path == "/products/sync-selected":
+                return self._ok(self.state.sync_products(body.get("item_ids") or []))
             if path.startswith("/products/") and path.endswith("/enabled"):
                 item_id = unquote(path.split("/")[2])
                 return self._ok(self.state.store.set_product_enabled(
