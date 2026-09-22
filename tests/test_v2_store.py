@@ -309,6 +309,48 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("售价168元", result["reply"])
         self.assertNotIn("单人套餐", result["reply"])
 
+    def test_store_query_strips_grounded_food_category_and_price_followup_uses_store_skus(self):
+        self.store.save_v2_product(
+            "10001", "蚂蚁洞烤肉代金券",
+            "美团200元代金券：售价119.8元\n抖音300元代金券：售价205元",
+        )
+        one = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳壹方城店", "美团门店", [],
+        )
+        other = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳万象前海店", "抖音门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = one["id"] if "美团" in sku["sku_name"] else other["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        initial = self.store.resolve_deterministic("10001", "深圳壹方城烤肉")
+        self.assertEqual("stores_sku_recommendation", initial["kind"])
+        self.assertEqual("available", initial["store_status"])
+        self.assertEqual(["深圳壹方城店"], [
+            row["branch"] for row in initial["store_matches"]
+        ])
+        for typo in ("深圳壹方成烤肉", "深圳壹方烤肉", "深圳壹方城城烤肉", "深圳一方城烤肉"):
+            with self.subTest(typo=typo):
+                fuzzy = self.store.resolve_deterministic("10001", typo)
+                self.assertEqual("stores_sku_recommendation", fuzzy["kind"])
+                self.assertEqual("available", fuzzy["store_status"])
+                self.assertEqual(["深圳壹方城店"], [
+                    row["branch"] for row in fuzzy["store_matches"]
+                ])
+        context = {
+            "query": initial["store_query"], "matches": initial["store_matches"],
+            "store_sku_matrix": initial["store_sku_matrix"], "status": "available",
+        }
+        followup = self.store.resolve_deterministic(
+            "10001", "什么价格呢", store_context=context,
+        )
+        self.assertEqual("stores_sku_recommendation", followup["kind"])
+        self.assertIn("美团200元代金券（售价119.8元）", followup["reply"])
+        self.assertNotIn("抖音300元代金券", followup["reply"])
+
     def test_store_reply_preserves_meaningful_marketplace_sku_names(self):
         meituan = {
             "sku_key": "meituan-200", "sku_name": "美团200（可叠加2张）",
@@ -5717,6 +5759,42 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("voucher_value", result["kind"])
         self.assertIn("不是", result["reply"])
         self.assertIn("115.8元", result["reply"])
+
+    def test_platform_bundle_corrects_listing_price_relationship_question(self):
+        platform_summary = json.dumps({
+            "title": "同仁四季椰子鸡代金券",
+            "description": "100元代金券最多使用2张",
+            "price": "108",
+            "sku": [
+                {
+                    "skuId": "dish", "priceInCent": 10800, "quantity": 10,
+                    "propertyList": [{"actualValueText": "单品煲仔饭"}],
+                },
+                {
+                    "skuId": "voucher-200", "priceInCent": 11580, "quantity": 10,
+                    "propertyList": [{"actualValueText": "100x2"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "platform-bundle-price", "title": "同仁四季椰子鸡代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "108",
+        })
+
+        wrong = self.store.resolve_deterministic(
+            "platform-bundle-price", "108抵200是这样吗",
+        )
+        self.assertEqual("voucher_value", wrong["kind"])
+        self.assertIn("不是", wrong["reply"])
+        self.assertIn("115.8元", wrong["reply"])
+        self.assertIn("2张100元代金券", wrong["reply"])
+
+        correct = self.store.resolve_deterministic(
+            "platform-bundle-price", "115.8抵200是这样吗",
+        )
+        self.assertEqual("voucher_value", correct["kind"])
+        self.assertIn("是的", correct["reply"])
+        self.assertIn("2张100元代金券", correct["reply"])
 
     def test_bare_positive_stack_rules_mean_unlimited_and_cover_quantity_phrasings(self):
         self.store.save_v2_product(
