@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from difflib import SequenceMatcher
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app_store import AppStore
@@ -146,6 +146,269 @@ def normalize_match_text(value: object) -> str:
     return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
 
 
+SOCIAL_GREETING_PREFIXES = (
+    "有人在吗", "有人吗", "你好", "您好", "哈喽", "嗨", "hello", "hey", "hi", "在吗",
+)
+SOCIAL_COURTESY_PREFIXES = (
+    "麻烦帮忙查一下", "麻烦帮忙看一下", "麻烦帮我看一下", "麻烦帮我看看",
+    "我想咨询一下", "方便帮我看下", "方便问一下", "不好意思打扰了",
+    "请教一下", "麻烦问一下", "麻烦问下", "我想问一下", "想问一下",
+    "咨询一下", "请问一下", "帮忙看一下", "帮我看一下", "帮我看看",
+    "不好意思", "打扰了", "劳驾", "问一下", "请问",
+)
+SOCIAL_COURTESY_SUFFIXES = (
+    "谢谢你了", "谢谢您了", "谢谢啦", "辛苦您了", "辛苦你了", "麻烦您了",
+    "麻烦你了", "拜托了", "劳烦了", "感谢", "多谢", "谢谢", "辛苦了", "麻烦了",
+)
+
+
+def split_social_business_text(value: object) -> Tuple[str, str]:
+    """Separate greetings/courtesy fillers from the buyer's business request."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    social_kind = ""
+    prefix_groups = (
+        (SOCIAL_GREETING_PREFIXES, "greeting"),
+        (SOCIAL_COURTESY_PREFIXES, "courtesy"),
+    )
+    for _ in range(8):
+        matched = False
+        for terms, kind in prefix_groups:
+            for term in sorted(terms, key=len, reverse=True):
+                match = re.match(
+                    rf"^\s*{re.escape(term)}(?:呀|啊|哦|呢|哈|啦)?",
+                    text, re.I,
+                )
+                if not match:
+                    continue
+                text = text[match.end():].lstrip(" \t，,。.!！?？~～：:；;")
+                social_kind = kind if kind == "courtesy" or not social_kind else social_kind
+                matched = True
+                break
+            if matched:
+                break
+        if not matched:
+            break
+    for _ in range(4):
+        matched = False
+        for term in sorted(SOCIAL_COURTESY_SUFFIXES, key=len, reverse=True):
+            match = re.search(
+                rf"(?:[\s，,。.!！?？~～：:；;]*){re.escape(term)}(?:呀|啊|哦|呢|哈|啦)?\s*$",
+                text, re.I,
+            )
+            if not match:
+                continue
+            text = text[:match.start()].rstrip(" \t，,。.!！?？~～：:；;")
+            social_kind = "thanks"
+            matched = True
+            break
+        if not matched:
+            break
+    return text.strip(" \t，,。.!！?？~～：:；;"), social_kind
+
+
+BUSINESS_INTENT_PRIORITY = {
+    "manual_handoff": 0,
+    "aftersale": 10,
+    "store": 20,
+    "price": 30,
+    "stacking": 40,
+    "time": 50,
+    "audience": 60,
+    "usage": 70,
+    "delivery": 80,
+    "purchase": 90,
+    "sku": 100,
+    "product_attribute": 110,
+    "restrictions": 120,
+}
+
+
+def classify_buyer_message(value: object) -> Dict:
+    """Return a fine-grained, explainable intent profile for one buyer message.
+
+    Social language is deliberately kept outside the business intents.  An
+    intent describes the requested answer, while entities/modifiers describe
+    the SKU, amount, quantity, location, date, meal period and audience that
+    constrain that answer.  The deterministic resolvers remain authoritative
+    for the final reply.
+    """
+    original = unicodedata.normalize("NFKC", str(value or "")).strip()
+    stripped, social_kind = split_social_business_text(original)
+    business_text = stripped if social_kind else original
+    compact = re.sub(r"[\s，,。.!！?？~～：:；;]+", "", business_text).lower()
+    detected: Dict[str, Dict] = {}
+
+    def record(intent: str, subtype: str, pattern: str, *, flags: int = 0) -> None:
+        if intent in detected:
+            return
+        match = re.search(pattern, business_text, flags)
+        if match:
+            detected[intent] = {
+                "intent": intent,
+                "subtype": subtype,
+                "evidence": match.group(0),
+                "position": match.start(),
+            }
+
+    # Manual and aftersale intents take priority because they change workflow
+    # state rather than merely selecting a product fact.
+    record("manual_handoff", "manual_handoff", r"(?:转|换|找)?(?:一下)?人工(?:客服)?")
+    record("aftersale", "refund_status", r"退款(?:到哪|进度|状态|什么时候到账|多久到账)|退款中|退款申请")
+    record("aftersale", "refund_request", r"给我退|帮我退|我要退|想退款|退了吧|退掉|申请退款|不想要了|不想用了")
+    record("aftersale", "coupon_failure", r"券码?(?:无效|失效|错误)|核销(?:不了|失败|异常)|无法核销|不能核销")
+    record("aftersale", "delivery_mismatch", r"发错券|发的券不对|少发|漏发|未收到(?:券|码)|没收到(?:券|码)")
+    record("aftersale", "expiry_issue", r"收到就过期|发来已过期|刚收到就过期|忘(?:记|了)用|没来得及用|过期了")
+    record("aftersale", "refund_policy", r"退款规则|退款政策|退换(?:货)?政策|怎么退款|如何退款|可以退(?:款)?吗|能退(?:款)?吗|支持退款吗")
+
+    price_signal = bool(re.search(
+        r"多少钱|多钱|什么价格|价格多少|价格呢|什么价|啥价|价钱|售价|报价|"
+        r"怎么卖|怎么收费|几元|几块|优惠多少|便宜多少|几折|折扣", business_text,
+    ))
+    audience_signal = bool(re.search(r"成人|大人|儿童|小孩|老人|老年|学生|女士|男士|\d+\s*(?:人|位)", business_text))
+    condition_signal = bool(re.search(
+        r"今天|明天|后天|周末|工作日|节假日|早餐|午餐|中餐|晚餐|夜宵|"
+        r"成人|大人|儿童|小孩|老人|老年|学生|女士|男士|\d+\s*(?:人|位)",
+        business_text,
+    ))
+    value_confirmation = re.search(
+        r"(?<!\d)\d+(?:\.\d+)?\s*(?:元|块)?\s*(?:拍下|下单|购买)?[^。！？\n]{0,8}"
+        r"(?:抵|代)\s*\d+(?:\.\d+)?\s*(?:元|块)?",
+        business_text,
+    )
+    quantity_price = re.search(r"[一二两三四五六七八九十\d]+\s*(?:张|份|套)\s*(?:多少钱|多钱|什么价|价格)", business_text)
+    consumption_plan = re.search(
+        r"(?:消费|预算|账单|吃|用|抵扣)?\s*\d+(?:\.\d+)?\s*(?:元|块)?[^。！？\n]{0,10}"
+        r"(?:怎么拍|怎么下单|怎么买|如何购买|如何凑|凑单|购买方案)|"
+        r"(?:怎么拍|怎么下单|怎么买|如何购买|如何凑|凑单)[^。！？\n]{0,10}\d+(?:\.\d+)?",
+        business_text,
+    )
+    if value_confirmation:
+        detected["price"] = {"intent": "price", "subtype": "voucher_value_confirmation", "evidence": value_confirmation.group(0), "position": value_confirmation.start()}
+    elif quantity_price:
+        detected["price"] = {"intent": "price", "subtype": "quantity_price", "evidence": quantity_price.group(0), "position": quantity_price.start()}
+    elif consumption_plan:
+        detected["price"] = {"intent": "price", "subtype": "consumption_plan", "evidence": consumption_plan.group(0), "position": consumption_plan.start()}
+    elif price_signal and condition_signal:
+        match = re.search(r"多少钱|多钱|什么价格|价格多少|什么价|啥价|售价|报价|怎么收费|几元|几块", business_text)
+        detected["price"] = {"intent": "price", "subtype": "conditional_price", "evidence": match.group(0) if match else "价格", "position": match.start() if match else 0}
+    elif price_signal and re.search(r"优惠多少|便宜多少|几折|折扣", business_text):
+        match = re.search(r"优惠多少|便宜多少|几折|折扣", business_text)
+        detected["price"] = {"intent": "price", "subtype": "discount", "evidence": match.group(0), "position": match.start()}
+    elif price_signal and re.search(r"\d+(?:\.\d+)?\s*(?:元)?\s*(?:代金券|券)?|[\u4e00-\u9fffA-Za-z0-9]+(?:套餐|自助|票)", business_text):
+        match = re.search(r"多少钱|多钱|什么价格|价格多少|什么价|啥价|售价|报价|怎么卖|怎么收费|几元|几块", business_text)
+        detected["price"] = {"intent": "price", "subtype": "sku_price", "evidence": match.group(0) if match else "价格", "position": match.start() if match else 0}
+    elif price_signal:
+        record("price", "catalog_price", r"多少钱|多钱|什么价格|价格多少|价格呢|什么价|啥价|价钱|售价|报价|怎么卖|怎么收费|几元|几块")
+
+    record("store", "store_scope", r"全国(?:通用|可用)|所有门店|全部门店|通用门店|哪些城市")
+    record("store", "nearby_store", r"附近(?:门店|哪家|哪里)|离我(?:最近|近)|最近的店")
+    record("store", "store_list", r"哪些店|哪几家店|有什么店|门店列表|可用门店|支持门店")
+    record(
+        "store", "store_availability",
+        r"(?:[\u4e00-\u9fffA-Za-z0-9]{1,24}(?:店|商场|广场|购物中心|商城|mall|MALL|城|市|区))"
+        r"[^。！？\n]{0,12}(?:能用|可以用|可用|支持|适用|不能用|不可以用)|"
+        r"(?:能用|可以用|可用|支持|适用)[^。！？\n]{0,12}(?:店|商场|广场|购物中心|商城|mall|MALL|城|市|区)",
+    )
+    record(
+        "store", "store_context",
+        r"[\u4e00-\u9fffA-Za-z0-9]{2,24}(?:门店|分店|店|商场|广场|购物中心|商城|"
+        r"万象城|万象汇|壹方城|壹方天地|万科里|天街|银泰|吾悦|大悦城|来福士|太古里|IFS|MALL)"
+        r"(?=[^。！？\n]{0,32}(?:多少钱|多钱|什么价|价格|\d+\s*(?:人|位)|成人|儿童|老人|午餐|晚餐))",
+    )
+
+    record("stacking", "mixed_denomination", r"(?:不同面额|混合|混着|一起|100\s*(?:和|加|跟)\s*\d+)[^。！？\n]{0,10}(?:叠加|使用|用)|能不能一起用")
+    record("stacking", "unlimited_stacking", r"无限叠加|不限张数|不限制(?:使用)?张数")
+    record("stacking", "stack_limit", r"最多(?:可以|能|可)?(?:叠加|使用|用)?(?:几|多少)张|一次(?:可以|能)?用(?:几|多少)张|叠加几张")
+    record("stacking", "stack_confirmation", r"(?:可以|能)用\s*[一二两三四五六七八九十\d]+\s*张吗|[一二两三四五六七八九十\d]+\s*张(?:可以|能)一起用吗")
+
+    record("time", "validity", r"有效期|什么时候过期|多久过期|能放多久|能囤多久")
+    record("time", "blackout_date", r"不可用日期|不能用日期|哪天不能用|节假日不能用")
+    record("time", "date_availability", r"今天|明天|后天|\d{1,2}\s*月\s*\d{1,2}\s*(?:日|号)|中秋|国庆|春节|元旦")
+    record("time", "day_availability", r"工作日|周末|星期[一二三四五六日天]|周[一二三四五六日天]|节假日")
+    record("time", "meal_period", r"早餐|早市|午餐|中餐|午市|下午茶|晚餐|晚市|夜宵|全天")
+    record("time", "purchase_timing", r"(?:吃完|消费后|结账前|买单前)[^。！？\n]{0,10}(?:买|拍|下单)")
+
+    if audience_signal and "price" not in detected:
+        record("audience", "audience_mix", r"[一二两三四五六七八九十\d]+\s*(?:大|成人)[一二两三四五六七八九十\d]+\s*(?:小|儿童)|\d+\s*(?:人|位)")
+        record("audience", "audience_eligibility", r"成人|大人|儿童|小孩|老人|老年|学生|女士|男士|身高|年龄")
+
+    record("usage", "redemption_steps", r"怎么用|如何使用|怎么核销|如何核销|到店怎么操作|使用方法")
+    record("usage", "reservation", r"需要预约|要预约吗|怎么预约|无需预约|免预约")
+    record("usage", "usage_scope", r"(?:锅底|酒水|饮料|菜品|餐品|包间|包厢|套餐)[^。！？\n]{0,10}(?:能用|可以用|抵扣|包含)")
+    record("usage", "dining_mode", r"堂食|外带|打包|外卖|配送")
+
+    record("delivery", "delivery_speed", r"多久发|什么时候发|几分钟发|秒发|发货要多久")
+    record("delivery", "delivery_channel", r"发什么券|什么券|美团券|抖音券|小程序券|电子券|券码")
+    record("delivery", "code_retrieval", r"怎么领|怎么领取|券在哪|码在哪|哪里看券|收不到券")
+    record("delivery", "transfer", r"可以转赠|能转赠|送给别人|给别人用")
+
+    record("purchase", "stock", r"有货吗|还有货吗|库存|卖完了吗|还能买吗")
+    record("purchase", "purchase_limit", r"限购|可以买几份|能买几份|最多买几份|一人限几")
+    record("purchase", "promotion_entry", r"购买链接|下单链接|二维码|微信购买|扫码购买")
+    record("purchase", "purchase_method", r"怎么买|怎么拍|怎么下单|如何购买|直接拍|可以拍吗|能拍吗")
+
+    record("sku", "sku_comparison", r"哪个好|哪个划算|有什么区别|区别是什么|推荐哪个")
+    record("sku", "sku_catalog", r"有哪些规格|什么规格|规格列表|有哪些券|有什么券|全部规格")
+    record("sku", "sku_availability", r"(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*(?:元|块)?(?:的)?(?:代金券|券)?(?:有吗|有没有|有么|有嘛|能买|能拍)|有(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)(?:元|块)?的吗|(?:成人|儿童|老人|学生|女士)票(?:有吗|有没有)")
+
+    record(
+        "product_attribute", "option_by_included_item",
+        r"(?:有|含|包含|带)[^。！？\n]{1,20}?(?:的是|的)(?:哪个|哪一个|哪款|什么档次|哪个套餐)|"
+        r"(?:哪个|哪一个|哪款|什么档次|哪个套餐)[^。！？\n]{0,12}(?:有|含|包含|带)",
+    )
+    record(
+        "product_attribute", "included_item_availability",
+        r"(?:轻享|超值|尊享|豪华|经典|单人|双人|三人|[\u4e00-\u9fffA-Za-z0-9]{2,20}(?:套餐|放题|自助))"
+        r"[^。！？\n]{0,12}(?:有|没有|含|不含|包含|不包含)[^。！？\n]{0,20}(?:吗|么|嘛|呢|[？?]|$)",
+    )
+    record("product_attribute", "included_items", r"包含什么|包括什么|套餐内容|有什么菜|有啥菜|含哪些")
+    record("product_attribute", "weight", r"多重|多少斤|多少克|重量")
+    record("product_attribute", "flavor", r"什么口味|有哪些口味|辣不辣|口味")
+    record("restrictions", "general_rules", r"有什么限制|有哪些限制|使用限制|限制条件|使用条件|注意事项")
+
+    intents = sorted(detected.values(), key=lambda row: (row["position"], BUSINESS_INTENT_PRIORITY[row["intent"]]))
+    primary = min(intents, key=lambda row: BUSINESS_INTENT_PRIORITY[row["intent"]]) if intents else None
+    content_items = []
+    for pattern in (
+        r"(?:有|含|包含|带)([^。！？\n]{1,20}?)(?:的是|的)(?:哪个|哪一个|哪款|什么档次|哪个套餐)",
+        r"(?:轻享|超值|尊享|豪华|经典|单人|双人|三人|[\u4e00-\u9fffA-Za-z0-9]{2,20}(?:套餐|放题|自助))"
+        r"(?:有|没有|含|不含|包含|不包含)([^吗么嘛呢？?。！!\n]{1,20})",
+    ):
+        item_match = re.search(pattern, business_text)
+        if item_match:
+            item = item_match.group(1).strip(" ，,、的")
+            if item:
+                content_items.append(item)
+    entities = {
+        "amounts": list(dict.fromkeys(re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)", business_text))),
+        "quantities": list(dict.fromkeys(re.findall(r"([一二两三四五六七八九十\d]+)\s*(张|份|套|桌)", business_text))),
+        "people": list(dict.fromkeys(re.findall(
+            r"([一二两三四五六七八九十\d]+)\s*(?:个)?"
+            r"(?:人|位|成人|大人|成年人|儿童|小孩|孩子|老人|长者|学生|女士|男士)",
+            business_text,
+        ))),
+        "audiences": [label for label, aliases in (
+            ("成人", ("成人", "大人", "成年人")),
+            ("儿童", ("儿童", "小孩", "孩子", "小朋友")),
+            ("老人", ("老人", "老年", "长者")),
+            ("学生", ("学生",)), ("女士", ("女士", "女性", "女宾")),
+            ("男士", ("男士", "男性", "男宾")),
+        ) if any(alias in business_text for alias in aliases)],
+        "meal_periods": [word for word in ("早餐", "午餐", "中餐", "下午茶", "晚餐", "夜宵", "全天") if word in business_text],
+        "content_items": list(dict.fromkeys(content_items)),
+    }
+    return {
+        "original_text": original,
+        "business_text": business_text.strip(" \t，,。.!！?？~～：:；;"),
+        "social_kind": social_kind,
+        "is_pure_social": bool(social_kind and not compact),
+        "primary_intent": primary["intent"] if primary else ("social" if social_kind and not compact else "unknown"),
+        "primary_subtype": primary["subtype"] if primary else (social_kind if social_kind and not compact else "unknown"),
+        "intents": intents,
+        "entities": entities,
+    }
+
+
 MEDIA_MARKER_PATTERN = (
     r"(?:\[\s*图片\s*\]|图片消息|买家发送了一张图片|"
     r"\[\s*语音\s*\]|语音消息|买家发送了一条语音)"
@@ -214,6 +477,11 @@ class V2Store(AppStore):
     def __init__(self, db_path: str):
         super().__init__(db_path)
         self._init_v2_db()
+
+    @staticmethod
+    def classify_buyer_intents(message: object) -> Dict:
+        """Expose the shared social/entity/business intent profiler."""
+        return classify_buyer_message(message)
 
     @staticmethod
     def _platform_description(product: Dict) -> str:
@@ -4738,7 +5006,7 @@ class V2Store(AppStore):
             return today_prefix + "\n".join(lines)
         if priced:
             lines = [self.format_product_option(option, brand) for option in priced]
-            return today_prefix + "当前价格如下：\n" + "\n".join(lines)
+            return today_prefix + "您好，当前可选规格及价格如下：\n" + "\n".join(lines)
         package_options = [
             option for option in self.extract_sale_options(product)
             if option.get("option_type") == "package" and option.get("sale_price")
@@ -4752,7 +5020,7 @@ class V2Store(AppStore):
                     prefix = self._day_reply_prefix(message, day_type)
                     return f"{prefix}当前商品没有该日期适用的在售套餐。"
                 package_prefix = self._day_reply_prefix(message, day_type)
-            return package_prefix + "当前价格如下：\n" + "\n".join(
+            return package_prefix + "您好，当前可选规格及价格如下：\n" + "\n".join(
                 self._format_conditional_option(option, {}) for option in package_options
             )
         facts = (product.get("structured") or {}).get("facts") or {}
@@ -5150,13 +5418,17 @@ class V2Store(AppStore):
 
     def named_sku_price_reply(self, product: Dict, message: str) -> str:
         """Resolve named ``xxx多少钱`` queries against SKU names first."""
+        query, _ = split_social_business_text(message)
         match = re.fullmatch(
             r"(?:请问)?(.+?)\s*(?:多少钱|多钱|的多少|什么价格|价格多少|卖多少|怎么卖|几块钱|几元)[？?]?",
-            str(message or "").strip(),
+            query,
         )
         if not match:
             return ""
         subject = match.group(1).strip(" ，,。.!！?？~～")
+        # Copulas immediately before the price phrase belong to the question,
+        # not to the SKU name: “300的代金券是多少钱” -> “300的代金券”.
+        subject = re.sub(r"(?:是|为|卖|要)$", "", subject).strip()
         if normalize_text(subject).lower() in {"今天", "现在", "当前", "这个", "它"}:
             return ""
         # Numeric denomination questions are handled by price_reply, including
@@ -5166,6 +5438,15 @@ class V2Store(AppStore):
             subject,
         ):
             return self.price_reply(product, message)
+        chinese_amount = re.fullmatch(
+            r"([零一二两三四五六七八九十百千]+)\s*(?:元|块)?\s*(?:的)?\s*"
+            r"(?:代金券|优惠券|券)?",
+            subject,
+        )
+        if chinese_amount:
+            amount = self._chinese_count(chinese_amount.group(1))
+            if amount and amount >= 20:
+                return self.price_reply(product, f"{amount}元代金券多少钱")
 
         options = [
             option for option in self.extract_product_options(product)
@@ -5277,7 +5558,21 @@ class V2Store(AppStore):
             r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?(?:代金券|券)?",
             subject,
         )))
-        subject_without_numbers = normalize_text(re.sub(r"\d+(?:\.\d+)?\s*元?", "", subject)).lower()
+        chinese_amounts = re.findall(
+            r"([零一二两三四五六七八九十百千]+)"
+            r"(?=\s*(?:元|块|的|代金券|优惠券|券|$))",
+            subject,
+        )
+        requested_values.extend(
+            str(value) for value in (self._chinese_count(raw) for raw in chinese_amounts)
+            if value and value >= 20
+        )
+        requested_values = list(dict.fromkeys(requested_values))
+        subject_without_numbers = re.sub(
+            r"\d+(?:\.\d+)?\s*元?|[零一二两三四五六七八九十百千]+\s*(?:元|块)?",
+            "", subject,
+        )
+        subject_without_numbers = normalize_text(subject_without_numbers).lower().strip("的")
         matched = []
         for option in options:
             option_name = normalize_text(option.get("name") or "").lower()
@@ -5551,6 +5846,173 @@ class V2Store(AppStore):
                 "kind": "product_attribute",
             }
         return None
+
+    @classmethod
+    def package_content_reply(
+        cls, product: Dict, message: str, context: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Answer per-SKU menu questions without treating silence as exclusion."""
+        text = str(message or "").strip()
+        if not text or re.search(r"退款|退货|售后|核销|券码", text):
+            return None
+        context = context if isinstance(context, dict) else {}
+        challenge = bool(re.search(
+            r"我看(?:好像|应该)?是?有|我看到有|详情(?:里|页)?有|不是有吗|"
+            r"应该有吧|好像有|明明有|写着有",
+            text,
+        ))
+        reverse = re.search(
+            r"(?:有|含|包含|带)([^。！？\n]{1,20}?)(?:的是|的)"
+            r"(?:哪个|哪一个|哪款|什么档次|哪个套餐)",
+            text,
+        )
+        target = reverse.group(1).strip(" ，,、的") if reverse else ""
+        if not target and not challenge:
+            direct = re.search(
+                r"(?:不包含|不含|没有|包含|有|含|带)"
+                r"([^吗么嘛呢？?。！!\n]{1,20})",
+                text,
+            )
+            target = direct.group(1).strip(" ，,、的") if direct else ""
+        if not target:
+            target = str(context.get("content_item") or "").strip()
+
+        profiles = []
+        structured = product.get("structured") or {}
+        if isinstance(structured, dict):
+            for key in ("sku_profiles", "products", "skus", "商品规格"):
+                values = structured.get(key)
+                if isinstance(values, list):
+                    profiles.extend(value for value in values if isinstance(value, dict))
+        options = cls.extract_sale_options(product)
+        names = []
+        for record in [*profiles, *options]:
+            name = str(record.get("sku_name") or record.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if not names or not target:
+            return None
+
+        def aliases(name: str) -> List[str]:
+            result = [name]
+            result.extend(re.findall(
+                r"(?:轻享|超值|尊享|豪华|经典|畅享|精选)[^\s，,。；;：:]{0,8}"
+                r"(?:套餐|放题|自助|档|票)?",
+                name,
+            ))
+            return list(dict.fromkeys(value for value in result if value))
+
+        selected = next((
+            name for name in sorted(names, key=len, reverse=True)
+            if any(alias in text for alias in aliases(name))
+        ), "")
+        if not selected:
+            selected_alias = re.search(r"轻享|超值|尊享|豪华|经典|畅享|精选", text)
+            if selected_alias:
+                selected = next((
+                    name for name in names if selected_alias.group(0) in name
+                ), "")
+        if not selected:
+            previous_selected = str(context.get("selected_sku_name") or "").strip()
+            if previous_selected in names:
+                selected = previous_selected
+
+        evidence: Dict[str, List[str]] = {name: [] for name in names}
+        for record in profiles:
+            name = str(record.get("sku_name") or record.get("name") or "").strip()
+            if name not in evidence:
+                continue
+            values = []
+            for key, value in record.items():
+                if key in {"sku_name", "name", "sale_price", "price", "售价"}:
+                    continue
+                if isinstance(value, list):
+                    values.extend(str(item) for item in value if str(item).strip())
+                elif not isinstance(value, dict) and str(value or "").strip():
+                    values.append(str(value))
+            evidence[name].extend(values)
+
+        source_text = "\n".join(filter(None, (
+            str(product.get("raw_text") or "").replace("\\n", "\n"),
+            cls._platform_description(product),
+            str(product.get("ai_summary") or "").replace("\\n", "\n"),
+        )))
+        all_aliases = [(name, alias) for name in names for alias in aliases(name)]
+        for clause in re.split(r"[\r\n。；;]+", source_text):
+            if not target or target not in clause:
+                continue
+            hits = sorted(
+                (clause.find(alias), name, alias)
+                for name, alias in all_aliases if alias and alias in clause
+            )
+            for index, (start, name, alias) in enumerate(hits):
+                end = hits[index + 1][0] if index + 1 < len(hits) else len(clause)
+                segment = clause[start:end].strip(" ，,、：:")
+                if segment and segment not in evidence[name]:
+                    evidence[name].append(segment)
+
+        def content_status(name: str) -> str:
+            local = "；".join(evidence.get(name) or [])
+            if not local or target not in local:
+                return "unknown"
+            escaped = re.escape(target)
+            if re.search(
+                rf"(?:不含|没有|不包含|不提供|不供应)[^。；\n]{{0,12}}{escaped}|"
+                rf"{escaped}[^。；\n]{{0,12}}(?:不含|没有|不包含|不提供|不供应)",
+                local,
+            ):
+                return "negative"
+            return "positive"
+
+        statuses = {name: content_status(name) for name in names}
+        if selected:
+            status = statuses.get(selected, "unknown")
+            if status == "positive":
+                reply = f"是的，当前资料明确标注{selected}包含{target}。"
+            elif status == "negative":
+                reply = f"当前资料明确标注{selected}不包含{target}。"
+            elif challenge:
+                reply = (
+                    f"您提醒得对，刚才直接判断“{selected}不含{target}”不准确。"
+                    f"当前资料没有明确写{selected}不含{target}，"
+                    "不能仅凭未提及就判断为没有。请以商品详情页当前展示为准；"
+                    "如果方便，把对应文字发来，我可以按最新内容继续核对。"
+                )
+            else:
+                reply = (
+                    f"当前资料没有明确说明{selected}是否包含{target}，"
+                    "暂时不能直接判断为不含。请以商品详情页当前展示为准。"
+                )
+            return {
+                "reply": reply, "source": "当前商品分SKU套餐内容",
+                "decision": "allow", "kind": "package_content",
+                "query_context_update": {
+                    "intent": "package_content", "content_item": target,
+                    "selected_sku_name": selected, "content_status": status,
+                },
+            }
+
+        if not reverse:
+            return None
+        positives = [name for name, status in statuses.items() if status == "positive"]
+        negatives = [name for name, status in statuses.items() if status == "negative"]
+        unknowns = [name for name, status in statuses.items() if status == "unknown"]
+        if positives:
+            reply = f"当前资料明确标注{'、'.join(positives)}包含{target}。"
+            if negatives:
+                reply += f"{'、'.join(negatives)}明确标注不包含{target}。"
+            if unknowns:
+                reply += f"{'、'.join(unknowns)}暂未明确说明，不能仅因未提及就判断为不含。"
+        else:
+            reply = f"当前资料暂未明确标注哪个规格包含{target}，无法准确确认。"
+        return {
+            "reply": reply, "source": "当前商品分SKU套餐内容",
+            "decision": "allow", "kind": "package_content",
+            "query_context_update": {
+                "intent": "package_content", "content_item": target,
+                "confirmed_skus": positives, "excluded_skus": negatives,
+            },
+        }
 
     @staticmethod
     def _coupon_scope_reply(product: Dict) -> str:
@@ -8860,7 +9322,7 @@ class V2Store(AppStore):
         match = re.fullmatch(
             r"(?:那|那么|那请问|再问下|再问一下|请问|还有)?"
             r"(?:(?:美团|抖音|小程序))?"
-            r"(\d+(?:\.\d+)?)\s*(?:元|块|块钱)?"
+            r"(\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*(?:元|块|块钱)?"
             r"(?:的|那个|那款|这一款|这个|这个规格|规格|面额|代金券|优惠券|抵扣券|现金券|券)?"
             r"(?:呢|有吗|有没有|也有吗|也能用吗|也可以用吗|"
             r"能不能(?:用|使用|买|拍)|可不可以(?:用|使用|买|拍)|"
@@ -8869,7 +9331,11 @@ class V2Store(AppStore):
             r"不能用吗|不可以用吗|不适用吗|行不行|行吗|支持吗|适用吗|怎么样|咋样)?",
             compact,
         )
-        return cls._format_number(match.group(1)) if match else ""
+        if not match:
+            return ""
+        raw = match.group(1)
+        amount = cls._chinese_count(raw) if not re.fullmatch(r"\d+(?:\.\d+)?", raw) else raw
+        return cls._format_number(amount) if amount else ""
 
     @classmethod
     def _amount_plan_request(cls, message: str) -> str:
@@ -11626,6 +12092,20 @@ class V2Store(AppStore):
                 "kind": "sensitive_aftersale",
             }
 
+        # Social language is tone, not a product entity. Remove greetings and
+        # courtesy fillers before intent routing so “你好，什么价格” resolves as
+        # a generic price question instead of a nonexistent SKU named “你好”.
+        intent_profile = classify_buyer_message(message)
+        business_message = str(intent_profile.get("business_text") or "")
+        social_kind = str(intent_profile.get("social_kind") or "")
+        # Only replace the original message when an actual social token was
+        # consumed. Punctuation-only follow-ups (for example “？” while an
+        # aftersale clarification is pending) must remain available to the
+        # context resolver instead of becoming an unrelated empty message.
+        if social_kind:
+            message = business_message
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
+
         if re.fullmatch(r"(?:请)?(?:帮我)?(?:转|换|找)?(?:一下)?人工(?:客服)?", compact):
             return {
                 "reply": "已切换至人工处理，请稍候。后续消息将保留给人工查看。",
@@ -11695,6 +12175,9 @@ class V2Store(AppStore):
             compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
 
         query_context = store_context if isinstance(store_context, dict) else {}
+        package_content = self.package_content_reply(product, message, query_context)
+        if package_content:
+            return package_content
         context_is_aftersale = query_context.get("intent") == "aftersale"
         payment_state = self._order_payment_state(order_context, message, actual_paid_amount)
         if payment_state == "unknown" and context_is_aftersale:
@@ -12002,17 +12485,21 @@ class V2Store(AppStore):
                     "kind": "consumption_plan",
                 }
 
-        pure_greeting = re.fullmatch(
+        pure_greeting = (not message and bool(social_kind)) or re.fullmatch(
             r"(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)(?:呀|啊|哦|呢|吗)?",
             compact,
             re.I,
         )
         if pure_greeting:
             return {
-                "reply": "您好，请问想咨询当前商品的使用规则、适用门店还是发货问题？",
-                "source": "首次问候固定回复",
+                "reply": (
+                    "不客气，请问还想咨询当前商品的价格、使用规则或适用门店吗？"
+                    if social_kind == "thanks" else
+                "您好，请问想咨询当前商品的使用规则、适用门店还是发货问题？"
+                ),
+                "source": "纯寒暄或客气话固定回复",
                 "decision": "allow",
-                "kind": "greeting",
+                "kind": "courtesy" if social_kind in {"courtesy", "thanks"} else "greeting",
             }
 
         previous_price = dict((query_context or {}).get("price_filters") or {})
@@ -12282,17 +12769,21 @@ class V2Store(AppStore):
 
         price_terms = (
             "多少钱", "多钱", "什么价格", "价格多少", "售价", "怎么卖", "几块钱", "几元",
-            "今天多少钱", "当前价格", "价钱", "价格", "多少代",
+            "今天多少钱", "当前价格", "价钱", "价格", "什么价", "啥价", "报价", "怎么收费", "多少代",
         )
         generic_price_question = compact in {
             "多少钱", "多钱", "多少", "价格", "价格呢", "什么价", "什么价格",
-            "怎么卖", "售价多少", "当前多少钱", "现在多少钱",
+            "啥价", "价钱", "报价", "怎么卖", "怎么收费", "售价多少", "当前多少钱", "现在多少钱",
         }
         shorthand_amount_question = bool(re.fullmatch(
             r"\s*\d+(?:\.\d+)?\s*(?:元|块)?\s*(?:的)?\s*(?:多少钱|多钱|多少|什么价|价格)\s*[？?]?\s*",
             message,
         ))
-        if any(word in message for word in price_terms) or generic_price_question or shorthand_amount_question:
+        classified_price = any(
+            row.get("intent") == "price"
+            for row in intent_profile.get("intents") or []
+        )
+        if classified_price or any(word in message for word in price_terms) or generic_price_question or shorthand_amount_question:
             price_reply = self.price_reply(product, message)
             return {
                 "reply": price_reply,

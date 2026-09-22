@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from v2_store import V2Store, extract_store_query, normalize_text
+from v2_store import V2Store, classify_buyer_message, extract_store_query, normalize_text
 
 
 class HandoffDate(datetime):
@@ -3137,6 +3137,76 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("324元", result["reply"])
         self.assertNotIn("493元", result["reply"])
 
+    def test_social_words_are_removed_before_price_intent_routing(self):
+        self.store.save_v2_product(
+            "10001", "同仁四季椰子鸡",
+            "200元代金券（100x2）：售价115.8元，发100元券2张\n300元代金券（限一）：售价212.8元，发300元券1张",
+        )
+        for message in (
+            "你好，什么价格", "您好，请问一下多少钱",
+            "麻烦问下啥价，谢谢", "哈喽，报价，辛苦了",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("price", result["kind"])
+                self.assertIn("当前可选规格及价格如下", result["reply"])
+                self.assertIn("115.8元", result["reply"])
+                self.assertIn("212.8元", result["reply"])
+                self.assertNotIn("没有“你好”", result["reply"])
+
+        greeting = self.store.resolve_deterministic("10001", "你好")
+        self.assertEqual("greeting", greeting["kind"])
+        thanks = self.store.resolve_deterministic("10001", "谢谢，辛苦了")
+        self.assertEqual("courtesy", thanks["kind"])
+        self.assertIn("不客气", thanks["reply"])
+
+    def test_intent_profile_separates_action_entities_and_social_tone(self):
+        cases = {
+            "你好，什么价格": ("price", "catalog_price"),
+            "麻烦问下3张多少钱": ("price", "quantity_price"),
+            "108抵200": ("price", "voucher_value_confirmation"),
+            "消费680怎么拍": ("price", "consumption_plan"),
+            "退款到哪了": ("aftersale", "refund_status"),
+            "100和300能一起用吗": ("stacking", "mixed_denomination"),
+            "有两百的吗": ("sku", "sku_availability"),
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                profile = self.store.classify_buyer_intents(message)
+                self.assertEqual(expected[0], profile["primary_intent"])
+                self.assertEqual(expected[1], profile["primary_subtype"])
+
+        combined = self.store.classify_buyer_intents(
+            "您好，深圳壹方城明天晚餐3个成年人多少钱，谢谢"
+        )
+        self.assertEqual("thanks", combined["social_kind"])
+        self.assertEqual("store", combined["primary_intent"])
+        self.assertEqual(
+            {"store", "price", "time"},
+            {row["intent"] for row in combined["intents"]},
+        )
+        self.assertIn("成人", combined["entities"]["audiences"])
+        self.assertIn("晚餐", combined["entities"]["meal_periods"])
+        self.assertEqual(["3"], combined["entities"]["people"])
+
+    def test_copula_price_and_chinese_denomination_questions_use_clean_sku_entities(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券",
+            "100元代金券：售价57.9元，最多叠加2张\n"
+            "300元代金券：售价212.8元，每次限用1张",
+        )
+        price = self.store.resolve_deterministic("10001", "请问300的代金券是多少钱")
+        self.assertEqual("price", price["kind"])
+        self.assertIn("300元代金券", price["reply"])
+        self.assertIn("212.8元", price["reply"])
+        self.assertNotIn("300的代金券是", price["reply"])
+
+        availability = self.store.resolve_deterministic("10001", "有两百的吗")
+        self.assertEqual("sku_availability", availability["kind"])
+        self.assertIn("没有200元代金券", availability["reply"])
+        self.assertIn("2张100元代金券", availability["reply"])
+        self.assertIn("支付115.8元", availability["reply"])
+
     def test_named_package_availability_uses_real_product_text(self):
         self.store.save_v2_product(
             "10001", "自助餐",
@@ -5821,6 +5891,60 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertIn("老人票", fares["reply"])
         self.assertIn("儿童票", fares["reply"])
+
+    def test_package_content_query_keeps_sku_and_item_context_without_inventing_exclusion(self):
+        self.store.save_v2_product(
+            "package-content", "一绪放题",
+            "轻享放题：售价198元\n超值放题：售价169.9元\n尊享放题：售价218元",
+        )
+        self.store.save_ai_summary("package-content", "分档套餐内容", {
+            "sku_profiles": [
+                {"name": "轻享放题", "sale_price": "198", "package_contents": "基础菜品"},
+                {"name": "超值放题", "sale_price": "169.9", "package_contents": "刺身、烧物"},
+                {"name": "尊享放题", "sale_price": "218", "package_contents": "刺身、大闸蟹"},
+            ],
+        })
+
+        first = self.store.resolve_deterministic("package-content", "有大闸蟹的是哪个？")
+        self.assertEqual("package_content", first["kind"])
+        self.assertIn("尊享放题包含大闸蟹", first["reply"])
+        self.assertIn("暂未明确说明", first["reply"])
+        self.assertNotIn("超值放题不包含大闸蟹", first["reply"])
+
+        second = self.store.resolve_deterministic(
+            "package-content", "超值没有吗？",
+            store_context=first["query_context_update"],
+        )
+        self.assertEqual("package_content", second["kind"])
+        self.assertIn("没有明确说明超值放题是否包含大闸蟹", second["reply"])
+        self.assertNotIn("超值放题不包含大闸蟹", second["reply"])
+
+        correction = self.store.resolve_deterministic(
+            "package-content", "我看好像是有的哦",
+            store_context=second["query_context_update"],
+        )
+        self.assertEqual("package_content", correction["kind"])
+        self.assertIn("没有明确写超值放题不含大闸蟹", correction["reply"])
+        self.assertIn("不能仅凭未提及", correction["reply"])
+
+    def test_package_content_only_denies_when_sku_has_explicit_negative_evidence(self):
+        product = {
+            "structured": {"sku_profiles": [
+                {"name": "超值放题", "package_contents": "明确不含大闸蟹"},
+                {"name": "尊享放题", "package_contents": "包含大闸蟹"},
+            ]},
+            "raw_text": "", "ai_summary": "", "platform_summary": "",
+        }
+        result = self.store.package_content_reply(
+            product, "超值没有吗", {"content_item": "大闸蟹"},
+        )
+        self.assertIn("明确标注超值放题不包含大闸蟹", result["reply"])
+
+    def test_classifier_recognizes_reverse_package_content_query(self):
+        profile = classify_buyer_message("请问有大闸蟹的是哪个？")
+        self.assertEqual("product_attribute", profile["primary_intent"])
+        self.assertEqual("option_by_included_item", profile["primary_subtype"])
+        self.assertIn("大闸蟹", profile["entities"]["content_items"])
 
     def test_knowledge_summary_separates_purchase_combinations_and_rule_sections(self):
         raw_text = (
