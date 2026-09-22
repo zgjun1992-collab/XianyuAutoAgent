@@ -21,7 +21,8 @@ except ImportError:  # Optional in source mode; packaged builds include it.
     Style = None
     lazy_pinyin = None
 
-FIRST_REPLY_TEMPLATE_VERSION = 7
+FIRST_REPLY_TEMPLATE_VERSION = 8
+PROMOTION_QR_PURPOSE = "promotion_qr"
 
 
 COUPON_TYPE_LABELS = {
@@ -30,6 +31,8 @@ COUPON_TYPE_LABELS = {
     "merchant_miniapp": "商家小程序券",
     "electronic_code": "普通电子券码",
     "purchase_order": "代买单",
+    "mixed": "混合发卡",
+    "promotion": "推广模式",
     "other": "其他卡券",
 }
 
@@ -39,6 +42,12 @@ COUPON_TYPE_DEFAULT_INSTRUCTIONS = {
     "merchant_miniapp": "当前商品发放的是商家小程序电子券，付款后发送领取信息，到店出示券码核销。",
     "electronic_code": "付款后发电子券码，门店扫码核销。",
     "purchase_order": "当前商品为代买单，付款后按订单说明发送领取信息，请按领取页面提示到店核销。",
+    # Mixed delivery deliberately has no generic fallback. Each SKU must use
+    # the channel and redemption facts stored in product knowledge.
+    "mixed": "",
+    # Promotion mode is a sales route rather than a voucher channel. Buyer-facing
+    # wording must come from the operator's knowledge and promotion assets.
+    "promotion": "",
     "other": "付款后发送当前商品对应的电子卡券，到店按券码说明核销。",
 }
 
@@ -1108,6 +1117,18 @@ class V2Store(AppStore):
             if not line_key or line_key in seen or line_key in rendered_key:
                 continue
 
+            combination = cls._parse_purchase_combination_line(line)
+            if combination and "【组合购买方案】" in rendered_text:
+                comparison_tokens = [
+                    combination.get("target_face_value"),
+                    combination.get("sale_price"),
+                ]
+                if all(
+                    normalize_match_text(token) in rendered_key
+                    for token in comparison_tokens if token
+                ):
+                    continue
+
             # Product rows and pure stacking rows are already rendered from the
             # authoritative SKU records. Keep them only when they also carry an
             # independent restriction such as a store, date or dine-in rule.
@@ -1125,6 +1146,181 @@ class V2Store(AppStore):
             seen.add(line_key)
             found.append(line.rstrip("。；; ") + "。")
         return found
+
+    @classmethod
+    def _parse_purchase_combination_line(cls, value: object) -> Dict:
+        """Parse a prose-only purchase plan without promoting it to a sellable SKU."""
+        line = str(value or "").strip().replace("两", "2")
+        line = re.sub(r"^(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d+[.、)）])\s*", "", line)
+        match = re.search(
+            r"(?<!\d)(?P<target>\d+(?:\.\d+)?)\s*元?\s*"
+            r"[（(]\s*(?P<composition>[^（）()\n]{1,40})\s*[）)]\s*"
+            r"[：:]\s*(?:售价|价格|支付|实付)?\s*[¥￥]?\s*"
+            r"(?P<price>\d+(?:\.\d+)?)\s*元?",
+            line,
+        )
+        if not match:
+            return {}
+        target = cls._format_number(match.group("target"))
+        composition = cls._normalize_composition(match.group("composition"), "")
+        components = []
+        for amount, count in re.findall(
+            r"(\d+(?:\.\d+)?)元券(\d+)张", composition,
+        ):
+            components.append({
+                "face_value": cls._format_number(amount),
+                "count": int(count),
+            })
+        if not components:
+            return {}
+        try:
+            component_total = sum(
+                Decimal(item["face_value"]) * item["count"] for item in components
+            )
+            if component_total != Decimal(target):
+                return {}
+        except (InvalidOperation, TypeError, ValueError):
+            return {}
+        return {
+            "target_face_value": target,
+            "composition": composition,
+            "sale_price": cls._format_number(match.group("price")),
+            "components": components,
+            "source_evidence": line.rstrip("。；; "),
+        }
+
+    @classmethod
+    def _purchase_combination_summary(cls, product: Dict, options: List[Dict]) -> str:
+        """Render validated multi-SKU purchase plans and expose price conflicts."""
+        structured = product.get("structured") or {}
+        records = []
+        if isinstance(structured, dict):
+            supplied = structured.get("purchase_combinations")
+            if isinstance(supplied, list):
+                for row in supplied:
+                    if not isinstance(row, dict):
+                        continue
+                    target = cls._format_number(
+                        row.get("target_face_value") or row.get("target_amount")
+                        or row.get("face_value") or ""
+                    )
+                    composition = cls._normalize_composition(
+                        row.get("composition") or "", ""
+                    )
+                    price = cls._format_number(row.get("sale_price") or row.get("price") or "")
+                    synthetic = cls._parse_purchase_combination_line(
+                        f"{target}（{composition}）：{price}"
+                    )
+                    if synthetic:
+                        synthetic["source_evidence"] = str(
+                            row.get("source_evidence") or synthetic["source_evidence"]
+                        ).strip()
+                        records.append(synthetic)
+        source = str(product.get("raw_text") or "").replace("\\n", "\n")
+        for piece in re.split(r"[\r\n；;]+", source):
+            parsed = cls._parse_purchase_combination_line(piece)
+            if parsed:
+                records.append(parsed)
+
+        option_by_face = {}
+        canonical_targets = set()
+        for option in options:
+            if str(option.get("availability") or "available") != "available":
+                continue
+            face = cls._format_number(option.get("face_value") or "")
+            if not face:
+                continue
+            canonical_targets.add(face)
+            if face not in option_by_face:
+                option_by_face[face] = option
+            elif cls._format_number(option_by_face[face].get("sale_price") or "") != cls._format_number(
+                option.get("sale_price") or ""
+            ):
+                option_by_face[face] = None
+
+        rendered = []
+        seen = set()
+        for record in records:
+            key = (
+                record.get("target_face_value"), record.get("composition"),
+                record.get("sale_price"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            target = record.get("target_face_value") or ""
+            # A real SKU with this face value is already shown in 商品规格 and must
+            # not be duplicated as a prose-derived combination.
+            if target in canonical_targets:
+                continue
+            component_rows = []
+            calculated = Decimal("0")
+            calculable = True
+            for component in record.get("components") or []:
+                face = component.get("face_value") or ""
+                count = int(component.get("count") or 0)
+                option = option_by_face.get(face)
+                if not option or count <= 0:
+                    calculable = False
+                    break
+                price = cls._format_number(option.get("sale_price") or "")
+                if not price:
+                    calculable = False
+                    break
+                calculated += Decimal(price) * count
+                option_name = str(option.get("name") or f"{face}元代金券").strip()
+                component_rows.append(f"{option_name}×{count}")
+            if not calculable or not component_rows:
+                continue
+            calculated_text = cls._format_number(calculated)
+            source_price = cls._format_number(record.get("sale_price") or "")
+            plan = "＋".join(component_rows)
+            if source_price and source_price != calculated_text:
+                rendered.append(
+                    f"{target}元方案：购买{plan}，按当前SKU售价应付{calculated_text}元；"
+                    f"原文写{source_price}元，价格冲突，需人工确认。"
+                )
+            else:
+                rendered.append(
+                    f"{target}元方案：购买{plan}，共支付{calculated_text}元，可抵扣{target}元。"
+                )
+        return "\n".join(rendered)
+
+    @staticmethod
+    def _group_uncovered_source_rules(lines: List[str]):
+        """Move recognizable safety rules into stable sections before raw fallback."""
+        groups = {
+            "【不可用日期】": [],
+            "【适用范围】": [],
+            "【使用规则】": [],
+            "【发券与核销】": [],
+            "【退款与发票】": [],
+            "【提醒】": [],
+        }
+        remaining = []
+        for line in lines:
+            if re.search(r"(?:不可用|不能用|不适用|除外|禁用)", line) and re.search(
+                r"\d{1,4}年|\d{1,2}月|\d{1,2}日|节|假日|中秋|国庆|春节|元旦|劳动节",
+                line,
+            ):
+                groups["【不可用日期】"].append(line)
+            elif re.search(r"退款|退货|退单|发票", line):
+                groups["【退款与发票】"].append(line)
+            elif re.search(r"发券|发码|领取|核销|券码|二维码", line):
+                groups["【发券与核销】"].append(line)
+            elif re.search(r"拍前|下单前|购买前|请咨询|联系客服", line):
+                groups["【提醒】"].append(line)
+            elif re.search(r"仅适用于|仅可用于|适用范围|适用于(?:餐品|菜品|酒水|门店|地区)", line):
+                groups["【适用范围】"].append(line)
+            elif re.search(
+                r"堂食|外带|外卖|预约|等位|包间|最低消费|找零|兑现金|"
+                r"服务费|每桌|每单|限用|使用次数|优惠同享|不可同享|酒水|锅底",
+                line,
+            ):
+                groups["【使用规则】"].append(line)
+            else:
+                remaining.append(line)
+        return groups, remaining
 
     @staticmethod
     def _format_number(value: object) -> str:
@@ -1203,6 +1399,29 @@ class V2Store(AppStore):
         return text.strip("（）() ")
 
     @classmethod
+    def _composition_from_option_name(cls, value: object) -> str:
+        """Extract an authoritative bundle such as 100x2 from an SKU name."""
+        text = str(value or "").replace("两", "2")
+        pairs = re.findall(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?\s*[xX×*]\s*(\d+)\s*张?", text,
+        )
+        if not pairs:
+            pairs = re.findall(
+                r"(?:发|给|含|包含)?\s*(\d+(?:\.\d+)?)\s*元?(?:代金券|券)\s*(\d+)\s*张",
+                text,
+            )
+        if not pairs:
+            reversed_pairs = re.findall(
+                r"(?:发|给|含|包含)?\s*(\d+)\s*张\s*(\d+(?:\.\d+)?)\s*元?(?:代金券|券)?",
+                text,
+            )
+            pairs = [(amount, count) for count, amount in reversed_pairs]
+        return "＋".join(
+            f"{cls._format_number(amount)}元券{int(count)}张"
+            for amount, count in pairs if int(count) > 0
+        )
+
+    @classmethod
     def _option_availability(cls, record: Dict) -> Dict:
         """Normalize explicit SKU sale/stock state without inventing stock.
 
@@ -1247,6 +1466,21 @@ class V2Store(AppStore):
         }
 
     @classmethod
+    def _platform_sku_source_id(
+        cls, record: Dict, name: str, face_value: str, platforms: List[str],
+    ) -> str:
+        explicit = str(cls._pick(
+            record, ("skuId", "sku_id", "optionId", "option_id", "id"),
+        ) or "").strip()
+        if explicit:
+            return explicit
+        if platforms and face_value:
+            fingerprint = normalize_text(name).lower()
+            suffix = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+            return f"platform:{platforms[0]}:{face_value}:{suffix}"
+        return ""
+
+    @classmethod
     def _normalize_product_option(cls, record: Dict) -> Optional[Dict]:
         face_value = cls._format_number(cls._pick(record, (
             "面额", "券面额", "代金券面额", "face_value", "value", "denomination",
@@ -1277,8 +1511,9 @@ class V2Store(AppStore):
         # the same structured record explicitly identifies a coupon.
         voucher_evidence = bool(re.search(
             r"代金券|抵扣券|现金券|\d+(?:\.\d+)?\s*元券|"
-            r"(?:^|[^\u4e00-\u9fff])券(?:$|[^\u4e00-\u9fff])",
-            evidence,
+            r"(?:^|[^\u4e00-\u9fff])券(?:$|[^\u4e00-\u9fff])|"
+            r"\b(?:voucher|coupon)\b",
+            evidence, re.I,
         ))
         invalid_name = bool(re.search(
             r"[=￥¥%]|地址|重量|斤|公斤|千克|克",
@@ -1286,14 +1521,16 @@ class V2Store(AppStore):
         ))
         if not voucher_evidence or invalid_name:
             return None
-        composition = cls._normalize_composition(composition_value, face_value)
+        name_composition = cls._composition_from_option_name(name)
+        composition = name_composition or cls._normalize_composition(
+            composition_value, face_value,
+        )
         max_stack = cls._normalize_stack_limit(cls._pick(record, (
             "最多叠加", "叠加上限", "最多使用张数", "最多使用", "max_stack", "max_count",
         )))
         platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
-        source_id = (
-            f"platform:{platforms[0]}:{face_value}" if platforms and face_value else
-            str(cls._pick(record, ("sku_id", "skuId", "option_id", "id")) or "").strip()
+        source_id = cls._platform_sku_source_id(
+            record, name, face_value, platforms,
         )
         if not name and face_value:
             name = f"{face_value}元代金券"
@@ -1341,6 +1578,10 @@ class V2Store(AppStore):
                 and str(row.get("actualValueText") or row.get("valueText") or "").strip()
             ), "")
             if not name:
+                name = str(cls._pick(record, (
+                    "skuName", "sku_name", "name", "title", "skuText", "specName",
+                )) or "").strip()
+            if not name:
                 idle_pairs = str((record.get("features") or {}).get("idlePvPairs") or "")
                 name = idle_pairs.rsplit("#", 1)[-1].strip() if "#" in idle_pairs else idle_pairs.strip()
             if not name or re.search(r"勿拍|不要拍|防下架|补差|运费|测试", name):
@@ -1367,11 +1608,9 @@ class V2Store(AppStore):
                     price = ""
             if not price:
                 continue
-            quantity_match = re.search(
-                rf"{re.escape(face)}\s*(?:元)?\s*[xX×*]\s*(\d+)\s*张?", name,
-            )
-            composition = cls._normalize_composition(
-                f"{face}x{quantity_match.group(1)}" if quantity_match else "", face,
+            composition = (
+                cls._composition_from_option_name(name)
+                or cls._normalize_composition("", face)
             )
             stack_match = re.search(
                 r"(?:最多)?(?:可)?叠加\s*(\d+)\s*张", name,
@@ -1384,7 +1623,9 @@ class V2Store(AppStore):
                 "name": name, "face_value": face, "sale_price": price,
                 "applicable_time": "", "composition": composition,
                 "max_stack": max_stack, "_platform_sku": True,
-                "sku_id": f"platform:{platforms[0]}:{face}" if platforms else "",
+                "sku_id": cls._platform_sku_source_id(
+                    record, name, face, platforms,
+                ),
                 **cls._option_availability(record),
             })
         return output
@@ -1469,9 +1710,9 @@ class V2Store(AppStore):
                     face_match = re.search(r"(?:美团|抖音|小程序)\s*(\d+(?:\.\d+)?)", name)
                 face = cls._format_number(face_match.group(1)) if face_match else ""
 
-            quantity_match = re.search(r"(?:[xX×*]|发)\s*(\d+)\s*张?", name)
-            composition = cls._normalize_composition(
-                f"{face}x{quantity_match.group(1)}" if face and quantity_match else "", face,
+            composition = (
+                cls._composition_from_option_name(name)
+                or cls._normalize_composition("", face)
             ) if face else ""
             maximum = cls._normalize_stack_limit(cls._pick(record, (
                 "最多叠加", "叠加上限", "最多使用张数", "最多使用", "max_stack", "max_count",
@@ -1482,9 +1723,8 @@ class V2Store(AppStore):
                 )
                 maximum = stack_match.group(1) if stack_match else ""
             platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
-            source_id = (
-                f"platform:{platforms[0]}:{face}" if platforms and face else
-                str(cls._pick(record, ("skuId", "sku_id", "optionId", "option_id", "id")) or "").strip()
+            source_id = cls._platform_sku_source_id(
+                record, name, face, platforms,
             )
             if not source_id:
                 fingerprint = f"{index}|{name}|{price}"
@@ -3360,6 +3600,9 @@ class V2Store(AppStore):
         )
         slots = {key: previous.get(key) for key in slot_keys} if inherited else {}
         slots.update({key: value for key, value in direct_slots.items() if value not in (None, "")})
+        if direct_slots.get("purchase_quantity") and not direct_slots.get("target_amount"):
+            slots.pop("target_amount", None)
+            slots.pop("amount_kind", None)
         # A newly stated audience such as “晚市双人” replaces a previous
         # purchase quantity.  Otherwise “3张” from the last question can leak
         # into the new two-person option and multiply the price incorrectly.
@@ -3646,13 +3889,23 @@ class V2Store(AppStore):
                         candidates = titled
             if voucher_matches and candidates is voucher_matches:
                 faces = sorted({
-                    self._format_number(option.get("face_value")) for option in candidates
-                    if option.get("face_value")
+                    self._format_number(amount)
+                    for option in candidates
+                    for amount, _ in self._option_coupon_pairs(option)
+                    if amount > 0
                 }, key=lambda value: Decimal(value))
                 if target_amount:
                     exact = [
                         option for option in candidates
-                        if self._format_number(option.get("face_value")) == self._format_number(target_amount)
+                        if (
+                            self._format_number(target_amount) == self._format_number(
+                                option.get("face_value") or ""
+                            )
+                            or self._format_number(target_amount) in {
+                                self._format_number(amount)
+                                for amount, _ in self._option_coupon_pairs(option)
+                            }
+                        )
                     ]
                     if not exact:
                         catalog = "、".join(f"{face}元" for face in faces)
@@ -3683,37 +3936,93 @@ class V2Store(AppStore):
                             "decision": "allow", "kind": "price",
                             "query_context_update": make_context("day_type"),
                         }
-                option = min(candidates, key=lambda item: Decimal(str(item.get("sale_price"))))
-                price = Decimal(str(option.get("sale_price"))) * quantity
-                face = Decimal(str(option.get("face_value"))) * quantity
-                contents = self._purchase_contents_label(option, quantity)
-                explicit_limit = str(option.get("max_stack") or "").strip()
-                delivered_per_unit = sum(
-                    int(count) for _, count in re.findall(
-                        r"(\d+(?:\.\d+)?)元券(\d+)张",
-                        str(option.get("composition") or ""),
+                package_face_matches = []
+                if target_amount:
+                    for option in candidates:
+                        pairs = self._option_coupon_pairs(option)
+                        unit_faces = {
+                            self._format_number(amount) for amount, _ in pairs if amount > 0
+                        }
+                        if (
+                            self._format_number(option.get("face_value") or "")
+                            == self._format_number(target_amount)
+                            and self._format_number(target_amount) not in unit_faces
+                        ):
+                            package_face_matches.append(option)
+                if package_face_matches:
+                    option = min(
+                        package_face_matches,
+                        key=lambda item: Decimal(str(item.get("sale_price") or "0")),
                     )
-                ) or 1
-                delivered_total = delivered_per_unit * quantity
-                maximum = int(Decimal(explicit_limit)) if explicit_limit else 0
-                if maximum and delivered_total > maximum:
-                    unit_face = self._option_total_value(option)
-                    unit_word = "每张" if delivered_per_unit == 1 else "每份该规格"
-                    reply = (
-                        f"购买{contents}共{self._format_number(price)}元。"
-                        f"{unit_word}可抵扣{self._format_number(unit_face)}元；"
-                        f"当前同面额代金券每次最多使用{maximum}张，"
-                        f"本次购买所得的{delivered_total}张不能在同一次消费中全部使用。"
-                    )
-                else:
-                    reply = (
-                        f"购买{contents}共{self._format_number(price)}元，"
-                        f"可抵扣{self._format_number(face)}元。"
-                    )
+                    price = Decimal(str(option.get("sale_price") or "0")) * quantity
+                    delivered_per_unit = sum(
+                        count for _, count in self._option_coupon_pairs(option)
+                    ) or 1
+                    delivered_total = delivered_per_unit * quantity
+                    option_value = self._option_total_value(option)
+                    contents = self._purchase_contents_label(option, quantity)
+                    try:
+                        maximum = int(Decimal(str(option.get("max_stack") or "0")))
+                    except (InvalidOperation, ValueError):
+                        maximum = 0
+                    reply = f"购买{contents}共{self._format_number(price)}元。"
+                    if maximum and delivered_total > maximum:
+                        reply += (
+                            f"每份该规格可抵扣{option_value}元；"
+                            f"当前同面额代金券每次最多使用{maximum}张，"
+                            f"本次购买所得的{delivered_total}张不能在同一次消费中全部使用。"
+                        )
+                    else:
+                        reply += f"共可抵扣{self._format_number(Decimal(option_value) * quantity)}元。"
+                    return {
+                        "reply": reply, "source": "当前商品真实SKU及其发券组成",
+                        "decision": "allow", "kind": "price",
+                        "query_context_update": {
+                            **context_update,
+                            "selected_sku_key": self.sku_key_for_option(option),
+                            "selected_sku_name": str(option.get("name") or "商品规格").strip(),
+                        },
+                    }
+                plan = self._coupon_quantity_purchase_plan(
+                    product, candidates, quantity,
+                    requested_face=str(target_amount or ""),
+                )
+                if plan.get("ambiguous_faces"):
+                    labels = "、".join(f"{face}元" for face in plan["ambiguous_faces"])
+                    return {
+                        "reply": f"您想购买哪种面额？当前可选：{labels}。",
+                        "source": "当前商品真实代金券与购买数量",
+                        "decision": "allow", "kind": "price",
+                        "query_context_update": make_context("target_amount"),
+                    }
+                if not plan.get("reply"):
+                    bundle_labels = []
+                    for option in candidates:
+                        delivered = sum(count for _, count in self._option_coupon_pairs(option))
+                        name = str(option.get("name") or "当前规格").strip()
+                        bundle_labels.append(f"{name}每份发{delivered}张")
+                    return {
+                        "reply": (
+                            f"当前在售规格无法刚好发{quantity}张。"
+                            + ("可选规格为：" + "；".join(dict.fromkeys(bundle_labels)) + "。" if bundle_labels else "")
+                        ),
+                        "source": "当前商品真实SKU发券组成",
+                        "decision": "deny", "kind": "price",
+                        "query_context_update": context_update,
+                    }
+                reply = str(plan["reply"])
+                selected = list(plan.get("selected") or [])
+                selected_context = {}
+                if len(selected) == 1:
+                    option = selected[0][0]
+                    selected_context = {
+                        "selected_sku_key": self.sku_key_for_option(option),
+                        "selected_sku_name": str(option.get("name") or "商品规格").strip(),
+                    }
                 return {
                     "reply": reply, "source": "当前商品真实代金券与购买数量",
                     "decision": "allow", "kind": "price",
-                    "query_context_update": context_update,
+                    "query_context_update": {**context_update, **selected_context},
                 }
 
             if candidates:
@@ -3753,7 +4062,7 @@ class V2Store(AppStore):
         if target_amount and voucher_matches:
             exact_matches = [
                 option for option in voucher_matches
-                if self._format_number(option.get("face_value")) == self._format_number(target_amount)
+                if self._option_total_value(option) == self._format_number(target_amount)
             ]
             calculation_options = exact_matches or voucher_matches
             if not slots.get("day_type"):
@@ -3987,11 +4296,198 @@ class V2Store(AppStore):
             return str(product.get("coupon_type_custom") or "其他卡券").strip()
         return COUPON_TYPE_LABELS.get(coupon_type, "")
 
+    @staticmethod
+    def promotion_purchase_intent(message: str) -> bool:
+        """Recognize common ways a buyer asks where/how/how much to buy."""
+        text = str(message or "").strip()
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", text).lower()
+        if not compact:
+            return False
+        if compact in {
+            "多少钱", "多钱", "多少", "价格", "价格呢", "什么价", "怎么卖",
+            "怎么买", "如何购买", "哪里买", "在哪买", "怎么下单", "如何下单",
+            "购买链接", "下单链接", "链接", "二维码", "购买入口", "下单入口",
+            "微信怎么买", "怎么付款", "如何付款", "付款方式", "我要买", "想买",
+            "能拍吗", "可以拍吗", "现在能买吗", "现在能拍吗", "能下单吗", "可以下单吗",
+            "有货吗", "还有吗", "还有货吗", "拍哪个", "买哪个", "选哪个",
+        }:
+            return True
+        return bool(re.search(
+            r"(?:多少钱|多钱|什么价|价格多少|售价|几块钱|几元)|"
+            r"(?:怎么|如何|哪里|在哪|从哪)(?:买|购买|拍|下单|付款)|"
+            r"(?:我要|我想|想|想要|准备|现在|可以|能|能不能|能否)(?:买|购买|拍|下单)|"
+            r"(?:买|购买|下单|付款)(?:入口|地址|链接|二维码|方式)|"
+            r"(?:推广|购买|下单|微信)(?:链接|二维码|入口)|"
+            r"(?:发|给|看|扫|打开|点)(?:一下|下)?(?:链接|二维码)|"
+            r"(?:发|给)我(?:个|一下)?(?:链接|二维码)|"
+            r"(?:链接|二维码).{0,5}(?:发我|给我|看看|看下)|"
+            r"(?:链接|二维码)(?:呢|在哪|在哪里|有吗|怎么扫|扫不出来|失效|打不开|点不开)|"
+            r"(?:扫哪|扫哪里|扫哪个|去哪扫|哪里扫|在哪扫|用微信扫)|"
+            r"(?:拍|买|选)(?:哪一个|哪个|哪款|什么规格)|"
+            r"(?:闲鱼|这里|页面)(?:能|可以|直接)?(?:买|拍|下单|付款)|"
+            r"(?:预算|消费|账单|抵扣|要抵|想抵)\s*\d+(?:\.\d+)?|"
+            r"(?:要|来)\s*[一二两三四五六七八九十\d]+\s*(?:张|份|个)|"
+            r"\d+(?:\.\d+)?\s*(?:元|块)?(?:的)?(?:多少钱|多钱|什么价|怎么买|怎么拍)",
+            text,
+            re.I,
+        ))
+
+    @staticmethod
+    def promotion_links(product: Dict) -> List[str]:
+        """Extract operator-supplied promotion links from authoritative raw knowledge."""
+        source = str(product.get("raw_text") or "")
+        link_pattern = re.compile(
+            r"(?:https?://|weixin://|#小程序://|www\.)[^\s<>\"'，。；;、]+",
+            re.I,
+        )
+        all_links = list(dict.fromkeys(match.rstrip(")）]】") for match in link_pattern.findall(source)))
+        if not all_links:
+            return []
+        preferred = []
+        for line in source.splitlines():
+            if not re.search(r"推广|购买|下单|微信|链接|入口|扫码|二维码", line):
+                continue
+            preferred.extend(match.rstrip(")）]】") for match in link_pattern.findall(line))
+        preferred = list(dict.fromkeys(preferred))
+        return preferred or (all_links if len(all_links) == 1 else [])
+
     @classmethod
-    def coupon_usage_instructions(cls, product: Dict) -> str:
+    def _mixed_coupon_delivery_rows(cls, product: Dict, message: str = "") -> List[str]:
+        """Render SKU-level delivery facts without inventing one global channel."""
+        structured = product.get("structured") or {}
+        structured = structured if isinstance(structured, dict) else {}
+        common = structured.get("common_rules") or {}
+        common = common if isinstance(common, dict) else {}
+        profiles = structured.get("sku_profiles") or []
+        profiles = [dict(row) for row in profiles if isinstance(row, dict)]
+        if not profiles:
+            profiles = [
+                {
+                    "sku_key": cls.sku_key_for_option(option),
+                    "sku_name": option.get("name") or "商品规格",
+                    "face_value": option.get("face_value") or "",
+                }
+                for option in cls.extract_product_options(product)
+            ]
+
+        query = normalize_text(message).lower()
+        exact_profiles = []
+        if query:
+            exact_profiles = [
+                row for row in profiles
+                if len(normalize_text(row.get("sku_name") or row.get("name") or "")) >= 2
+                and normalize_text(row.get("sku_name") or row.get("name") or "").lower() in query
+            ]
+        requested_amounts = {
+            cls._format_number(value)
+            for value in re.findall(
+                r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元|块|面额|代金券|优惠券|券)",
+                str(message or ""),
+            )
+            if cls._format_number(value)
+        }
+        selected = exact_profiles
+        if not selected and requested_amounts:
+            for row in profiles:
+                face = cls._format_number(row.get("face_value") or "")
+                name = str(row.get("sku_name") or row.get("name") or "")
+                name_amounts = {
+                    cls._format_number(value)
+                    for value in re.findall(
+                        r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元|块|面额|代金券|优惠券|券)",
+                        name,
+                    )
+                }
+                if face in requested_amounts or requested_amounts & name_amounts:
+                    selected.append(row)
+        if not selected and not requested_amounts:
+            platform_names = (
+                "商家小程序", "美团", "抖音", "快手", "大众点评", "支付宝",
+                "微信", "云闪付", "京东", "淘宝", "饿了么", "小程序",
+            )
+            mentioned_platforms = [
+                value for value in platform_names
+                if value in str(message or "")
+                and not (value == "小程序" and "商家小程序" in str(message or ""))
+            ]
+            # “美团还是抖音” asks for a comparison, while “抖音券怎么用”
+            # selects the matching SKU channel.
+            if len(set(mentioned_platforms)) == 1:
+                platform = mentioned_platforms[0]
+                selected = [
+                    row for row in profiles
+                    if platform in " ".join(
+                        str(row.get(key) or "")
+                        for key in ("sku_name", "name", "delivery_platform", "delivery_method")
+                    )
+                ]
+        targets = selected or ([] if requested_amounts else profiles)
+
+        labels = (
+            ("delivery_platform", "发券平台"),
+            ("delivery_method", "发券方式"),
+            ("claim_method", "领取方式"),
+            ("redeem_method", "核销方式"),
+        )
+        rows = []
+        for profile in targets:
+            merged = dict(common)
+            merged.update({
+                key: value for key, value in profile.items()
+                if value not in (None, "", [], {})
+            })
+            name = str(profile.get("sku_name") or profile.get("name") or "商品规格").strip()
+            details = []
+            seen = set()
+            for key, label in labels:
+                text = cls._fact_value_text(merged.get(key)).rstrip("。；; ")
+                if text and text not in seen:
+                    seen.add(text)
+                    details.append(f"{label}：{text}")
+            if not any(item.startswith("发券平台：") for item in details):
+                platforms = []
+                for platform in (
+                    "商家小程序", "美团", "抖音", "快手", "大众点评", "支付宝",
+                    "微信", "云闪付", "京东", "淘宝", "饿了么", "小程序",
+                ):
+                    if (
+                        platform in name and platform not in platforms
+                        and not (platform == "小程序" and "商家小程序" in name)
+                    ):
+                        platforms.append(platform)
+                if platforms:
+                    details.insert(0, "发券平台：" + "、".join(platforms))
+            if details:
+                rows.append(f"{name}：" + "；".join(details) + "。")
+
+        if rows:
+            return rows
+
+        if requested_amounts:
+            return []
+
+        facts = structured.get("facts") or {}
+        facts = facts if isinstance(facts, dict) else {}
+        fallback = []
+        fact_keys = (
+            (("发码平台", "发券平台", "delivery_platform"), "发券平台"),
+            (("发码方式", "发券方式", "delivery_method"), "发券方式"),
+            (("领取方式", "claim_method"), "领取方式"),
+            (("核销方式", "redeem_method"), "核销方式"),
+        )
+        for keys, label in fact_keys:
+            text = cls._first_fact(facts, keys).rstrip("。；; ")
+            if text:
+                fallback.append(f"{label}：{text}")
+        return ["商品知识：" + "；".join(fallback) + "。"] if fallback else []
+
+    @classmethod
+    def coupon_usage_instructions(cls, product: Dict, message: str = "") -> str:
         custom = str(product.get("coupon_instructions") or "").strip()
         if custom:
             return custom
+        if str(product.get("coupon_type") or "").strip() in {"mixed", "promotion"}:
+            return "\n".join(cls._mixed_coupon_delivery_rows(product, message))
         return COUPON_TYPE_DEFAULT_INSTRUCTIONS.get(
             str(product.get("coupon_type") or "").strip(),
             "付款后发送电子券码，到店扫码核销。",
@@ -4064,7 +4560,7 @@ class V2Store(AppStore):
         if requested:
             matched = [
                 option for option in priced
-                if self._format_number(option.get("face_value")) in requested
+                if self._option_total_value(option) in requested
             ]
             if not matched:
                 target = max(Decimal(value) for value in requested)
@@ -4918,21 +5414,38 @@ class V2Store(AppStore):
         return "；".join(selected)
 
     @classmethod
+    def _option_coupon_pairs(cls, option: Dict) -> List[tuple[Decimal, int]]:
+        pairs = [
+            (Decimal(amount), int(count))
+            for amount, count in re.findall(
+                r"(\d+(?:\.\d+)?)元券(\d+)张",
+                str(option.get("composition") or ""),
+            )
+            if int(count) > 0
+        ]
+        if pairs:
+            return pairs
+        try:
+            face = Decimal(str(option.get("face_value") or "0"))
+        except InvalidOperation:
+            face = Decimal("0")
+        return [(face, 1)] if face > 0 else []
+
+    @classmethod
     def _purchase_contents_label(cls, option: Dict, quantity: int = 1) -> str:
         """Render the coupons actually delivered, not an internal option name."""
-        composition = str(option.get("composition") or "")
-        pairs = re.findall(r"(\d+(?:\.\d+)?)元券(\d+)张", composition)
+        pairs = cls._option_coupon_pairs(option)
         if pairs:
             face = cls._format_number(option.get("face_value") or "")
             if (
                 quantity == 1
                 and len(pairs) == 1
                 and cls._format_number(pairs[0][0]) == face
-                and int(pairs[0][1]) == 1
+                and pairs[0][1] == 1
             ):
                 return f"{face}元代金券"
             parts = [
-                f"{int(count) * quantity}张{cls._format_number(amount)}元代金券"
+                f"{count * quantity}张{cls._format_number(amount)}元代金券"
                 for amount, count in pairs
             ]
             return "、".join(parts)
@@ -4943,22 +5456,18 @@ class V2Store(AppStore):
 
     @classmethod
     def _option_total_value(cls, option: Dict) -> str:
-        pairs = re.findall(
-            r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
-        )
+        pairs = cls._option_coupon_pairs(option)
         if pairs:
-            total = sum(Decimal(amount) * int(count) for amount, count in pairs)
+            total = sum(amount * count for amount, count in pairs)
             return cls._format_number(total)
         return cls._format_number(option.get("face_value") or "")
 
     @classmethod
     def _option_delivers_single_face(cls, option: Dict, amount: str) -> bool:
-        pairs = re.findall(
-            r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
-        )
+        pairs = cls._option_coupon_pairs(option)
         if pairs:
             return (
-                len(pairs) == 1 and int(pairs[0][1]) == 1
+                len(pairs) == 1 and pairs[0][1] == 1
                 and cls._format_number(pairs[0][0]) == cls._format_number(amount)
             )
         return cls._format_number(option.get("face_value") or "") == cls._format_number(amount)
@@ -4972,11 +5481,7 @@ class V2Store(AppStore):
         text = f"{name}售价{price}元，购买后发放{contents}"
         if total:
             text += f"，共可抵扣{total}元"
-        delivered = sum(
-            int(count) for _, count in re.findall(
-                r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
-            )
-        )
+        delivered = sum(count for _, count in cls._option_coupon_pairs(option))
         try:
             stack = int(Decimal(str(option.get("max_stack") or "0")))
         except (InvalidOperation, ValueError):
@@ -5008,13 +5513,134 @@ class V2Store(AppStore):
             # case “only 100 available, buyer asks for 200”; anything beyond
             # this conservative fallback is called out as unconfirmed below.
             maximum = int(limit.group(1)) if limit else 2
-        delivered = sum(
-            int(count)
-            for _, count in re.findall(
-                r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
-            )
-        ) or 1
+        delivered = sum(count for _, count in cls._option_coupon_pairs(option)) or 1
         return max(1, maximum // delivered)
+
+    def _coupon_quantity_purchase_plan(
+        self, product: Dict, options: List[Dict], desired_count: int,
+        requested_face: str = "",
+    ) -> Dict:
+        """Price an exact number of delivered coupons, not an SKU multiplier."""
+        groups: Dict[str, List[tuple[Dict, int, Decimal]]] = {}
+        for option in options:
+            pairs = self._option_coupon_pairs(option)
+            unit_faces = {self._format_number(amount) for amount, _ in pairs if amount > 0}
+            if len(unit_faces) != 1:
+                continue
+            unit_face = next(iter(unit_faces))
+            if requested_face and unit_face != self._format_number(requested_face):
+                continue
+            try:
+                price = Decimal(str(option.get("sale_price") or "0"))
+            except InvalidOperation:
+                continue
+            delivered = sum(count for _, count in pairs)
+            if price > 0 and delivered > 0:
+                groups.setdefault(unit_face, []).append((option, delivered, price))
+        if not groups:
+            return {}
+        if not requested_face and len(groups) > 1:
+            return {"ambiguous_faces": sorted(groups, key=Decimal)}
+
+        best = None
+        for unit_face, rows in groups.items():
+            zero_counts = tuple(0 for _ in rows)
+            dp: List[Optional[tuple[Decimal, int, tuple[int, ...]]]] = [None] * (desired_count + 1)
+            dp[0] = (Decimal("0"), 0, zero_counts)
+            for count in range(1, desired_count + 1):
+                for index, (_, delivered, price) in enumerate(rows):
+                    if delivered > count or dp[count - delivered] is None:
+                        continue
+                    previous = dp[count - delivered]
+                    quantities = list(previous[2])
+                    quantities[index] += 1
+                    candidate = (previous[0] + price, previous[1] + 1, tuple(quantities))
+                    if dp[count] is None or candidate[:2] < dp[count][:2]:
+                        dp[count] = candidate
+            if dp[desired_count] is None:
+                continue
+            total_price, package_count, quantities = dp[desired_count]
+            candidate = (total_price, package_count, unit_face, rows, quantities)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        if best is None:
+            return {
+                "unavailable_count": desired_count,
+                "available_bundles": {
+                    face: sorted({delivered for _, delivered, _ in rows})
+                    for face, rows in groups.items()
+                },
+            }
+
+        total_price, _, unit_face, rows, quantities = best
+        selected = [
+            (rows[index][0], quantity)
+            for index, quantity in enumerate(quantities) if quantity
+        ]
+        total_value = Decimal(unit_face) * desired_count
+        contents = f"{desired_count}张{unit_face}元代金券"
+        if len(selected) == 1:
+            option, package_quantity = selected[0]
+            name = str(option.get("name") or option.get("sku_name") or "当前规格").strip()
+            if package_quantity == 1:
+                reply = (
+                    f"{name}：售价{self._format_number(total_price)}元，"
+                    f"发{contents}，共可抵扣{self._format_number(total_value)}元。"
+                )
+            else:
+                reply = (
+                    f"购买{package_quantity}份{name}，共支付{self._format_number(total_price)}元，"
+                    f"发{contents}，共可抵扣{self._format_number(total_value)}元。"
+                )
+        else:
+            details = "＋".join(
+                f"{str(option.get('name') or option.get('sku_name') or '当前规格').strip()}×{quantity}"
+                for option, quantity in selected
+            )
+            reply = (
+                f"购买方案：{details}，共支付{self._format_number(total_price)}元，"
+                f"发{contents}，共可抵扣{self._format_number(total_value)}元。"
+            )
+
+        limits = []
+        for option, _ in selected:
+            try:
+                limit = int(Decimal(str(option.get("max_stack") or "0")))
+            except (InvalidOperation, ValueError):
+                limit = 0
+            if limit > 0:
+                limits.append(limit)
+        knowledge = "\n".join((
+            str(product.get("raw_text") or ""), str(product.get("ai_summary") or ""),
+        ))
+        if limits:
+            limit = min(limits)
+            if desired_count > limit:
+                if len(selected) == 1:
+                    option, _ = selected[0]
+                    pairs = self._option_coupon_pairs(option)
+                    if len(pairs) == 1 and pairs[0][1] == 1:
+                        reply = (
+                            f"购买{contents}共{self._format_number(total_price)}元。"
+                            f"每张可抵扣{unit_face}元；当前同面额代金券每次最多使用{limit}张，"
+                            f"{desired_count}张不能在同一次消费中全部使用。"
+                        )
+                    else:
+                        reply = reply.replace(
+                            f"，共可抵扣{self._format_number(total_value)}元。", "。",
+                        ) + f"该面额每次最多使用{limit}张，本次购买的券不能在同一次消费中全部使用。"
+                else:
+                    reply = reply.replace(
+                        f"，共可抵扣{self._format_number(total_value)}元。", "。",
+                    ) + f"该面额每次最多使用{limit}张，本次购买的券不能在同一次消费中全部使用。"
+            else:
+                reply += f"该面额每次最多使用{limit}张。"
+        elif self._supports_unlimited_stacking(knowledge):
+            reply += "该面额支持无限叠加。"
+        return {
+            "reply": reply, "selected": selected,
+            "unit_face": unit_face, "total_price": total_price,
+        }
 
     def amount_inquiry_plan_reply(
         self, product: Dict, message: str,
@@ -5264,20 +5890,20 @@ class V2Store(AppStore):
             if not self._is_sellable_option(option):
                 continue
             try:
-                face = Decimal(str(option.get("face_value") or "0"))
+                option_value = Decimal(str(self._option_total_value(option) or "0"))
                 price = Decimal(str(option.get("sale_price") or "0"))
             except InvalidOperation:
                 continue
-            if face == target and price > 0:
+            if option_value == target and price > 0:
                 exact.append((price, option))
         if exact:
             price, option = min(exact, key=lambda value: value[0])
-            face = Decimal(str(option.get("face_value") or "0"))
+            option_value = Decimal(str(self._option_total_value(option) or "0"))
             contents = self._purchase_contents_label(option, 1)
             reply = (
                 f"{self._format_number(target)}元消费的话，可以购买"
                 f"{contents}，售价{self._format_number(price)}元，"
-                f"可抵扣{self._format_number(face)}元。"
+                f"可抵扣{self._format_number(option_value)}元。"
             )
             if include_final_cost:
                 savings = target - price
@@ -5290,24 +5916,19 @@ class V2Store(AppStore):
         candidates = []
         for option in options:
             try:
-                face = Decimal(str(option.get("face_value") or "0"))
+                option_value = Decimal(str(self._option_total_value(option) or "0"))
                 price = Decimal(str(option.get("sale_price") or "0"))
             except (InvalidOperation, ValueError):
                 continue
             maximum = self._option_stack_limit(product, option)
-            if face <= 0 or price <= 0 or maximum <= 0:
+            if option_value <= 0 or price <= 0 or maximum <= 0:
                 continue
-            quantity = min(int(target // face), maximum)
+            quantity = min(int(target // option_value), maximum)
             if quantity > 0:
-                delivered_count = sum(
-                    int(count)
-                    for _, count in re.findall(
-                        r"(\d+(?:\.\d+)?)元券(\d+)张", str(option.get("composition") or "")
-                    )
-                ) or 1
+                delivered_count = sum(count for _, count in self._option_coupon_pairs(option)) or 1
                 candidates.append((
-                    face * quantity, price * quantity, delivered_count * quantity,
-                    quantity, face, price, maximum, option,
+                    option_value * quantity, price * quantity, delivered_count * quantity,
+                    quantity, option_value, price, maximum, option,
                 ))
         if not candidates:
             if missing_denomination:
@@ -5322,7 +5943,7 @@ class V2Store(AppStore):
                     "不属于代金券商品。"
                 )
             return "当前商品没有不超过该消费金额的可用代金券。"
-        covered, total_price, coupon_count, quantity, face, price, maximum, option = min(
+        covered, total_price, coupon_count, quantity, option_value, price, maximum, option = min(
             candidates, key=lambda row: (-row[0], row[1], row[2])
         )
         remainder = target - covered
@@ -6125,6 +6746,9 @@ class V2Store(AppStore):
         sections = []
         if lines:
             sections.append("【商品规格】\n" + "\n".join(lines))
+        combination_summary = self._purchase_combination_summary(product, options)
+        if combination_summary:
+            sections.append("【组合购买方案】\n" + combination_summary)
         profile_summary = self._sku_profile_summary(product.get("structured") or {})
         if profile_summary:
             sections.append("【逐SKU规则档案】\n" + profile_summary)
@@ -6184,6 +6808,10 @@ class V2Store(AppStore):
         source_rules = self._uncovered_source_rules(
             str(product.get("raw_text") or ""), "\n".join(sections)
         )
+        grouped_rules, source_rules = self._group_uncovered_source_rules(source_rules)
+        for title, rule_lines in grouped_rules.items():
+            if rule_lines:
+                sections.append(title + "\n" + "\n".join(rule_lines))
         if source_rules:
             sections.append("【原文规则保留】\n" + "\n".join(source_rules))
         return "\n\n".join(sections)
@@ -6197,6 +6825,25 @@ class V2Store(AppStore):
 
         brand = self.extract_brand(product)
         coupon_type = str(product.get("coupon_type") or "").strip()
+        if coupon_type == "promotion":
+            subject = title or brand or "当前商品"
+            sections = [
+                f"您好，您咨询的是{subject}。",
+                "本商品仅通过推广渠道购买，请不要在闲鱼页面下单或付款。",
+            ]
+            links = self.promotion_links(product)
+            qr_asset = self.promotion_qr_asset(str(product.get("item_id") or ""))
+            purchase_lines = []
+            if links:
+                purchase_lines.append("请使用微信打开以下推广链接购买：")
+                purchase_lines.extend(links)
+            if qr_asset:
+                purchase_lines.append("也可以使用微信扫描下方二维码，进入推广页面选择商品后付款。")
+                purchase_lines.append(f"{{$图片:{qr_asset['id']}}}")
+            if not purchase_lines:
+                purchase_lines.append("当前推广链接和二维码尚未配置，请暂时不要下单，等待卖家补充购买入口。")
+            sections.append("【购买方式】\n" + "\n".join(purchase_lines))
+            return "\n".join(sections)
         coupon_phrase = {
             "meituan": "美团电子券",
             "douyin": "抖音电子券",
@@ -6204,10 +6851,13 @@ class V2Store(AppStore):
             "electronic_code": "电子券码",
             "other": self.coupon_type_display(product) or "电子券码",
         }.get(coupon_type, "电子券码")
-        greeting = (
-            f"您好，当前商品为{brand}品牌{coupon_phrase}。"
-            if brand else f"您好，当前商品为{coupon_phrase}。"
-        )
+        if coupon_type == "mixed":
+            greeting = f"您好，以下是{brand + '品牌' if brand else ''}当前商品的规格和使用信息。"
+        else:
+            greeting = (
+                f"您好，当前商品为{brand}品牌{coupon_phrase}。"
+                if brand else f"您好，当前商品为{coupon_phrase}。"
+            )
 
         options = self.extract_product_options(product)
         product_lines = [self.format_product_option(option, brand) for option in options]
@@ -6248,7 +6898,9 @@ class V2Store(AppStore):
             rule_parts.append(use_rule.rstrip("。；; ") + "。")
         if rule_parts:
             sections.append("【使用规则】\n" + "\n".join(rule_parts))
-        sections.append("【发券方式】\n" + self.coupon_usage_instructions(product).rstrip("。；; ") + "。")
+        delivery_text = self.coupon_usage_instructions(product)
+        if delivery_text:
+            sections.append("【发券方式】\n" + delivery_text.rstrip("。；; ") + "。")
         reminder_source = "\n".join((
             raw_text,
             str(product.get("custom_policy_summary") or product.get("custom_policy_raw") or ""),
@@ -6437,6 +7089,34 @@ class V2Store(AppStore):
             output.append(item)
         return output
 
+    def promotion_qr_asset(self, item_id: str) -> Optional[Dict]:
+        """Return the enabled QR asset reserved for promotion-mode sales."""
+        return next((
+            asset for asset in self.list_image_assets(str(item_id or ""))
+            if str(asset.get("purpose") or "") == PROMOTION_QR_PURPOSE
+            and bool(asset.get("enabled")) and str(asset.get("file_path") or "").strip()
+        ), None)
+
+    def promotion_purchase_reply(self, product: Dict) -> Dict:
+        links = self.promotion_links(product)
+        qr_asset = self.promotion_qr_asset(str(product.get("item_id") or ""))
+        lines = ["这款商品请不要在闲鱼页面下单或付款，仅通过卖家提供的推广渠道购买。"]
+        if links:
+            lines.append("请使用微信打开以下推广链接：\n" + "\n".join(links))
+        if qr_asset:
+            lines.append("也可以使用微信扫描我发送的二维码，进入推广页面选择商品并付款。")
+        if not links and not qr_asset:
+            lines.append("当前推广链接和二维码尚未配置，请暂时不要下单，等待卖家补充购买入口。")
+        else:
+            lines.append("商品规格和实际支付金额请以推广购买页面展示为准。")
+        return {
+            "reply": "\n\n".join(lines),
+            "source": "人工设置的推广购买流程",
+            "decision": "allow",
+            "kind": "promotion_purchase",
+            **({"image_asset_id": qr_asset["id"]} if qr_asset else {}),
+        }
+
     def delete_image_asset(self, asset_id: int) -> Optional[Dict]:
         asset = self.get_image_asset(asset_id)
         if not asset:
@@ -6455,6 +7135,8 @@ class V2Store(AppStore):
         candidates = []
         fuzzy = []
         for asset in self.list_image_assets(item_id):
+            if str(asset.get("purpose") or "") == PROMOTION_QR_PURPOSE:
+                continue
             if not asset.get("enabled"):
                 continue
             words = [word for word in asset.get("trigger_words", []) if str(word).strip()]
@@ -7216,6 +7898,25 @@ class V2Store(AppStore):
                     == normalize_text(option.get("composition") or "")
                 ]
                 same = commercial_matches[0] if len(commercial_matches) == 1 else None
+            if same is None:
+                face = self._format_number(option.get("face_value") or "")
+                platforms = {
+                    value for value in ("美团", "抖音", "小程序")
+                    if value in str(option.get("name") or "")
+                }
+                compatible = [
+                    existing for existing in options
+                    if face
+                    and self._format_number(existing.get("face_value") or "") == face
+                    and (
+                        not platforms
+                        or platforms.intersection({
+                            value for value in ("美团", "抖音", "小程序")
+                            if value in str(existing.get("name") or "")
+                        })
+                    )
+                ]
+                same = compatible[0] if len(compatible) == 1 else None
             if same:
                 same_key = self.sku_key_for_option(same)
                 if key != same_key:
@@ -7223,6 +7924,8 @@ class V2Store(AppStore):
                     if key not in aliases:
                         aliases.append(key)
                 for field in ("face_value", "composition", "max_stack"):
+                    if field == "max_stack" and same.get("_platform_sku"):
+                        continue
                     if not same.get(field) and option.get(field):
                         same[field] = option[field]
                 continue
@@ -7248,6 +7951,13 @@ class V2Store(AppStore):
             configuration_keys = [key, legacy_key, *(
                 str(value) for value in option.get("_configuration_alias_keys") or []
             )]
+            face = self._format_number(option.get("face_value") or "")
+            platforms = [
+                value for value in ("美团", "抖音", "小程序")
+                if value in str(option.get("name") or "")
+            ]
+            if platforms and face:
+                configuration_keys.append(f"source:platform:{platforms[0]}:{face}")
             key = next((
                 candidate for candidate in configuration_keys
                 if candidate in rules or candidate in bindings
@@ -10519,7 +11229,9 @@ class V2Store(AppStore):
         for _, kind, label, payload in sorted(tasks, key=lambda value: value[0]):
             child = None
             if kind == "usage":
-                reply = self.coupon_usage_instructions(product)
+                reply = self.coupon_usage_instructions(product, text)
+                if not reply:
+                    reply = "商品知识暂未标明该规格的发券渠道，请说明具体规格或面额后再确认。"
             elif kind == "voucher_value":
                 reply = self.voucher_value_confirmation_reply(product, text) or (
                     "当前商品资料中暂未找到能确认的售价与面额对应关系。"
@@ -10850,6 +11562,8 @@ class V2Store(AppStore):
             compact,
         )
         if purchase_failure:
+            if str(product.get("coupon_type") or "").strip() == "promotion":
+                return self.promotion_purchase_reply(product)
             amount = self._format_number(purchase_failure.group(1))
             candidates = [
                 option for option in self.extract_product_options(product)
@@ -10882,6 +11596,8 @@ class V2Store(AppStore):
             r"(?:买|购买|下单|拍)(?:券|这个|该商品)?(?:吗|嘛|么)?",
             compact,
         ):
+            if str(product.get("coupon_type") or "").strip() == "promotion":
+                return self.promotion_purchase_reply(product)
             return {
                 "reply": "可以，当前商品仍在售；请先按页面下单，并按商品规则在使用当天购买、当天使用。",
                 "source": "当前商品在售状态与购买规则",
@@ -10941,6 +11657,16 @@ class V2Store(AppStore):
             or actual_failure or delivery_mismatch or expiry_statement
             or personal_reason or aftersale_followup
         )
+
+        # Promotion mode changes only the pre-sale purchase path. Aftersales,
+        # store applicability, dates and usage rules continue through their
+        # existing authoritative resolvers.
+        if (
+            str(product.get("coupon_type") or "").strip() == "promotion"
+            and not aftersale_candidate
+            and self.promotion_purchase_intent(message)
+        ):
+            return self.promotion_purchase_reply(product)
 
         if delivery_mismatch:
             if not refund_request:
@@ -11808,8 +12534,20 @@ class V2Store(AppStore):
                 "kind": "same_day_use",
             }
 
+        coupon_type = str(product.get("coupon_type") or "").strip()
         coupon_label = self.coupon_type_display(product)
         if any(word in message for word in ("转赠", "转送", "送给别人", "给别人用")):
+            if coupon_type in {"mixed", "promotion"}:
+                delivery = self.coupon_usage_instructions(product, message)
+                return {
+                    "reply": (
+                        "当前商品知识暂未说明该规格是否支持转赠，请告诉我具体规格或面额后确认。"
+                        + (f"\n{delivery}" if delivery else "")
+                    ),
+                    "source": "商品知识中的SKU级发券信息",
+                    "decision": "allow",
+                    "kind": "transfer_usage",
+                }
             return {
                 "reply": "不支持转赠哦，需要购买人本人下单并使用。\n\n付款后系统会自动发送领取信息，使用时打开美团券码，到适用门店向工作人员出示券码核销即可。",
                 "source": "卡券转赠与核销规则",
@@ -11818,9 +12556,23 @@ class V2Store(AppStore):
             }
         platform_words = (
             "什么券", "发的什么券", "哪个平台", "什么平台", "美团还是抖音",
-            "美团券吗", "抖音券吗", "是美团", "是抖音", "哪种券",
+            "美团券吗", "抖音券吗", "是美团", "是抖音", "哪种券", "什么卡券",
+            "卡券类型", "发什么卡", "什么渠道", "哪个渠道", "发券渠道", "发卡渠道",
+            "发券平台", "发卡平台",
         )
         if any(word in message for word in platform_words):
+            if coupon_type in {"mixed", "promotion"}:
+                delivery = self.coupon_usage_instructions(product, message)
+                return {
+                    "reply": (
+                        "根据当前商品知识，不同规格的发券渠道如下：\n" + delivery
+                        if delivery else
+                        "当前商品知识暂未标明具体发券渠道，请告诉我具体规格或面额后再确认。"
+                    ),
+                    "source": "商品知识中的SKU级发券信息",
+                    "decision": "allow",
+                    "kind": "coupon_type",
+                }
             if not coupon_label:
                 return {
                     "reply": "当前商品资料暂未设置卡券类型，暂时无法准确确认。",
@@ -11910,10 +12662,12 @@ class V2Store(AppStore):
             asks_send = any(word in message for word in send_words)
             asks_use = any(word in message for word in use_words)
             if asks_send or asks_use:
-                reply = self.coupon_usage_instructions(product)
+                reply = self.coupon_usage_instructions(product, message)
+                if not reply:
+                    reply = "商品知识暂未标明该规格的发券、领取或核销方式，请说明具体规格或面额后再确认。"
                 return {
                     "reply": reply,
-                    "source": "发码与核销固定回复",
+                    "source": "商品发码与核销知识" if coupon_type in {"mixed", "promotion"} else "发码与核销固定回复",
                     "decision": "allow",
                     "kind": "delivery_usage",
                 }
@@ -11922,6 +12676,19 @@ class V2Store(AppStore):
             "去店里再买", "到店再买", "店里再买", "现场再买", "现场买吗",
             "去店里买", "到店买吗", "怎么买", "如何购买",
         )):
+            if coupon_type == "promotion":
+                return self.promotion_purchase_reply(product)
+            if coupon_type == "mixed":
+                delivery = self.coupon_usage_instructions(product, message)
+                return {
+                    "reply": (
+                        "直接在当前商品页面选择所需规格拍下并付款。"
+                        + (f"\n{delivery}" if delivery else "具体发券和领取方式以所选规格的商品知识为准。")
+                    ),
+                    "source": "商品知识中的SKU级购买与发券信息",
+                    "decision": "allow",
+                    "kind": "purchase_flow",
+                }
             return {
                 "reply": "不用到店后再买哦，直接在当前商品页面拍下并付款，系统会自动发送电子券；到店后出示券码核销即可。请确认当天需要使用后再购买。",
                 "source": "购买、发货与核销流程",

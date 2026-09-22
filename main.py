@@ -1136,10 +1136,12 @@ class XianyuLive:
             return text
         return self.sanitize_buyer_reply(text)
 
-    @staticmethod
-    def should_suppress_first_reply_for_question(product, message):
-        """The enabled first reply is mandatory for every real first buyer message."""
-        return False
+    def should_suppress_first_reply_for_question(self, product, message):
+        """Avoid sending the same promotion entry twice on the first purchase question."""
+        if str((product or {}).get("coupon_type") or "").strip() != "promotion":
+            return False
+        detector = getattr(self.app_store, "promotion_purchase_intent", None)
+        return bool(detector and detector(message))
 
     async def send_required_first_reply(
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
@@ -1995,6 +1997,17 @@ class XianyuLive:
                 bot_reply = predecision.suggested_reply
                 logger.info("议价请求命中最高规则，直接使用礼貌婉拒")
             elif deterministic:
+                deterministic_asset_id = deterministic.get("image_asset_id")
+                first_reply_already_sent_asset = bool(
+                    deterministic_asset_id and first_reply_sent_now
+                    and f"{{$图片:{deterministic_asset_id}}}" in str(
+                        (current_product or {}).get("first_reply_text") or ""
+                    )
+                )
+                if deterministic_asset_id and not first_reply_already_sent_asset:
+                    resolved_asset = self.app_store.get_image_asset(int(deterministic_asset_id))
+                    if resolved_asset and resolved_asset.get("file_path"):
+                        image_asset = resolved_asset
                 bot_reply = deterministic["reply"]
                 logger.info(f"确定性规则命中: {deterministic.get('source', '')}")
             else:
