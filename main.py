@@ -1137,11 +1137,38 @@ class XianyuLive:
         return self.sanitize_buyer_reply(text)
 
     def should_suppress_first_reply_for_question(self, product, message):
-        """Avoid sending the same promotion entry twice on the first purchase question."""
-        if str((product or {}).get("coupon_type") or "").strip() != "promotion":
+        """Let a concrete first question receive one focused answer."""
+        product = product or {}
+        coupon_type = str(product.get("coupon_type") or "").strip()
+        if coupon_type == "promotion":
+            detector = getattr(self.app_store, "promotion_purchase_intent", None)
+            return bool(detector and detector(message))
+        if coupon_type == "purchase_order":
             return False
-        detector = getattr(self.app_store, "promotion_purchase_intent", None)
-        return bool(detector and detector(message))
+        # Seller-authored welcomes stay intact. Only a generated catalog-style
+        # welcome is redundant before a direct business answer.
+        if bool(product.get("first_reply_manual")) or not bool(product.get("enabled", 1)):
+            return False
+        classifier = getattr(self.app_store, "classify_buyer_intents", None)
+        if callable(classifier):
+            profile = classifier(message) or {}
+            if profile.get("primary_intent") not in {None, "", "unknown", "social"}:
+                return True
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or "")).lower()
+        compact = re.sub(
+            r"^(?:(?:你好|您好|哈喽|嗨|hi|hello|hey)(?:呀|啊|哦|呢)?)+",
+            "", compact, flags=re.I,
+        )
+        if not compact:
+            return False
+        return bool(re.search(
+            r"多少钱|多钱|什么价格|价格多少|价格呢|什么价|啥价|价钱|售价|报价|"
+            r"怎么卖|怎么收费|几元|几块|怎么买|怎么拍|怎么下单|如何购买|"
+            r"门店|哪家店|哪个店|哪里能用|可以用吗|能用吗|"
+            r"怎么用|核销|领取|发券|叠加|最多几张|限购|有效期|不可用日期|"
+            r"工作日|周末|节假日|早餐|午餐|晚餐|儿童|老人|成人|退款|售后",
+            compact,
+        ))
 
     async def send_required_first_reply(
         self, websocket, chat_id, send_user_id, scope_id, item_id, product, conversation,
