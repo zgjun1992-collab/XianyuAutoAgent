@@ -5954,6 +5954,31 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("没有明确写超值放题不含大闸蟹", correction["reply"])
         self.assertIn("不能仅凭未提及", correction["reply"])
 
+    def test_explicit_coupon_denomination_purchase_is_not_a_consumption_amount(self):
+        self.store.save_v2_product(
+            "denomination-purchase", "100元抵扣券组合",
+            "100x2：售价115.8元，发100元券2张\n"
+            "100x3：售价169.8元，发100元券3张\n"
+            "300元代金券：售价212.8元，发300元券1张",
+        )
+        for message in ("好的，100抵扣券怎么拍", "一百抵扣券怎么买"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("denomination-purchase", message)
+                self.assertEqual("sku_purchase", result["kind"])
+                self.assertIn("100元抵扣券请按需要张数选择对应规格", result["reply"])
+                self.assertIn("100x2", result["reply"])
+                self.assertIn("付款后发2张100元代金券", result["reply"])
+                self.assertNotIn("消费金额", result["reply"])
+
+        consumption = self.store.resolve_deterministic(
+            "denomination-purchase", "抵扣100元怎么拍",
+        )
+        self.assertEqual("consumption_plan", consumption["kind"])
+
+        profile = classify_buyer_message("好的，100抵扣券怎么拍")
+        self.assertEqual("purchase", profile["primary_intent"])
+        self.assertEqual("denomination_purchase", profile["primary_subtype"])
+
     def test_package_content_only_denies_when_sku_has_explicit_negative_evidence(self):
         product = {
             "structured": {"sku_profiles": [

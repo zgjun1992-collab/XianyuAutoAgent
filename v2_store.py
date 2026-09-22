@@ -282,10 +282,21 @@ def classify_buyer_message(value: object) -> Dict:
         r"(?:怎么拍|怎么下单|怎么买|如何购买|如何凑|凑单)[^。！？\n]{0,10}\d+(?:\.\d+)?",
         business_text,
     )
+    denomination_purchase = re.search(
+        r"(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*"
+        r"(?:元|块)?\s*(?:的)?\s*(?:代金券|优惠券|抵扣券|现金券|券)"
+        r"[^。！？\n]{0,10}(?:怎么拍|怎么买|如何拍|如何买|怎么下单|如何下单|拍哪个|买哪个)|"
+        r"(?:怎么拍|怎么买|如何拍|如何买|怎么下单|如何下单|拍哪个|买哪个)"
+        r"[^。！？\n]{0,10}(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*"
+        r"(?:元|块)?\s*(?:的)?\s*(?:代金券|优惠券|抵扣券|现金券|券)",
+        business_text,
+    )
     if value_confirmation:
         detected["price"] = {"intent": "price", "subtype": "voucher_value_confirmation", "evidence": value_confirmation.group(0), "position": value_confirmation.start()}
     elif quantity_price:
         detected["price"] = {"intent": "price", "subtype": "quantity_price", "evidence": quantity_price.group(0), "position": quantity_price.start()}
+    elif denomination_purchase:
+        detected["purchase"] = {"intent": "purchase", "subtype": "denomination_purchase", "evidence": denomination_purchase.group(0), "position": denomination_purchase.start()}
     elif consumption_plan:
         detected["price"] = {"intent": "price", "subtype": "consumption_plan", "evidence": consumption_plan.group(0), "position": consumption_plan.start()}
     elif price_signal and condition_signal:
@@ -2065,6 +2076,7 @@ class V2Store(AppStore):
             r"(?:^|[\n；;])[ \t]*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d{1,2}、[ \t]*|\d{1,2}\.[ \t]+)?[ \t]*"
             r"(?P<platform>美团|抖音|小程序)?[ \t]*"
             r"(?P<face>\d+(?:\.\d+)?)[ \t]*元?[ \t]*(?:代金券|券)?"
+            r"(?P<bundle_tail>[ \t]*[xX×*][ \t]*(?P<bundle_count>\d+)[ \t]*张?)?"
             r"(?P<label_tail>[ \t]*[（(][^（）()\n]{1,30}[）)])?"
             r"[ \t]*[：:\"“”']+[ \t]*(?:售价|价格)?[ \t]*[¥￥]?[ \t]*(?P<price>\d+(?:\.\d+)?)[ \t]*元?"
             r"(?P<tail>[^\n；;]{0,100})",
@@ -2078,11 +2090,15 @@ class V2Store(AppStore):
             ):
                 continue
             face = cls._format_number(match.group("face"))
+            bundle_count = match.group("bundle_count") or ""
+            bundle_tail = (
+                f"{face}x{int(bundle_count)}" if bundle_count else ""
+            )
             raw_label_tail = (match.group("label_tail") or "").strip()
             label_tail = raw_label_tail if re.search(
                 r"(?:叠加|使用|限用|最多)[^）)]*\d+\s*张", raw_label_tail,
             ) else ""
-            tail = (raw_label_tail + " " + (match.group("tail") or "")).strip()
+            tail = (bundle_tail + " " + raw_label_tail + " " + (match.group("tail") or "")).strip()
             time_match = re.search(
                 r"(工作日|节假日|周末|全周(?:通用)?|下午茶|午餐|晚餐|午市|晚市)", tail
             )
@@ -2103,7 +2119,11 @@ class V2Store(AppStore):
                 tail,
             )
             output.append({
-                "name": f"{match.group('platform') or ''}{face}元代金券{label_tail}",
+                "name": (
+                    f"{match.group('platform') or ''}{face}x{int(bundle_count)}{label_tail}"
+                    if bundle_count else
+                    f"{match.group('platform') or ''}{face}元代金券{label_tail}"
+                ),
                 "face_value": face,
                 "sale_price": cls._format_number(match.group("price")),
                 "applicable_time": time_match.group(1) if time_match else "",
@@ -5250,6 +5270,84 @@ class V2Store(AppStore):
             return plan or f"当前商品没有{requested}元代金券，请选择商品页面已有的规格。"
         prefix = self._day_reply_prefix(text, implicit_day) if implicit_day else ""
         return f"{prefix}可以直接拍下，{self.format_product_option(option, self.extract_brand(product))}。"
+
+    def denomination_purchase_reply(
+        self, product: Dict, message: str,
+        available_options: Optional[List[Dict]] = None,
+    ) -> Optional[Dict]:
+        """Answer ``100抵扣券怎么拍`` as an SKU request, not a bill amount."""
+        requested = self._denomination_purchase_amount(message)
+        if not requested:
+            return None
+        options = (
+            list(available_options)
+            if available_options is not None else self.extract_product_options(product)
+        )
+        options = [
+            option for option in options
+            if self._is_sellable_option(option)
+            and (option.get("option_type") or "voucher") == "voucher"
+        ]
+        day_type = self._requested_day_type(message)
+        if not day_type and self._has_explicit_day_options(options):
+            day_type = self._requested_day_type(message, default_today=True)
+        if day_type:
+            options = self._filter_options_for_day(options, day_type)
+
+        matches = []
+        for option in options:
+            pairs = self._option_coupon_pairs(option)
+            if any(self._format_number(face) == requested for face, _ in pairs):
+                matches.append(option)
+        matches.sort(key=lambda option: (
+            sum(count for _, count in self._option_coupon_pairs(option)) or 1,
+            Decimal(str(option.get("sale_price") or "999999999")),
+            str(option.get("name") or option.get("sku_name") or ""),
+        ))
+        if not matches:
+            catalog = [self._atomic_voucher_option_text(option) for option in options[:6]]
+            reply = f"当前在售SKU没有发放{requested}元券的规格。"
+            if catalog:
+                reply += "现有规格为：\n" + "\n".join(
+                    f"{index}. {line}。" for index, line in enumerate(catalog, start=1)
+                )
+            return {
+                "reply": reply, "source": "当前真实SKU的单张券面额与发券组成",
+                "decision": "deny", "kind": "sku_purchase",
+            }
+
+        lines = []
+        for option in matches:
+            name = str(option.get("name") or option.get("sku_name") or "当前规格").strip()
+            price = self._format_number(option.get("sale_price") or "")
+            contents = self._purchase_contents_label(option)
+            total = self._option_total_value(option)
+            line = f"选择{name}拍1份"
+            line += f"，售价{price}元" if price else "，售价尚未同步"
+            line += f"，付款后发{contents}"
+            if total:
+                line += f"，共可抵扣{total}元"
+            lines.append(line + "。")
+        prefix = self._day_reply_prefix(message, day_type) if day_type else ""
+        reply = prefix + f"{requested}元抵扣券请按需要张数选择对应规格：\n"
+        reply += "\n".join(
+            f"{index}. {line}" for index, line in enumerate(lines, start=1)
+        )
+        context_update = None
+        if len(matches) == 1:
+            context_update = {
+                "selected_sku_key": str(
+                    matches[0].get("sku_key") or self.sku_key_for_option(matches[0])
+                ),
+                "selected_sku_name": str(
+                    matches[0].get("name") or matches[0].get("sku_name") or "当前规格"
+                ),
+            }
+        return {
+            "reply": reply, "source": "当前真实SKU的单张券面额、售价与发券组成",
+            "decision": "allow", "kind": "sku_purchase",
+            **({"query_context_update": context_update} if context_update else {}),
+        }
 
     def voucher_sku_lookup_reply(self, product: Dict, message: str) -> Optional[Dict]:
         """Answer explicit denomination/option stock questions atomically.
@@ -9325,6 +9423,8 @@ class V2Store(AppStore):
         compact = re.sub(r"[\s，,。.!！?？；;：:~～]+", "", str(message or ""))
         if re.search(r"退款|退货|退钱|售后|不想要|买多了|拍多了|申请退", compact):
             return ""
+        if cls._denomination_purchase_amount(message):
+            return ""
         if re.search(
             r"(?:能不能|可不可以|有没有|有无|有没|是否有|可以不可以)"
             r"[^\d]{0,6}\d+(?:\.\d+)?(?:元|块)?(?:代金券|优惠券|券)",
@@ -9370,6 +9470,28 @@ class V2Store(AppStore):
         if not (consumption_words or plan_words):
             return ""
         return cls._format_number(amounts[0])
+
+    @classmethod
+    def _denomination_purchase_amount(cls, message: str) -> str:
+        """Extract the unit face from an explicit coupon-SKU purchase question."""
+        text = unicodedata.normalize("NFKC", str(message or ""))
+        number = r"\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+"
+        coupon = r"代金券|优惠券|抵扣券|现金券|抵用券|券"
+        action = r"怎么拍|怎么买|如何拍|如何买|怎么下单|如何下单|拍哪个|买哪个|选哪个"
+        match = re.search(
+            rf"(?P<amount>{number})\s*(?:元|块)?\s*(?:的)?\s*(?:{coupon})"
+            rf"[^。！？\n]{{0,10}}(?:{action})|"
+            rf"(?:{action})[^。！？\n]{{0,10}}(?P<reverse>{number})\s*"
+            rf"(?:元|块)?\s*(?:的)?\s*(?:{coupon})",
+            text,
+        )
+        if not match:
+            return ""
+        raw = match.group("amount") or match.group("reverse") or ""
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            return cls._format_number(raw)
+        converted = cls._chinese_count(raw)
+        return cls._format_number(converted) if converted else ""
 
     def _store_aware_amount_plan_reply(
         self, item_id: str, product: Dict, amount: str,
@@ -12553,6 +12675,10 @@ class V2Store(AppStore):
         )
         if store_followup:
             return store_followup
+
+        denomination_purchase = self.denomination_purchase_reply(product, message)
+        if denomination_purchase:
+            return denomination_purchase
 
         if not (store_context or {}).get("price_filters"):
             context_matrix = list((store_context or {}).get("store_sku_matrix") or [])
