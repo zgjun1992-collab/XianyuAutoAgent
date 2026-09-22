@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.35",
+  "version": "0.11.36",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.35：新增推广模式和推广二维码销售流程；支持混合发卡、选中商品同步及商品标题搜索；完善SKU知识归纳、上下文金额与门店回复。"
+      "releaseNotes": "0.11.36：完善SKU知识归纳和自助餐客服回复；未标注特殊人群的票种默认成人票，未标注日期或餐段的票种默认全部时间段通用；不同档次、人数、票种和餐段按真实SKU独立报价。保留推广模式、混合发卡、选中商品同步及商品标题搜索。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
