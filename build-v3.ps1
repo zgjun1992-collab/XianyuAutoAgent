@@ -58,6 +58,39 @@ try {
     Pop-Location
 }
 
+# pnpm 11 may intentionally skip dependency install scripts. In that case the
+# Electron package exists but its runtime archive has not been expanded yet.
+# Restore the pinned runtime from the local cache so release builds stay
+# reproducible and do not require a network download.
+if (-not (Test-Path -LiteralPath (Join-Path $sourceElectronDist "electron.exe"))) {
+    $electronArchive = $null
+    $electronCacheRoots = @($electronCache)
+    if ($env:LOCALAPPDATA) {
+        $electronCacheRoots += (Join-Path $env:LOCALAPPDATA "electron\Cache")
+    }
+    foreach ($cacheRoot in $electronCacheRoots) {
+        if (-not (Test-Path -LiteralPath $cacheRoot)) {
+            continue
+        }
+        $electronArchive = Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Filter "electron-v44.1.0-win32-x64.zip" |
+            Select-Object -First 1
+        if ($electronArchive) {
+            break
+        }
+    }
+    if (-not $electronArchive) {
+        throw "Electron 44.1.0 runtime archive was not found in the configured caches."
+    }
+    if (Test-Path -LiteralPath $sourceElectronDist) {
+        Remove-Item -LiteralPath $sourceElectronDist -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $sourceElectronDist -Force | Out-Null
+    Expand-Archive -LiteralPath $electronArchive.FullName -DestinationPath $sourceElectronDist -Force
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceElectronDist "electron.exe"))) {
+        throw "Electron runtime archive was found but could not be restored."
+    }
+}
+
 try {
     New-Item -ItemType Directory -Path $stageDesktop -Force | Out-Null
     $excludedDirectories = @(
