@@ -71,6 +71,8 @@ stores: 商品文案明确列出的适用门店数组，每项字段为brand、b
 套餐、菜品、重量、人数和普通商品售价不得填写为face_value，也不得放入products，应逐项放入sale_options；例如“2.6斤烤鱼套餐售价118元”中的118只是套餐售价，不是118元代金券。
 人数、工作日/周末/节假日、早餐/午餐/晚餐等限制条件只有原文明确出现时才可写入对应规格字段，不得从商品名称或常识补全。
 但使用时间采用统一业务默认值：原文没有明确“仅限工作日/周末/节假日”、特定日期不可用或午晚市等时段限制时，facts.使用时间必须写“适用门店营业时间内可用”；不得编造具体几点营业。原文存在明确限制时必须完整保留，具体禁用日期优先于该默认值。
+自助餐、人数餐和其他按人售卖的票种采用以下业务默认值：SKU名称及其专属规则未明确写儿童、老人、学生、女士等特殊人群时，按成人票归档；只有明确写出特殊人群时才归入对应票种。该默认不适用于代金券。
+SKU及其专属规则未明确工作日、周末、节假日、早餐、午餐、下午茶或晚餐限制时，按全部日期、全部餐段通用归档，并在applicable_time写“适用门店营业时间内可用”；一旦明确了日期或餐段限制，必须保留在该SKU档案中，不得让其他档次或其他票种继承覆盖。
 不得把多个面额和售价合并到同一个字符串，不得遗漏括号中的发券组成。
 叠加规则要与发券组成分开。默认仅支持同面额叠加；只有原文明写“不同面额可叠加”时，
 才可以在facts.叠加规则中写不同面额叠加，禁止自行扩展；
@@ -311,6 +313,24 @@ class BackendState:
             profile["inherited_common_fields"] = inherited
             if sku.get("max_stack_in_sku_data"):
                 profile["max_stack"] = sku["max_stack_in_sku_data"]
+
+            is_voucher = profile["option_type"] == "voucher" or bool(profile["face_value"])
+            people_value = str(profile.get("people_count") or "").strip()
+            audience_value = str(profile.get("audience") or "").strip()
+            is_people_dining = not is_voucher and bool(
+                people_value
+                or sku.get("people_counts_in_sku_name")
+                or re.search(r"自助|(?:单|双|[一二两三四五六七八九十\d]+)人|[一二两三四五六七八九十\d]+位", name)
+            )
+            if is_people_dining and not audience_value:
+                profile["audience"] = "成人"
+
+            scoped_time_fields = (
+                "available_dates", "unavailable_dates", "applicable_day", "meal_period",
+                "use_hours", "applicable_time", "holiday_policy",
+            )
+            if not any(profile.get(key) not in (None, "", [], {}) for key in scoped_time_fields):
+                profile["applicable_time"] = "适用门店营业时间内可用"
             fixed_profiles.append(profile)
             option = {
                 "sku_key": profile["sku_key"], "name": name, "option_type": profile["option_type"],
