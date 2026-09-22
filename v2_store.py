@@ -4819,7 +4819,7 @@ class V2Store(AppStore):
                     return f"{day_prefix}当前商品没有该日期适用的在售代金券。"
             by_face = next((
                 option for option in options
-                if self._format_number(option.get("face_value")) == requested
+                if self._option_total_value(option) == requested
             ), None)
             if by_face:
                 return day_prefix + (
@@ -4832,11 +4832,11 @@ class V2Store(AppStore):
                 if self._format_number(option.get("sale_price")) == requested
             ), None)
             if by_price:
-                face = self._format_number(by_price.get("face_value"))
+                face = self._option_total_value(by_price)
                 return day_prefix + f"当前售价{requested}元对应{face}元代金券，共可抵扣{face}元。"
             faces = sorted({
-                self._format_number(option.get("face_value")) for option in options
-                if option.get("face_value")
+                self._option_total_value(option) for option in options
+                if self._option_total_value(option)
             }, key=Decimal)
             suffix = f"当前已确认面额为{'、'.join(value + '元' for value in faces)}。" if faces else ""
             return day_prefix + f"当前商品没有{requested}元这一已确认的代金券规格。{suffix}"
@@ -4853,7 +4853,7 @@ class V2Store(AppStore):
         exact = next((
             option for option in options
             if self._format_number(option.get("sale_price")) == paid
-            and self._format_number(option.get("face_value")) == face
+            and self._option_total_value(option) == face
         ), None)
         if exact:
             return day_prefix + f"是的，{self._atomic_voucher_option_text(exact)}。"
@@ -4864,7 +4864,7 @@ class V2Store(AppStore):
         for option in options:
             try:
                 unit_paid = Decimal(str(option.get("sale_price") or "0"))
-                unit_face = Decimal(str(option.get("face_value") or "0"))
+                unit_face = Decimal(str(self._option_total_value(option) or "0"))
                 asked_paid = Decimal(paid)
                 asked_face = Decimal(face)
             except InvalidOperation:
@@ -4885,7 +4885,7 @@ class V2Store(AppStore):
 
         same_face = next((
             option for option in options
-            if self._format_number(option.get("face_value")) == face
+            if self._option_total_value(option) == face
         ), None)
         if same_face:
             actual_price = self._format_number(same_face.get("sale_price"))
@@ -4900,7 +4900,7 @@ class V2Store(AppStore):
             if self._format_number(option.get("sale_price")) == paid
         ), None)
         if same_price:
-            actual_face = self._format_number(same_price.get("face_value"))
+            actual_face = self._option_total_value(same_price)
             contents = self._purchase_contents_label(same_price)
             return day_prefix + (
                 f"当前售价{paid}元对应{actual_face}元代金券，"
@@ -9139,6 +9139,47 @@ class V2Store(AppStore):
             r"怎么买|如何买|怎么拍|如何拍|买几张|拍几张|叠加|几张",
             compact,
         ))
+        generic_price_followup = bool(re.fullmatch(
+            r"(?:(?:这家|这个店|该店|那家|刚才那家|"
+            r"第一(?:家|个)|第二(?:家|个)|第三(?:家|个)|第[123](?:家|个))的?)?"
+            r"(?:什么价格呢?|什么价呢?|价格(?:多少|呢)?|多少钱呢?|多钱呢?|卖多少|怎么卖)",
+            compact,
+        ))
+        if generic_price_followup and not selected_skus:
+            if ordinal is not None:
+                if ordinal >= len(matrix):
+                    return {
+                        "reply": "刚才的查询结果中没有这家门店，请发送完整门店名称重新查询。",
+                        "source": "门店上下文序号超出候选范围",
+                        "decision": "allow", "kind": "stores_clarify",
+                        "store_matches": [row.get("store") or {} for row in matrix],
+                        "store_query": str(context.get("query") or ""),
+                        "store_status": "ambiguous",
+                    }
+                price_rows = [matrix[ordinal]]
+            elif len(matrix) == 1:
+                price_rows = matrix
+            else:
+                names = "、".join(
+                    self._store_display_name(row.get("store") or {}) for row in matrix
+                )
+                return {
+                    "reply": f"刚才查询到多家门店：{names}。请发送完整门店名，或回复第一家、第二家再查询价格。",
+                    "source": "多门店上下文中的价格指代不明确",
+                    "decision": "allow", "kind": "stores_clarify",
+                    "store_matches": [row.get("store") or {} for row in matrix],
+                    "store_query": str(context.get("query") or ""),
+                    "store_status": "ambiguous",
+                }
+            query = str(context.get("query") or "刚才查询的门店")
+            return {
+                "reply": self._format_store_sku_matrix(query, price_rows),
+                "source": "当前会话最近一次门店可用SKU及实时售价",
+                "decision": "allow", "kind": "stores_sku_recommendation",
+                "store_matches": [row.get("store") or {} for row in price_rows],
+                "store_query": query, "store_status": "available",
+                "store_sku_matrix": price_rows,
+            }
         spec_followup = bool(amount_followup) or bool(selected_skus and sku_followup_words)
         if product_question or not (spec_followup or generic_followup_words or all_spec_followup):
             return None
@@ -9454,7 +9495,7 @@ class V2Store(AppStore):
             score < 85 and (province_scope or city_scope or district_scope)
             and local_branch_key and cls._within_one_edit(query_key, local_branch_key)
         ):
-            score, quality = 85, "fuzzy"
+            score, quality = 85, "one_edit"
             matched_anchor = query_key
             evidence.append({"type": "one_edit_branch", "value": local_branch_key, "score": 85})
 
@@ -10148,6 +10189,13 @@ class V2Store(AppStore):
             and int(matches[0].get("match_score") or 0) >= 90
             and not matches[0].get("unresolved_terms")
         )
+        unique_high_typo = bool(
+            len(matches) == 1
+            and bool(province_scope or city_scope or district_scope)
+            and matches[0].get("match_quality") == "one_edit"
+            and int(matches[0].get("match_score") or 0) >= 85
+            and not matches[0].get("unresolved_terms")
+        )
         close_competing_candidates = bool(
             len(generic_key) >= 4 and search_term and len(matches) > 1
             and int(matches[0].get("match_score") or 0)
@@ -10163,7 +10211,7 @@ class V2Store(AppStore):
         )
         if (
             close_competing_candidates
-            or (uncertain_evidence and not unique_high_phonetic)
+            or (uncertain_evidence and not (unique_high_phonetic or unique_high_typo))
         ):
             return {
                 "status": "needs_confirmation", "matches": matches,
@@ -13334,6 +13382,8 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         # “石家庄聚宝源涮肉东尚店” focused on 石家庄 + 东尚店.
         for category in (
             "椰子鸡", "涮肉", "羊肉火锅", "火锅", "活鱼烤鱼", "烤鱼",
+            "韩式烤肉", "日式烤肉", "烤肉", "烧肉", "烧烤",
+            "韩国料理", "日本料理", "日式料理", "料理", "牛排",
             "自助餐", "自助", "餐饮", "美食",
         ):
             if category in product_text:
