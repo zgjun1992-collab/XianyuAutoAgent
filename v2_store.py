@@ -2423,6 +2423,88 @@ class V2Store(AppStore):
         return list(dict.fromkeys(result))
 
     @staticmethod
+    def _option_supports_audience(option: Dict, audience: str) -> bool:
+        """An unlabeled SKU is an adult fare, never a special-identity fare."""
+        explicit = set(option.get("audience_types") or [])
+        if audience == "adult":
+            return not explicit.intersection({"child", "student", "senior", "female"})
+        return audience in explicit
+
+    @classmethod
+    def _effective_audience_types(cls, option: Dict) -> List[str]:
+        explicit = list(option.get("audience_types") or [])
+        return explicit or ["adult"]
+
+    @classmethod
+    def _requested_package_tier_options(
+        cls, options: List[Dict], message: str,
+    ) -> tuple[List[Dict], bool]:
+        """Scope a buffet query to its named tier without hard-coding one menu."""
+        available = list(options or [])
+        if not available:
+            return [], False
+        raw = str(message or "")
+
+        # Preserve the established business alias: buyers call the M8-9 SKU
+        # “高阶和牛”, even when the marketplace SKU omits that marketing label.
+        if re.search(r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛", raw, re.I):
+            matched = [
+                option for option in available
+                if re.search(
+                    r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9",
+                    str(option.get("name") or ""), re.I,
+                )
+            ]
+            if matched:
+                return matched, True
+
+        canonical = re.sub(
+            r"m\s*8\s*(?:[-—~～至到/]\s*)?m?\s*9", " m89 ", raw.lower(), flags=re.I,
+        )
+        canonical = normalize_text(canonical).lower()
+        # Remove structural words. What remains is a brand/tier/menu marker,
+        # such as “轻享”“尊享”“经典”“梭子蟹” or “m89”.
+        structural = (
+            r"请问|您好|你好|我要|我想|想要|帮我|给我|现在|这个|那个|这款|那款|"
+            r"怎么拍|如何拍|怎么选|如何选|怎么买|如何买|怎么下单|多少钱|多钱|"
+            r"什么价|价格|售价|收费|有吗|有没有|能拍吗|可以拍吗|"
+            r"今天|明天|后天|今晚|明晚|工作日|平日|周末|节假日|法定假日|"
+            r"早餐|早市|早上|上午|中午|午餐|午市|下午茶|晚餐|晚市|晚上|夜宵|"
+            r"成人|大人|儿童|小孩|孩子|小朋友|学生|老人|老年人|长者|女士|女生|女宾|"
+            r"单人|双人|三人|四人|五人|六人|七人|八人|九人|十人|"
+            r"[一二两三四五六七八九十单双俩仨\d]+(?:个|口)?(?:人|位)|"
+            r"自助餐|自助|套餐|团购|商品|规格|票种|票|券|一份|一张|份|张|呢|吗|嘛|么"
+        )
+        canonical = re.sub(structural, " ", canonical, flags=re.I)
+        tokens = [
+            token for token in re.findall(r"m\d+|[a-z]{2,}\d*|[\u4e00-\u9fff]{2,}", canonical)
+            if token
+        ]
+        if not tokens:
+            return available, False
+
+        option_names = [
+            re.sub(
+                r"m\s*8\s*(?:[-—~～至到/]\s*)?m?\s*9", "m89",
+                normalize_text(option.get("name") or "").lower(), flags=re.I,
+            )
+            for option in available
+        ]
+        recognized = [token for token in tokens if any(token in name for name in option_names)]
+        if not recognized:
+            return available, False
+        discriminating = [
+            token for token in recognized
+            if sum(token in name for name in option_names) < len(option_names)
+        ]
+        required = discriminating or recognized
+        matched = [
+            option for option, name in zip(available, option_names)
+            if all(token in name for token in required)
+        ]
+        return (matched or available), True
+
+    @staticmethod
     def _height_cm(value: object) -> Optional[Decimal]:
         match = re.search(r"(\d+(?:\.\d+)?)\s*(米|m|厘米|cm)", str(value or ""), re.I)
         if not match:
@@ -3208,11 +3290,20 @@ class V2Store(AppStore):
             item for item in self.extract_sale_options(product)
             if item.get("sale_price") and self._is_sellable_option(item)
         ]
-        option_audiences = {
+        options, _tier_scoped = self._requested_package_tier_options(options, text)
+        explicit_option_audiences = {
             audience
             for option in options
             for audience in (option.get("audience_types") or [])
         }
+        option_audiences = {
+            audience
+            for option in options
+            for audience in self._effective_audience_types(option)
+        }
+        has_unlabelled_adult_option = any(
+            not (option.get("audience_types") or []) for option in options
+        )
         party_counts = self._people_counts(text)
         party_count = party_counts[0] if len(party_counts) == 1 else None
 
@@ -3220,7 +3311,8 @@ class V2Store(AppStore):
         # Only explicit child/senior/student wording switches to identity fares.
         # This default also applies when the catalogue contains those fares.
         if (
-            not counts and party_count and "adult" in option_audiences
+            not counts and party_count and "adult" in explicit_option_audiences
+            and not has_unlabelled_adult_option
             and (price_intent or availability_intent or plan_intent)
         ):
             counts = {"adult": party_count}
@@ -3261,6 +3353,8 @@ class V2Store(AppStore):
             not counts and party_count and len(option_audiences) >= 2
             and (price_intent or availability_intent or plan_intent)
         ):
+            if has_unlabelled_adult_option and not explicit_types:
+                return None
             slots["people_count"] = party_count
             identity_labels = {
                 "adult": "成人", "senior": "老人", "child": "儿童",
@@ -3313,8 +3407,7 @@ class V2Store(AppStore):
             meal
             for option in options
             if any(
-                kind in (option.get("audience_types") or [])
-                or (kind == "adult" and not (option.get("audience_types") or []))
+                self._option_supports_audience(option, kind)
                 for kind in counts
             )
             for meal in (option.get("meal_periods") or [])
@@ -3374,17 +3467,11 @@ class V2Store(AppStore):
                 continue
             candidates = []
             for option in options:
-                audiences = option.get("audience_types") or []
-                if kind == "adult":
-                    if any(value in audiences for value in ("child", "student", "senior", "female")):
-                        continue
-                elif kind not in audiences:
+                if not self._option_supports_audience(option, kind):
                     continue
                 people = option.get("people_counts") or []
                 exact = count in people
-                single = 1 in people or (
-                    not people and (kind != "adult" or "adult" in audiences)
-                )
+                single = 1 in people or not people
                 if exact or single:
                     score = (
                         (2 if exact else 1)
@@ -3564,14 +3651,13 @@ class V2Store(AppStore):
         # Buyers often send only a compact condition bundle, for example
         # “三人明天中午”. A person count plus an explicit date/day/meal period
         # is a complete local price request even when “多少钱/能用吗” is omitted.
-        package_tier_intent = bool(re.search(
-            r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛|轻享和牛",
-            text, re.I,
-        ))
         condition_package_options = [
             option for option in self.extract_sale_options(product)
             if option.get("option_type") == "package" and option.get("sale_price")
         ]
+        _, package_tier_intent = self._requested_package_tier_options(
+            condition_package_options, text,
+        )
         condition_people_counts = {
             int(count)
             for option in condition_package_options
@@ -3699,23 +3785,19 @@ class V2Store(AppStore):
         if not requested_audiences:
             # Child/senior/student fares must never become the default adult
             # answer merely because they are the only option left after date filtering.
-            options = [option for option in options if not (option.get("audience_types") or [])]
-
-        # Keep package tiers isolated. “M8 M9/高阶和牛” identifies the M8-9
-        # option even when the requested party size is two; it must not be
-        # replaced by an unrelated two-person “轻享和牛” SKU.
-        tier_options = []
-        if re.search(r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9|高阶和牛", text, re.I):
-            tier_options = [
+            options = [
                 option for option in options
-                if re.search(r"M\s*8\s*[-—~～至到/]?\s*M?\s*9|M8-?9", str(option.get("name") or ""), re.I)
+                if self._option_supports_audience(option, "adult")
             ]
-        elif re.search(r"轻享和牛", text):
-            tier_options = [
-                option for option in options if "轻享和牛" in str(option.get("name") or "")
+        else:
+            options = [
+                option for option in options
+                if any(self._option_supports_audience(option, kind) for kind in requested_audiences)
             ]
-        if tier_options:
-            options = tier_options
+
+        # A named menu tier is a hard SKU filter. Generic extraction covers
+        # 轻享/尊享/经典/etc.; the helper also keeps the M8-9 alias compatible.
+        options, _tier_scoped = self._requested_package_tier_options(options, text)
         if not slots.get("day_type") and self._has_explicit_day_options(options):
             # A buyer asking the current price/availability without naming a
             # date means today. Never fall back to the first or cheapest tier.
@@ -3726,8 +3808,9 @@ class V2Store(AppStore):
             slots.get("day_type") == "weekend" and has_holiday_options and not has_weekend_options
         )
         effective_intent = (
-            "price" if (price_intent or implicit_condition_price)
+            "price" if price_intent
             else "availability" if availability_intent
+            else "price" if implicit_condition_price
             else str(previous.get("intent") or "price")
         )
 
@@ -8116,7 +8199,12 @@ class V2Store(AppStore):
                 for platform in requested_platforms
             ):
                 continue
-            if not slots.get("audience_types") and (sku.get("audience_types") or []):
+            if (
+                not slots.get("audience_types")
+                and set(sku.get("audience_types") or []).intersection(
+                    {"child", "student", "senior", "female"}
+                )
+            ):
                 continue
             if requested_amount:
                 face = self._format_number(option.get("face_value"))
@@ -8130,7 +8218,10 @@ class V2Store(AppStore):
                 continue
             for key in ("day_types", "meal_periods", "audience_types"):
                 requested = set(slots.get(key) or [])
-                supported = set(sku.get(key) or [])
+                supported = (
+                    set(self._effective_audience_types(sku))
+                    if key == "audience_types" else set(sku.get(key) or [])
+                )
                 if requested and supported and not requested & supported:
                     break
             else:
@@ -10476,7 +10567,10 @@ class V2Store(AppStore):
         if requested_audiences:
             current_matches = [
                 item for item in current_matches
-                if requested_audiences.intersection(item.get("audience_types") or [])
+                if any(
+                    self._option_supports_audience(item, kind)
+                    for kind in requested_audiences
+                )
             ]
 
         if options and not day_matches:
@@ -10506,7 +10600,9 @@ class V2Store(AppStore):
             }
 
         audience_groups = {
-            audience for item in current_matches for audience in (item.get("audience_types") or [])
+            audience
+            for item in current_matches
+            for audience in self._effective_audience_types(item)
         }
         if len(audience_groups) > 1 and not self._audience_types(text):
             return {

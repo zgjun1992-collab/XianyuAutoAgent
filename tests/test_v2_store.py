@@ -5474,6 +5474,78 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("共264元", result["reply"])
         self.assertNotIn("分别有几位", result["reply"])
 
+    def test_unlabelled_buffet_sku_is_an_adult_fare(self):
+        self.store.save_v2_product(
+            "10001", "一绪寿喜烧自助",
+            "轻享和牛单人自助：售价219元\n"
+            "轻享和牛双人自助：售价438元\n"
+            "儿童票：售价68元",
+        )
+        result = self.store.resolve_deterministic("10001", "怎么拍？轻享两位")
+        self.assertIn("轻享和牛双人自助", result["reply"])
+        self.assertIn("438元", result["reply"])
+        self.assertNotIn("没有“成人票”", result["reply"])
+        self.assertNotIn("儿童票", result["reply"])
+
+    def test_buffet_tier_is_a_hard_filter_for_the_same_party_size(self):
+        self.store.save_v2_product(
+            "10001", "多档自助餐",
+            "经典双人自助：售价398元\n"
+            "轻享双人自助：售价438元\n"
+            "尊享双人自助：售价528元",
+        )
+        light = self.store.resolve_deterministic("10001", "轻享两位怎么拍")
+        self.assertIn("轻享双人自助", light["reply"])
+        self.assertIn("438元", light["reply"])
+        self.assertNotIn("经典双人", light["reply"])
+        self.assertNotIn("尊享双人", light["reply"])
+
+        premium = self.store.resolve_deterministic("10001", "尊享2人多少钱")
+        self.assertIn("尊享双人自助", premium["reply"])
+        self.assertIn("528元", premium["reply"])
+        self.assertNotIn("398元", premium["reply"])
+
+    def test_unlabelled_buffet_fare_is_all_day_but_special_fares_are_scoped(self):
+        self.store.save_v2_product(
+            "10001", "分时段自助餐",
+            "经典单人自助：售价99元\n"
+            "午餐儿童票：售价49元\n"
+            "晚餐儿童票：售价59元",
+        )
+        adult = self.store.resolve_deterministic("10001", "周末晚餐2位怎么拍")
+        self.assertIn("需要购买2份经典单人自助", adult["reply"])
+        self.assertIn("共198元", adult["reply"])
+        self.assertNotIn("儿童票", adult["reply"])
+
+        child = self.store.resolve_deterministic("10001", "晚餐1位儿童多少钱")
+        self.assertIn("晚餐儿童票", child["reply"])
+        self.assertIn("59元", child["reply"])
+        self.assertNotIn("午餐儿童票", child["reply"])
+
+    def test_specific_meal_price_overrides_unrestricted_same_tier(self):
+        self.store.save_v2_product(
+            "10001", "轻享自助餐",
+            "轻享双人自助：售价438元\n"
+            "晚餐轻享双人自助：售价458元",
+        )
+        dinner = self.store.resolve_deterministic("10001", "晚餐轻享2位怎么拍")
+        self.assertIn("晚餐轻享双人自助", dinner["reply"])
+        self.assertIn("458元", dinner["reply"])
+
+        lunch = self.store.resolve_deterministic("10001", "午餐轻享2位怎么拍")
+        self.assertIn("轻享双人自助", lunch["reply"])
+        self.assertIn("438元", lunch["reply"])
+        self.assertNotIn("458元", lunch["reply"])
+
+    def test_unlabelled_adult_fare_never_answers_a_child_query(self):
+        self.store.save_v2_product(
+            "10001", "经典自助餐", "经典单人自助：售价99元",
+        )
+        result = self.store.resolve_deterministic("10001", "1位儿童多少钱")
+        self.assertEqual("audience_price", result["kind"])
+        self.assertIn("没有“儿童票”", result["reply"])
+        self.assertNotIn("需要购买1张经典单人自助", result["reply"])
+
     def test_family_package_does_not_drop_extra_senior(self):
         self.store.save_v2_product(
             "10001", "家庭自助套餐",

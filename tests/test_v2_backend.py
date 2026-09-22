@@ -193,6 +193,43 @@ class BackendSyncTests(unittest.TestCase):
         self.assertEqual(before["structured"], result["structured"])
         self.assertEqual(before["raw_text"], result["raw_text"])
 
+    def test_unlabelled_buffet_profile_defaults_to_adult_and_all_times(self):
+        structured = {
+            "sku_profiles": [{"sku_key": "light-2", "sku_name": "轻享两位"}],
+        }
+        canonical = [{
+            "sku_key": "light-2", "sku_name": "轻享两位", "option_type": "package",
+            "sale_price": "438", "face_value": "", "composition": "", "stock": "8",
+            "sellable": True, "people_counts_in_sku_name": [2],
+        }]
+
+        result = self.state._normalize_summary_structure(structured, canonical)
+
+        profile = result["sku_profiles"][0]
+        self.assertEqual("成人", profile["audience"])
+        self.assertEqual("适用门店营业时间内可用", profile["applicable_time"])
+        self.assertEqual("适用门店营业时间内可用", result["sale_options"][0]["applicable_time"])
+
+    def test_explicit_buffet_audience_and_meal_are_never_replaced_by_defaults(self):
+        structured = {
+            "sku_profiles": [{
+                "sku_key": "child-dinner", "sku_name": "儿童晚餐",
+                "audience": "儿童", "meal_period": "晚餐", "applicable_time": "晚餐时段可用",
+            }],
+        }
+        canonical = [{
+            "sku_key": "child-dinner", "sku_name": "儿童晚餐", "option_type": "package",
+            "sale_price": "88", "face_value": "", "composition": "", "stock": "8",
+            "sellable": True, "people_counts_in_sku_name": [1],
+        }]
+
+        result = self.state._normalize_summary_structure(structured, canonical)
+
+        profile = result["sku_profiles"][0]
+        self.assertEqual("儿童", profile["audience"])
+        self.assertEqual("晚餐", profile["meal_period"])
+        self.assertEqual("晚餐时段可用", profile["applicable_time"])
+
     def test_sync_without_mtop_token_shows_login_message_before_api_call(self):
         self.state.configure({"cookie": "unb=seller-1"})
         with self.assertRaisesRegex(ValueError, "闲鱼登录状态已失效"):
