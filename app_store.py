@@ -194,6 +194,14 @@ class PolicyEngine:
             r"(?:能|可以)?省多少",
             user_message,
         ))
+        # “不用改价/无需改价” confirms that the buyer will pay the displayed
+        # price. It is the opposite of asking the seller to alter an order, so
+        # the bare risk keyword must not send a correct answer to manual review.
+        no_price_change_confirmation = bool(re.search(
+            r"(?:不用|无需|不需要|不必)[^。！？\n]{0,6}"
+            r"(?:改价|修改价格|调整价格)",
+            risk_source,
+        ))
         refund_terms = ("退款", "退货", "退钱", "退一下", "申请退")
         refund_mentioned = any(word in risk_source for word in refund_terms)
         refund_review_patterns = (
@@ -208,6 +216,7 @@ class PolicyEngine:
             p for p in self.policies["risk_keywords"]
             if p in risk_source and p not in {"退款", "退货"}
             and not (p == "优惠" and informational_discount_question)
+            and not (p == "改价" and no_price_change_confirmation)
         ]
         if refund_needs_review:
             risk_hits.insert(0, "需要核验的退款事项")

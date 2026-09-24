@@ -23,6 +23,11 @@ except ImportError:  # Optional in source mode; packaged builds include it.
 
 FIRST_REPLY_TEMPLATE_VERSION = 8
 PROMOTION_QR_PURPOSE = "promotion_qr"
+# Common sentence-final question particles.  Keep this shared so SKU stock
+# questions do not drift between “吗/么/嘛/呢/呀/啊/吧/不/没” spellings or
+# natural two-particle endings such as “吗呀” and “嘛呢”.
+QUESTION_TAIL_PATTERN = r"[吗么嘛呢呀啊吧不没]{0,2}"
+QUESTION_TAIL_REQUIRED_PATTERN = r"[吗么嘛呢呀啊吧不没]{1,2}"
 
 
 COUPON_TYPE_LABELS = {
@@ -116,6 +121,8 @@ STORE_QUERY_NEUTRAL_WORDS = (
     "那家", "这家", "那边", "这边", "您好", "你好", "当前", "现在", "今天", "一下",
     "本周末", "周末", "工作日", "平日", "节假日", "早餐", "中午", "午餐", "晚上", "晚餐", "晚市",
     "可以使用", "可以用", "能不能用", "可不可以用", "是否可用", "能用",
+    "用得了吗", "用的了吗", "用得了", "用的了", "我要使用", "我要用",
+    "我想使用", "我想用", "需要使用", "需要用", "想使用", "想用", "要使用", "要用",
     "可用", "适用", "支持", "还有没有", "还有吗", "还有么", "还有嘛",
     "有没有", "有吗", "有不", "行不行", "行吗",
     "吃完再买对吧", "吃完再买", "吃了再买对吧", "吃了再买", "用餐后再买",
@@ -317,8 +324,16 @@ def classify_buyer_message(value: object) -> Dict:
     record(
         "store", "store_availability",
         r"(?:[\u4e00-\u9fffA-Za-z0-9]{1,24}(?:店|商场|广场|购物中心|商城|mall|MALL|城|市|区))"
-        r"[^。！？\n]{0,12}(?:能用|可以用|可用|支持|适用|不能用|不可以用)|"
+        r"[^。！？\n]{0,12}(?:能用|可以用|可用|支持|适用|不能用|不可以用|用得了|用的了)|"
         r"(?:能用|可以用|可用|支持|适用)[^。！？\n]{0,12}(?:店|商场|广场|购物中心|商城|mall|MALL|城|市|区)",
+    )
+    # Buyers frequently omit the administrative suffix or type “用的了” for
+    # “用得了”, for example “汕头的用的了吗”.  This is still a concrete
+    # business question and must not trigger a catalog-style first reply.
+    record(
+        "store", "store_availability",
+        r"[\u4e00-\u9fffA-Za-z0-9]{2,24}(?:的)?(?:能|可以|可)?"
+        r"(?:使用|用)(?:得|的)?了(?:吗|嘛|么)?",
     )
     record(
         "store", "store_context",
@@ -353,14 +368,26 @@ def classify_buyer_message(value: object) -> Dict:
     record("delivery", "code_retrieval", r"怎么领|怎么领取|券在哪|码在哪|哪里看券|收不到券")
     record("delivery", "transfer", r"可以转赠|能转赠|送给别人|给别人用")
 
-    record("purchase", "stock", r"有货吗|还有货吗|库存|卖完了吗|还能买吗")
+    record(
+        "purchase", "stock",
+        rf"^(?:(?:这个|这款|当前商品|商品)?(?:还有)?有货{QUESTION_TAIL_PATTERN}|"
+        rf"还有货{QUESTION_TAIL_PATTERN}|还有{QUESTION_TAIL_PATTERN})$|"
+        r"库存|卖完了吗|还能买吗",
+    )
     record("purchase", "purchase_limit", r"限购|可以买几份|能买几份|最多买几份|一人限几")
     record("purchase", "promotion_entry", r"购买链接|下单链接|二维码|微信购买|扫码购买")
     record("purchase", "purchase_method", r"怎么买|怎么拍|怎么下单|如何购买|直接拍|可以拍吗|能拍吗")
 
     record("sku", "sku_comparison", r"哪个好|哪个划算|有什么区别|区别是什么|推荐哪个")
     record("sku", "sku_catalog", r"有哪些规格|什么规格|规格列表|有哪些券|有什么券|全部规格")
-    record("sku", "sku_availability", r"(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*(?:元|块)?(?:的)?(?:代金券|券)?(?:有吗|有没有|有么|有嘛|能买|能拍)|有(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)(?:元|块)?的吗|(?:成人|儿童|老人|学生|女士)票(?:有吗|有没有)")
+    record(
+        "sku", "sku_availability",
+        rf"(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*(?:元|块)?(?:的)?(?:代金券|券)?"
+        rf"(?:有没有|有货{QUESTION_TAIL_PATTERN}|有{QUESTION_TAIL_PATTERN}|"
+        rf"能买{QUESTION_TAIL_PATTERN}|能拍{QUESTION_TAIL_PATTERN})|"
+        rf"有(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)(?:元|块)?的{QUESTION_TAIL_REQUIRED_PATTERN}|"
+        rf"(?:成人|儿童|老人|学生|女士)票(?:有没有|有货{QUESTION_TAIL_PATTERN}|有{QUESTION_TAIL_PATTERN})",
+    )
 
     record(
         "product_attribute", "option_by_included_item",
@@ -537,6 +564,54 @@ class V2Store(AppStore):
             if current.get(key) not in (None, ""):
                 merged[key] = current[key]
         return json.dumps(merged, ensure_ascii=False)
+
+    @classmethod
+    def platform_sku_changes(cls, previous: object, incoming: object) -> Dict:
+        """Return a stable-ID diff for two marketplace SKU payloads."""
+        def snapshot(payload):
+            product = {"platform_summary": str(payload or "")}
+            rows = {}
+            for option in cls._platform_configuration_options(product):
+                key = cls.sku_key_for_option(option)
+                rows[key] = {
+                    "sku_key": key,
+                    "sku_id": str(option.get("sku_id") or ""),
+                    "name": str(option.get("name") or "商品规格"),
+                    "sale_price": str(option.get("sale_price") or ""),
+                    "stock": str(option.get("stock") or ""),
+                    "availability": str(option.get("availability") or "available"),
+                    "face_value": str(option.get("face_value") or ""),
+                    "option_type": str(option.get("option_type") or ""),
+                }
+            return rows
+
+        before = snapshot(previous)
+        after = snapshot(incoming)
+        added = [after[key] for key in after.keys() - before.keys()]
+        removed = [before[key] for key in before.keys() - after.keys()]
+        changed = []
+        comparable_fields = ("name", "sale_price", "stock", "availability", "face_value", "option_type")
+        for key in before.keys() & after.keys():
+            fields = {
+                field: {"before": before[key][field], "after": after[key][field]}
+                for field in comparable_fields
+                if before[key][field] != after[key][field]
+            }
+            if fields:
+                changed.append({
+                    "sku_key": key,
+                    "sku_id": after[key]["sku_id"],
+                    "name": after[key]["name"],
+                    "fields": fields,
+                })
+        added.sort(key=lambda row: (row["name"], row["sku_key"]))
+        removed.sort(key=lambda row: (row["name"], row["sku_key"]))
+        changed.sort(key=lambda row: (row["name"], row["sku_key"]))
+        return {
+            "has_changes": bool(added or removed or changed),
+            "before_count": len(before), "after_count": len(after),
+            "added": added, "removed": removed, "changed": changed,
+        }
 
     @contextmanager
     def _connect(self):
@@ -965,11 +1040,17 @@ class V2Store(AppStore):
         now = self._now()
         title = str(item.get("title") or "").strip()
         platform_summary = str(item.get("platform_summary") or "").strip()
+        defer_platform_summary = bool(item.get("defer_platform_summary"))
         image_urls = [str(value).strip() for value in item.get("image_urls", []) if str(value).strip()]
         with self._connect() as conn:
             old = conn.execute("SELECT * FROM v2_products WHERE item_id=?", (item_id,)).fetchone()
             platform_summary = self._merge_platform_summary(
                 old["platform_summary"] if old else "", platform_summary,
+            )
+            stored_platform_summary = (
+                old["platform_summary"]
+                if old and defer_platform_summary
+                else platform_summary
             )
             conn.execute(
                 """INSERT INTO v2_products(
@@ -984,7 +1065,7 @@ class V2Store(AppStore):
                     sync_status=CASE WHEN v2_products.manual_edited=1 THEN 'source_updated' ELSE 'synced' END,
                     last_synced_at=excluded.last_synced_at,enabled=1,updated_at=excluded.updated_at""",
                 (
-                    item_id, title, "", "", "{}", platform_summary,
+                    item_id, title, "", "", "{}", stored_platform_summary,
                     str(item.get("thumbnail_url") or ""),
                     json.dumps(image_urls, ensure_ascii=False), str(item.get("price") or ""),
                     str(item.get("item_status") or "onsale"), "goofish", "synced", 0,
@@ -998,12 +1079,23 @@ class V2Store(AppStore):
             )
         return self.get_v2_product(item_id)
 
-    def stage_source_update(self, item_id: str, summary: str, structured: Dict, description: str = "") -> Dict:
+    def stage_source_update(
+        self, item_id: str, summary: str, structured: Dict, description: str = "",
+        platform_summary: str = "", sku_changes: Optional[Dict] = None,
+        summary_error: str = "",
+    ) -> Dict:
         """Store a source refresh without changing effective knowledge, stores or first reply."""
+        pending_sections = ["knowledge", "stores", "first_reply"]
+        if platform_summary and (sku_changes or {}).get("has_changes"):
+            pending_sections.insert(0, "skus")
         payload = {
             "summary": str(summary or "").strip(),
             "structured": structured or {},
             "description": str(description or ""),
+            "platform_summary": str(platform_summary or "").strip(),
+            "sku_changes": sku_changes or {},
+            "summary_error": str(summary_error or "").strip(),
+            "pending_sections": pending_sections,
             "staged_at": self._now(),
         }
         with self._connect() as conn:
@@ -1022,6 +1114,19 @@ class V2Store(AppStore):
         if not pending:
             raise ValueError("当前商品没有待确认的来源更新")
         sections = {str(value) for value in (sections or [])}
+        pending_sections = set(pending.get("pending_sections") or ("knowledge", "stores", "first_reply"))
+        unknown = sections - pending_sections
+        if unknown:
+            raise ValueError(f"当前来源更新不包含：{','.join(sorted(unknown))}")
+        if "skus" in sections:
+            platform_summary = str(pending.get("platform_summary") or "").strip()
+            if not platform_summary:
+                raise ValueError("当前来源更新中没有新的SKU资料")
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE v2_products SET platform_summary=?,updated_at=? WHERE item_id=?",
+                    (platform_summary, self._now(), item_id),
+                )
         if "knowledge" in sections:
             summary = str(pending.get("summary") or "").strip()
             structured = pending.get("structured") or {}
@@ -1030,15 +1135,17 @@ class V2Store(AppStore):
                 # index, not the source of truth: rules omitted by the model
                 # (for example "除酒水外全场通用") must still survive approval.
                 normalized_product = dict(product)
-                source_description = (
-                    self._platform_description(product)
-                    or str(pending.get("description") or "").strip()
-                )
+                incoming_platform = str(pending.get("platform_summary") or "").strip()
+                source_product = dict(product)
+                if incoming_platform:
+                    source_product["platform_summary"] = incoming_platform
+                source_description = self._platform_description(source_product) or str(pending.get("description") or "").strip()
                 normalized_product.update({
                     "raw_text": "\n".join(
                         value for value in (summary, source_description) if value
                     ),
                     "structured": structured,
+                    "platform_summary": incoming_platform or product.get("platform_summary") or "",
                 })
                 summary = self.build_knowledge_summary(normalized_product) or summary
                 now = self._now()
@@ -1066,11 +1173,13 @@ class V2Store(AppStore):
                 conn.execute("UPDATE v2_products SET first_reply_manual=0 WHERE item_id=?", (item_id,))
             self.refresh_first_reply(item_id, force=True)
         resolved = set(pending.get("resolved_sections") or []) | sections
-        remaining = {"knowledge", "stores", "first_reply"} - resolved
+        remaining = pending_sections - resolved
         with self._connect() as conn:
             if not remaining:
                 conn.execute(
-                    "UPDATE v2_products SET source_update_json='{}',sync_status='ready',updated_at=? WHERE item_id=?",
+                    """UPDATE v2_products SET source_update_json='{}',
+                       sync_status=CASE WHEN manual_edited=1 THEN 'manual_edited' ELSE 'ready' END,
+                       updated_at=? WHERE item_id=?""",
                     (self._now(), item_id),
                 )
             else:
@@ -1507,12 +1616,19 @@ class V2Store(AppStore):
             if str(option.get("availability") or "available") != "available":
                 continue
             face = cls._format_number(option.get("face_value") or "")
-            if not face:
+            total = cls._option_total_value(option)
+            if not face or not total:
                 continue
-            canonical_targets.add(face)
+            canonical_targets.add(total)
+            # A 100x2 bundle is already a canonical 200-yuan SKU, but it is not
+            # an atomic 100-yuan component for validating an invented plan.
+            if not cls._option_delivers_single_face(option, face):
+                continue
             if face not in option_by_face:
                 option_by_face[face] = option
-            elif cls._format_number(option_by_face[face].get("sale_price") or "") != cls._format_number(
+            elif option_by_face[face] is not None and cls._format_number(
+                option_by_face[face].get("sale_price") or ""
+            ) != cls._format_number(
                 option.get("sale_price") or ""
             ):
                 option_by_face[face] = None
@@ -1695,6 +1811,17 @@ class V2Store(AppStore):
                 text,
             )
             pairs = [(amount, count) for count, amount in reversed_pairs]
+        if not pairs:
+            # Marketplace combination SKUs also use expressions such as
+            # “600（400+200）”.  Collapse repeated amounts so
+            # “1000（400+400+200）” becomes 400元券2张＋200元券1张.
+            plus_group = re.search(r"[（(]([^）)]*\+[^）)]*)[）)]", text)
+            if plus_group:
+                counts = {}
+                for amount in re.findall(r"\d+(?:\.\d+)?", plus_group.group(1)):
+                    normalized = cls._format_number(amount)
+                    counts[normalized] = counts.get(normalized, 0) + 1
+                pairs = list(counts.items())
         return "＋".join(
             f"{cls._format_number(amount)}元券{int(count)}张"
             for amount, count in pairs if int(count) > 0
@@ -1843,6 +1970,7 @@ class V2Store(AppStore):
             str((product or {}).get("title") or ""),
             str(parsed.get("title") or ""), str(parsed.get("description") or ""),
         ))
+        description = str(parsed.get("description") or "")
         if not re.search(r"代金券|抵扣券|现金券|餐饮券", product_evidence):
             return []
 
@@ -1866,7 +1994,8 @@ class V2Store(AppStore):
             if not name or re.search(r"勿拍|不要拍|防下架|补差|运费|测试", name):
                 continue
             face_match = re.search(
-                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?(?=\s*(?:代金券|券|[xX×*（(]|$))",
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?"
+                r"(?=\s*(?:代金券|代金|组合|券|[xX×*（(]|$))",
                 name,
             )
             if not face_match:
@@ -1887,16 +2016,29 @@ class V2Store(AppStore):
                     price = ""
             if not price:
                 continue
-            composition = (
-                cls._composition_from_option_name(name)
-                or cls._normalize_composition("", face)
-            )
+            composition = cls._composition_from_option_name(name)
+            if not composition and description:
+                described_bundle = re.search(
+                    rf"(?<!\d){re.escape(face)}\s*(?:元)?(?:代金|组合)?\s*"
+                    r"[（(][^）)]*(?:\+|[xX×*])[^）)]*[）)]",
+                    description,
+                )
+                if described_bundle:
+                    composition = cls._composition_from_option_name(
+                        described_bundle.group(0)
+                    )
+            composition = composition or cls._normalize_composition("", face)
             stack_match = re.search(
-                r"(?:最多)?(?:可)?叠加\s*(\d+)\s*张", name,
+                r"(?:最多)?(?:可)?叠加\s*"
+                r"(\d+|[零一二两三四五六七八九十百千]+)\s*张|"
+                r"(?:仅限|限用|限)\s*"
+                r"(\d+|[零一二两三四五六七八九十百千]+)\s*张",
+                name,
             )
-            max_stack = (
-                stack_match.group(1) if stack_match else ""
+            parsed_stack = cls._chinese_count(
+                (stack_match.group(1) or stack_match.group(2)) if stack_match else ""
             )
+            max_stack = str(parsed_stack) if parsed_stack else ""
             platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
             output.append({
                 "name": name, "face_value": face, "sale_price": price,
@@ -1982,7 +2124,7 @@ class V2Store(AppStore):
             if voucher:
                 face_match = re.search(
                     r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元)?"
-                    r"(?=\s*(?:代金券|抵扣券|现金券|券|[xX×*（(]|$))",
+                    r"(?=\s*(?:代金券|代金|组合|抵扣券|现金券|券|[xX×*（(]|$))",
                     name,
                 )
                 if not face_match:
@@ -1998,9 +2140,12 @@ class V2Store(AppStore):
             )))
             if not maximum:
                 stack_match = re.search(
-                    r"(?:最多)?(?:可)?(?:叠加|使用)\s*(\d+)\s*张", name,
+                    r"(?:最多(?:可)?(?:叠加|使用)|可叠加|仅限(?:使用)?|限用|只能(?:使用|用)?)\s*"
+                    r"(\d+|[零一二两三四五六七八九十百千]+)\s*张",
+                    name,
                 )
-                maximum = stack_match.group(1) if stack_match else ""
+                parsed_maximum = cls._chinese_count(stack_match.group(1)) if stack_match else None
+                maximum = str(parsed_maximum) if parsed_maximum else ""
             platforms = [value for value in ("美团", "抖音", "小程序") if value in name]
             source_id = cls._platform_sku_source_id(
                 record, name, face, platforms,
@@ -2045,22 +2190,28 @@ class V2Store(AppStore):
                 value for value in ("美团", "抖音", "小程序")
                 if value in str(option.get("name") or "")
             ]
+            face_pattern = rf"(?<!\d){re.escape(face)}(?:\.0+)?\s*元?(?:代金券|优惠券|抵扣券|现金券|券)?"
+            limit_pattern = (
+                r"(?:最多(?:可)?(?:使用|叠加)?|上限(?:为)?|可叠加|仅限(?:使用)?|限用|限|"
+                r"只能(?:使用|用)?)\s*"
+                r"(?P<limit>\d+|[零一二两三四五六七八九十百千]+)\s*张"
+            )
             for clause in clauses:
-                limit_match = re.search(
-                    r"(?:最多(?:使用|叠加)?|上限(?:为)?|可叠加|限用|限)\s*"
-                    r"(\d+)\s*张",
-                    clause,
+                local_match = re.search(
+                    rf"{face_pattern}[^。；;\n]{{0,24}}?{limit_pattern}", clause,
+                ) or re.search(
+                    rf"{limit_pattern}[^。；;\n]{{0,24}}?{face_pattern}", clause,
                 )
-                if not limit_match:
+                if not local_match:
                     continue
-                if not re.search(rf"(?<!\d){re.escape(face)}(?:\.0+)?\s*元?", clause):
+                local_evidence = local_match.group(0)
+                if (face_counts.get(face, 0) > 1 and platforms
+                        and not any(platform in local_evidence for platform in platforms)):
                     continue
-                if platforms and not any(platform in clause for platform in platforms):
-                    continue
-                if not platforms and face_counts.get(face, 0) > 1:
-                    continue
-                option["max_stack"] = limit_match.group(1)
-                break
+                parsed_limit = cls._chinese_count(local_match.group("limit"))
+                if parsed_limit:
+                    option["max_stack"] = str(parsed_limit)
+                    break
         return output
 
     @classmethod
@@ -2383,38 +2534,13 @@ class V2Store(AppStore):
             business_keys.add(key)
             deduplicated.append(option)
         valid = deduplicated
-        # Some Goofish listings expose quantity selectors as separate SKUs
-        # (100券、100券×2、100券×3). They are one sellable denomination, not
-        # three products. Keep the unit SKU, but never treat the package
-        # quantity as a stacking limit; only explicit rule text may set one.
-        collapsed = []
-        for option in sorted(
-            valid,
-            key=lambda value: (
-                Decimal(str(value.get("face_value") or "0")),
-                Decimal(str(value.get("sale_price") or "0")),
-            ),
-        ):
-            face = str(option.get("face_value") or "")
-            same_face = [item for item in collapsed if str(item.get("face_value") or "") == face]
-            quantity_match = re.search(
-                r"(?:[×xX*]|发)\s*([2-9]\d*)\s*张?",
-                " ".join(str(option.get(key) or "") for key in ("name", "composition")),
-            )
-            if same_face and quantity_match:
-                base = same_face[0]
-                quantity = int(quantity_match.group(1))
-                try:
-                    base_price = Decimal(str(base.get("sale_price") or "0"))
-                    current_price = Decimal(str(option.get("sale_price") or "0"))
-                except InvalidOperation:
-                    base_price = current_price = Decimal("0")
-                if base_price > 0 and abs(current_price - base_price * quantity) <= Decimal("0.2"):
-                    continue
-            collapsed.append(option)
-        for option in collapsed:
+        # Marketplace quantity bundles such as 100x2 and 100x3 are independent
+        # buyer-selectable SKUs. Preserve them even when their prices are exact
+        # multiples of the unit SKU; composition is used for total-value and
+        # discount calculations, not as a reason to hide a real SKU.
+        for option in valid:
             option.pop("_platform_sku", None)
-        return collapsed
+        return valid
 
     @staticmethod
     def _chinese_count(value: object) -> Optional[int]:
@@ -2483,6 +2609,9 @@ class V2Store(AppStore):
             r"怎么收|怎么买|怎么拍|一共|总共|合计|要付|"
             r"还有吗|还有么|还有嘛|还有没有|有货吗|有没有|有吗|能用吗|可以用吗)",
             rf"(?:买|要|来|拿|拍|购)\s*(?P<count>{number})\s*(?P<unit>{unit})",
+            rf"(?P<count>{number})\s*(?P<unit>张)\s*"
+            r"(?:的|每张|面额(?:为)?)?\s*\d+(?:\.\d+)?\s*(?:元|块)?"
+            r"(?:代金券|优惠券|抵扣券|现金券|券)?(?:呢|呀|啊)?[？?。！!]*$",
             rf"(?P<count>{number})\s*(?P<unit>{unit})\s*(?:的)?\s*(?:呢|可以吗|有吗)[？?。！!]*$",
         )
         for pattern in patterns:
@@ -3994,6 +4123,23 @@ class V2Store(AppStore):
         if not any(slots.get(key) not in (None, "") for key in slot_keys):
             return None
         options = [option for option in self.extract_sale_options(product) if option.get("sale_price")]
+        # A short quantity follow-up inherits the SKU scope from the latest
+        # store answer. This preserves “该店只支持200券” for “能拍2张吗”.
+        if direct_slots.get("purchase_quantity"):
+            matrix = list((query_context or {}).get("store_sku_matrix") or [])
+            scoped_skus = []
+            seen_scoped_skus = set()
+            for row in matrix:
+                for sku in row.get("supported_skus") or []:
+                    key = str(sku.get("sku_key") or sku.get("sku_name") or "")
+                    if key and key not in seen_scoped_skus and sku.get("sellable", True):
+                        seen_scoped_skus.add(key)
+                        scoped_skus.append(sku)
+            if scoped_skus:
+                options = [
+                    {**sku, "name": str(sku.get("sku_name") or "商品规格")}
+                    for sku in scoped_skus if sku.get("sale_price")
+                ]
         requested_audiences = set(direct_slots.get("audience_types") or [])
         if not requested_audiences:
             # Child/senior/student fares must never become the default adult
@@ -5148,27 +5294,53 @@ class V2Store(AppStore):
                 return ""
 
         lines = []
+        discounts = []
         requested_match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*折", text)
         requested = Decimal(requested_match.group(1)) if requested_match else None
+        # Buyers commonly omit the decimal point in colloquial discount
+        # confirmations: ``75折`` means 7.5折 and ``749折`` means 7.49折.
+        # Normalize those compact forms before comparing with the calculated
+        # discount; a literal 75折 is not a meaningful retail discount.
+        while requested is not None and requested > Decimal("10"):
+            requested /= Decimal("10")
         for option in options:
             try:
                 price = Decimal(str(option.get("sale_price") or "0"))
                 face = Decimal(str(option.get("face_value") or "0"))
+                total_value = Decimal(str(self._option_total_value(option) or "0"))
             except InvalidOperation:
                 continue
-            if price <= 0 or face <= 0:
+            if price <= 0 or total_value <= 0:
                 continue
-            discount = (price / face * Decimal("10")).quantize(
+            discount = (price / total_value * Decimal("10")).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
+            name = str(option.get("name") or "").strip()
+            if not name:
+                name = f"{self._format_number(total_value)}元代金券"
             line = (
-                f"{self._format_number(face)}元代金券售价{self._format_number(price)}元，"
+                f"{name}售价{self._format_number(price)}元，"
                 f"约{self._format_number(discount)}折"
             )
-            if requested is not None:
-                line = ("是的，" if abs(discount - requested) <= Decimal("0.01") else "不是，") + line
+            coupon_count = sum(count for _, count in self._option_coupon_pairs(option))
+            if coupon_count > 1 or (face > 0 and total_value != face):
+                contents = self._purchase_contents_label(option)
+                line = (
+                    f"{name}售价{self._format_number(price)}元，发放{contents}，"
+                    f"共可抵扣{self._format_number(total_value)}元，"
+                    f"约{self._format_number(discount)}折"
+                )
             lines.append(line)
+            discounts.append(discount)
         prefix = self._day_reply_prefix(text, day_type) if day_type else ""
+        if requested is not None and discounts:
+            matched = [abs(discount - requested) <= Decimal("0.01") for discount in discounts]
+            if all(matched):
+                prefix += "是的，"
+            elif any(matched):
+                prefix += "部分规格是，"
+            else:
+                prefix += "不是，"
         return prefix + "；".join(lines) + "。" if lines else ""
 
     def purchase_entry_reply(self, product: Dict, message: str) -> str:
@@ -5553,11 +5725,12 @@ class V2Store(AppStore):
         """Answer ``xxx有吗`` strictly from real SKUs, never from LLM guesses."""
         text = str(message or "").strip()
         match = re.fullmatch(
-            r"(?:请问)?(?:有没有|有无|有没有卖|卖不卖)\s*(.+?)(?:呢|啊|呀|吗)?[？?]?|"
-            r"(?:请问)?(?:能不能|可不可以|可以不可以|能否)(?:买|拍|购买)\s*(.+?)[？?]?|"
-            r"(?:请问)?(.+?)\s*(?:有吗|有没有|有么|有嘛|还有吗|有货吗|"
-            r"能拍吗|可以拍吗|能买到吗|能不能买)[？?]?|"
-            r"(?:请问)?有\s*(.+?)\s*(?:吗|么|嘛|不)[？?]?",
+            rf"(?:请问)?(?:有没有|有无|有没有卖|卖不卖)\s*(.+?){QUESTION_TAIL_PATTERN}[？?]?|"
+            rf"(?:请问)?(?:能不能|可不可以|可以不可以|能否)(?:买|拍|购买)\s*(.+?){QUESTION_TAIL_PATTERN}[？?]?|"
+            rf"(?:请问)?(.+?)\s*(?:有没有|有货{QUESTION_TAIL_PATTERN}|还有{QUESTION_TAIL_PATTERN}|"
+            rf"有{QUESTION_TAIL_PATTERN}|能拍{QUESTION_TAIL_PATTERN}|可以拍{QUESTION_TAIL_PATTERN}|"
+            rf"能买到{QUESTION_TAIL_PATTERN}|能不能买{QUESTION_TAIL_PATTERN})[？?]?|"
+            rf"(?:请问)?有\s*(.+?)\s*{QUESTION_TAIL_REQUIRED_PATTERN}[？?]?",
             text,
         )
         if not match:
@@ -5642,11 +5815,32 @@ class V2Store(AppStore):
                     return f"有的，当前商品包含{name}{suffix}。"
         if requested_values:
             target = max(Decimal(self._format_number(value)) for value in requested_values)
-            plan = self.consumption_plan_reply(
-                product, target, missing_denomination=True
+            exact_plan = any(
+                (option_value := Decimal(str(self._option_total_value(option) or "0"))) > 0
+                and target % option_value == 0
+                and int(target / option_value) <= self._option_stack_limit(product, option)
+                for option in options
             )
-            if plan:
-                return plan
+            if exact_plan or not options:
+                plan = self.consumption_plan_reply(
+                    product, target, missing_denomination=True
+                )
+                if plan:
+                    return plan
+            requested = "、".join(
+                f"{self._format_number(value)}元代金券" for value in requested_values
+            )
+            available = [option for option in options if option.get("sale_price")]
+            if available:
+                brand = self.extract_brand(product)
+                return (
+                    f"当前商品没有{requested}。\n\n"
+                    "当前有以下规格：\n"
+                    + "\n".join(
+                        self.format_product_option(option, brand)
+                        for option in available
+                    )
+                )
         # Only an explicit product-option noun is strong enough to conclude
         # that a named option is missing.  A phrase such as “广东万达有吗” or
         # “西丽益田假日店有吗” must continue to the store matcher.
@@ -5873,6 +6067,19 @@ class V2Store(AppStore):
         """Answer per-SKU menu questions without treating silence as exclusion."""
         text = str(message or "").strip()
         if not text or re.search(r"退款|退货|售后|核销|券码", text):
+            return None
+        voucher_source = "\n".join((
+            str(product.get("title") or ""),
+            str(product.get("raw_text") or ""),
+            json.dumps(product.get("structured") or {}, ensure_ascii=False),
+        ))
+        # “有200代金券吗” asks whether a sellable denomination exists.  It is
+        # not a question about whether the previously selected 300-yuan SKU
+        # contains a 200-yuan voucher.  Let the SKU availability resolver use
+        # the current catalog and replace the previous selected-SKU context.
+        if (re.search(r"有吗|有没有|有无|有么|有嘛|有货|卖不卖|选项|规格", text)
+                and re.search(r"(?<!\d)\d+(?:\.\d+)?(?:\s*元|\s*块)?", text)
+                and re.search(r"代金券|抵扣券|现金券", voucher_source)):
             return None
         context = context if isinstance(context, dict) else {}
         challenge = bool(re.search(
@@ -6960,6 +7167,33 @@ class V2Store(AppStore):
         requested_platforms = [name for name in ("抖音", "美团", "小程序") if name in message]
         if len(values) == 1:
             denomination = self._format_number(values[0])
+            platform_options = [
+                option for option in options
+                if not requested_platforms or any(
+                    platform in str(option.get("name") or "")
+                    for platform in requested_platforms
+                )
+            ]
+            composed_total_matches = [
+                option for option in platform_options
+                if self._option_total_value(option) == denomination
+                and not self._option_delivers_single_face(option, denomination)
+            ]
+            atomic_matches = [
+                option for option in platform_options
+                if self._option_delivers_single_face(option, denomination)
+            ]
+            # “100x2” is one sellable 200-yuan-total SKU that delivers two
+            # actual 100-yuan coupons.  In a question such as “200的代金券能否
+            # 同时用2张”, 张 refers to the delivered coupons, not two copies of
+            # the SKU.  Route this through the composition-aware reply instead
+            # of multiplying 200 * 2 and inventing two 200-yuan coupons.
+            if len(composed_total_matches) == 1 and not atomic_matches:
+                composed_reply = self.coupon_quantity_limit_reply(
+                    product, f"{denomination}元代金券一次可以用几张",
+                )
+                if composed_reply:
+                    return composed_reply
             matching = [
                 option for option in options
                 if self._format_number(option.get("face_value") or "") == denomination
@@ -8914,7 +9148,9 @@ class V2Store(AppStore):
                         price = str(usable[0].get("sale_price") or "").strip()
                         details = []
                         if maximum:
-                            details.append(f"可叠加{maximum}张")
+                            details.append(
+                                "每次限用1张" if maximum == "1" else f"可叠加{maximum}张"
+                            )
                         if price:
                             details.append(f"售价{price}元")
                         direct.append(
@@ -9424,6 +9660,11 @@ class V2Store(AppStore):
         if re.search(r"退款|退货|退钱|售后|不想要|买多了|拍多了|申请退", compact):
             return ""
         if cls._denomination_purchase_amount(message):
+            return ""
+        # A number followed by 张/份 is a purchase quantity, not a tiny
+        # consumption target. Let the quantity resolver answer it.
+        purchase_quantity, purchase_unit = cls._purchase_quantity_slot(message)
+        if purchase_quantity and purchase_unit:
             return ""
         if re.search(
             r"(?:能不能|可不可以|有没有|有无|有没|是否有|可以不可以)"
@@ -11958,6 +12199,70 @@ class V2Store(AppStore):
                 ) + "。"
             return fallback
 
+        def store_scoped_voucher_value(fallback: str) -> str:
+            """Bind a paid/face relation to the store found in the same message."""
+            child = store_child_cache or {}
+            if not value_match or str(child.get("store_status") or "") != "available":
+                return fallback
+            matrix = list(child.get("store_sku_matrix") or [])
+            if not matrix:
+                return fallback
+            paid = self._format_number(value_match.group(1))
+            face = self._format_number(value_match.group(2))
+            referenced = [
+                sku for sku in (multi_store_scope.get("skus") or [])
+                if self._format_number(sku.get("sale_price")) == paid
+                and self._option_total_value(sku) == face
+            ]
+            if len(referenced) != 1:
+                return fallback
+            target = referenced[0]
+            target_key = str(target.get("sku_key") or "")
+            supported_stores = []
+            unsupported_stores = []
+            for row in matrix:
+                store_name = self._store_display_name(row.get("store") or {})
+                supported_keys = {
+                    str(sku.get("sku_key") or "")
+                    for sku in (row.get("supported_skus") or [])
+                }
+                if target_key and target_key in supported_keys:
+                    supported_stores.append(store_name)
+                else:
+                    unsupported_stores.append(store_name)
+            if not unsupported_stores:
+                return fallback
+
+            target_name = str(target.get("sku_name") or f"{face}元代金券")
+            unsupported_label = "、".join(
+                f"【{name}】" for name in dict.fromkeys(unsupported_stores)
+            )
+            if supported_stores:
+                supported_label = "、".join(
+                    f"【{name}】" for name in dict.fromkeys(supported_stores)
+                )
+                return (
+                    f"{target_name}售价{paid}元、面额{face}元；"
+                    f"{supported_label}可以使用，但{unsupported_label}不支持该规格。"
+                )
+
+            reply = (
+                f"{target_name}售价{paid}元、面额{face}元，但"
+                f"{unsupported_label}不支持该规格，不能在该店使用。"
+            )
+            if len(matrix) == 1:
+                alternatives = [
+                    sku for sku in (matrix[0].get("supported_skus") or [])
+                    if self._option_total_value(sku) == face
+                    and str(sku.get("sku_key") or "") != target_key
+                    and sku.get("sellable", True)
+                ]
+                if alternatives:
+                    reply += "该店可用的同面额规格为" + "、".join(
+                        self._sku_public_label(sku) for sku in alternatives
+                    ) + "。"
+            return reply
+
         for _, kind, label, payload in sorted(tasks, key=lambda value: value[0]):
             child = None
             if kind == "usage":
@@ -11965,9 +12270,10 @@ class V2Store(AppStore):
                 if not reply:
                     reply = "商品知识暂未标明该规格的发券渠道，请说明具体规格或面额后再确认。"
             elif kind == "voucher_value":
-                reply = self.voucher_value_confirmation_reply(product, text) or (
+                voucher_reply = self.voucher_value_confirmation_reply(product, text) or (
                     "当前商品资料中暂未找到能确认的售价与面额对应关系。"
                 )
+                reply = store_scoped_voucher_value(voucher_reply)
             elif kind == "stacking":
                 reply = self.stacking_reply(product, text)
             elif kind == "restrictions":
@@ -12293,6 +12599,52 @@ class V2Store(AppStore):
                     "decision": "allow", "kind": "coupon_catalog",
                     "query_context_update": {"last_sku_catalog": True},
                 }
+
+        no_price_change_confirmation = bool(
+            re.search(
+                r"(?:不用|无需|不需要|不必)[^。！？\n]{0,6}"
+                r"(?:改价|修改价格|调整价格)",
+                message,
+            )
+            and re.search(r"拍|下单|购买", message)
+        )
+        if no_price_change_confirmation:
+            options = [
+                option for option in self.list_product_skus(item_id, product)
+                if self._is_sellable_option(option) and option.get("sale_price")
+            ]
+            direct = [
+                option for option in options
+                if not re.search(
+                    r"拍下改价|需要改价|需改价|改价后",
+                    str(option.get("name") or option.get("sku_name") or ""),
+                )
+            ]
+            change_required = [
+                str(option.get("name") or option.get("sku_name") or "当前规格").strip()
+                for option in options if option not in direct
+            ]
+            selected_name = str(query_context.get("selected_sku_name") or "").strip()
+            if direct:
+                subject = (
+                    f"{selected_name}是页面已有规格，"
+                    if selected_name and not re.search(r"改价", selected_name)
+                    else "选择商品页面已经标明售价的代金券规格，"
+                )
+                reply = f"是的，{subject}按页面显示金额直接拍下即可，无需改价。"
+                if change_required:
+                    labels = "、".join(f"“{name}”" for name in dict.fromkeys(change_required))
+                    reply += f"{labels}等明确标注改价的规格除外。"
+            else:
+                reply = (
+                    "当前商品没有可确认按页面价格直接购买的规格；"
+                    "页面若标注“拍下改价”，仍需另行确认价格。"
+                )
+            return {
+                "reply": reply,
+                "source": "当前真实在售规格及页面售价",
+                "decision": "allow", "kind": "purchase_price_confirmation",
+            }
 
         if re.fullmatch(r"(?:请)?(?:帮我)?(?:改个价|改价|修改价格|价格改一下)", compact):
             return {
@@ -12627,16 +12979,19 @@ class V2Store(AppStore):
                     "query_context_update": {"price_filters": previous_price},
                 }
 
-        if compact in {
-            "还有吗", "还有么", "还有嘛", "还有不", "还有货吗", "有货吗", "能拍吗", "可以拍吗",
-            "现在能买吗", "现在能拍吗", "当前能买吗", "当前能拍吗",
-            "是不是卖完了", "是卖完了吗", "卖完了吗", "卖完了么", "售罄了吗", "没货了吗",
-        }:
+        generic_stock_question = bool(re.fullmatch(
+            rf"(?:还有|(?:这个|这款|当前商品|商品)?(?:还有)?有货|"
+            rf"能拍|可以拍|现在能买|现在能拍|当前能买|当前能拍)"
+            rf"{QUESTION_TAIL_PATTERN}",
+            compact,
+        ))
+        sellout_question = bool(re.fullmatch(
+            rf"(?:是不是卖完了|是卖完了|卖完了|售罄了|没货了){QUESTION_TAIL_PATTERN}",
+            compact,
+        ))
+        if generic_stock_question or sellout_question:
             offline = str(product.get("item_status") or "").lower() in {
                 "offline", "off_shelf", "offshelf", "deleted", "下架",
-            }
-            sellout_question = compact in {
-                "是不是卖完了", "是卖完了吗", "卖完了吗", "卖完了么", "售罄了吗", "没货了吗",
             }
             return {
                 "reply": (
@@ -13882,6 +14237,16 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
     text = str(message or "").strip()
     # Tolerate common key-repeat typos without widening fuzzy store matching.
     text = re.sub(r"能{2,}(?=(?:使用|用))", "能", text)
+    # In colloquial store questions, ``点`` often means “这个地点” rather
+    # than being part of the branch name: “峡山点能用吗” -> “峡山能用吗”.
+    # Scope the cleanup to an immediately following availability predicate so
+    # real names containing 点 are not rewritten in ordinary searches.
+    text = re.sub(
+        r"(?<=[\u4e00-\u9fffA-Za-z0-9])点"
+        r"(?=\s*(?:能不能|可不可以|可以|能|可|支持|适用|行不行|行)"
+        r"(?:使用|用)?(?:吗|嘛|么|呢|吧|不|没|否|[？?])?)",
+        "", text,
+    )
     # Product titles are frequently followed by a parenthesized branch.  That
     # bracket is a reliable entity boundary; use it before deleting intent
     # words from the rest of the sentence.
@@ -13921,6 +14286,10 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
     )
     for phrase in (
         "适用门店相关问题", "适用门店问题", "门店相关问题", "门店问题",
+        "都有什么适用门店", "都有什么门店", "都有什么店",
+        "都有啥适用门店", "都有啥门店", "都有啥店",
+        "什么适用门店", "什么门店", "什么店",
+        "有啥适用门店", "有啥门店", "有啥店",
         "有什么适用门店", "有哪些适用门店", "哪些适用门店",
         "都有哪些可以使用", "都有哪些可以用", "有哪些可以使用", "有哪些可以用",
         "哪些门店可以使用", "哪些门店可以用", "哪些店可以使用", "哪些店可以用",
@@ -13930,10 +14299,13 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         "有哪家门店", "有哪家店", "有那家门店", "有那家店",
         "有那些门店", "有那些店", "有哪些门店", "有哪些店",
         "这个券", "这张券", "该券", "能不能使用", "能不能用", "可不可以使用", "可不可以用",
+        "用得了吗", "用的了吗", "用得了嘛", "用的了嘛", "用得了", "用的了",
+        "我要使用", "我要用", "我想使用", "我想用", "需要使用", "需要用",
+        "想使用", "想用", "要使用", "要用",
         "不能使用吗", "不能用吗", "不可以使用吗", "不可以用吗", "不可使用吗", "不可用吗",
         "可以使用嘛", "可以使用吗", "可以用嘛", "能用嘛", "可用嘛",
         "也可以使用", "也可以用", "也能用", "也可用", "也可以",
-        "可以用吗", "可以吗", "能用吗", "可用吗", "支持吗", "行吗",
+        "可以用吗", "可以吗", "能用吗", "可用吗", "支持吗", "行不行", "行吗",
         "可以用", "可以", "能用", "可用", "支持", "适用",
         "适用吗", "能不能用", "可以使用吗", "是否可用", "哪些门店", "哪个门店", "门店",
         "还有没有", "还有吗", "还有么", "还有嘛", "有没有", "没有", "有吗",
@@ -14007,6 +14379,18 @@ def extract_store_query(message: str, product: Optional[Dict] = None,
         " ", text,
     )
     text = re.sub(r"\s+", " ", text).strip()
+    # A location can occur twice in a natural sentence (“我在乌鲁木齐，我要用
+    # 乌鲁木齐的”).  Once intent words are removed, collapse only identical
+    # whitespace-delimited entities.  Different entities such as “深圳 壹方城”
+    # remain intact and continue through branch matching.
+    compact_parts = []
+    seen_parts = set()
+    for part in text.split():
+        key = re.sub(r"的$", "", part).strip()
+        if key and key not in seen_parts:
+            seen_parts.add(key)
+            compact_parts.append(key)
+    text = " ".join(compact_parts)
     # A final “的” is a grammatical scope marker in queries such as
     # “荆州的/武汉市的”, never part of the city or branch search key.
     text = re.sub(r"的$", "", text).strip()

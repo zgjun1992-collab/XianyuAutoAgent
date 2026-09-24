@@ -1,8 +1,9 @@
 const { app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage, dialog, Notification, shell, Menu } = require('electron')
-const { spawn } = require('child_process')
+const { spawn, execFile } = require('child_process')
 const fs = require('fs')
 const net = require('net')
 const path = require('path')
+const { staleBackendPids } = require('./backend-process-policy.cjs')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -69,6 +70,34 @@ function isAllowedGoofishNavigation(rawUrl) {
 
 const isDev = !app.isPackaged
 const projectRoot = path.resolve(__dirname, '..', '..')
+
+function tasklistOutput(imageName) {
+  if (process.platform !== 'win32') return Promise.resolve('')
+  return new Promise((resolve) => {
+    execFile(
+      'tasklist.exe', ['/FI', `IMAGENAME eq ${imageName}`, '/FO', 'CSV', '/NH'],
+      { windowsHide: true, encoding: 'utf8' },
+      (_error, stdout) => resolve(String(stdout || ''))
+    )
+  })
+}
+
+async function cleanupStaleBackendProcesses(imageName) {
+  const stale = staleBackendPids(await tasklistOutput(imageName), imageName, backendProcess?.pid || 0)
+  if (!stale.length) return []
+  const stopped = []
+  for (const pid of stale) {
+    try {
+      process.kill(pid)
+      stopped.push(pid)
+      console.error(`V3 backend: cleaned stale ${imageName} PID ${pid}`)
+    } catch (error) {
+      console.error(`V3 backend: unable to clean PID ${pid}`, error?.message || String(error))
+    }
+  }
+  if (stopped.length) await new Promise((resolve) => setTimeout(resolve, 750))
+  return stopped
+}
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'desktop-settings.json')
@@ -226,10 +255,10 @@ async function startBackend() {
   let args
   if (isDev) {
     executable = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
-    args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir]
+    args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir, '--parent-pid', String(process.pid)]
   } else {
     executable = path.join(process.resourcesPath, 'backend', 'xianyu-v3-backend.exe')
-    args = ['--port', String(backendPort), '--data-dir', dataDir]
+    args = ['--port', String(backendPort), '--data-dir', dataDir, '--parent-pid', String(process.pid)]
   }
   backendProcess = spawn(executable, args, {
     cwd: isDev ? projectRoot : path.dirname(executable),
@@ -454,6 +483,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     goofishSession = session.fromPartition('persist:xianyu-main')
     await configureGoofishProxy(goofishSession)
     console.error('V3 stage: network route ready')
+    if (!isDev) await cleanupStaleBackendProcesses('xianyu-v3-backend.exe')
     await startBackend()
     console.error('V3 stage: backend ready')
     await createWindow()

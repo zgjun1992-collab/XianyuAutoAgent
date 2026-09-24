@@ -52,6 +52,21 @@ class AppStoreTests(unittest.TestCase):
         result = PolicyEngine().evaluate("有效期到什么时候", "本地资料显示有效期到2026年12月31日。")
         self.assertEqual("allow", result.action)
 
+    def test_no_price_change_confirmation_is_not_manual_review(self):
+        for message in (
+            "我直接拍这个就不用改价了吧",
+            "按页面价格拍下无需改价对吗",
+            "直接购买不需要修改价格吧",
+        ):
+            with self.subTest(message=message):
+                result = PolicyEngine().evaluate(message, "是的，按页面价格直接拍下即可。")
+                self.assertEqual("allow", result.action)
+                self.assertEqual("是的，按页面价格直接拍下即可。", result.suggested_reply)
+
+        actual_change = PolicyEngine().evaluate("我拍下你改价吧", "请先拍下。")
+        self.assertEqual("review", actual_change.action)
+        self.assertIn("人工核实", actual_change.suggested_reply)
+
     def test_coupon_word_is_not_mistaken_for_bargaining(self):
         result = PolicyEngine().evaluate("这个优惠券怎么用", "到店扫码核销。")
         self.assertEqual("allow", result.action)

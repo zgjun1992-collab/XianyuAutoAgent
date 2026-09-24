@@ -2,9 +2,10 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from v2_backend import BackendState
+from v2_backend import BackendState, _start_parent_watchdog
 
 
 class FakeXianyuApis:
@@ -77,6 +78,19 @@ class BackendSyncTests(unittest.TestCase):
         self.assertEqual(1, len(records))
         self.assertEqual("sku-200", records[0]["skuId"])
 
+    def test_moved_sku_array_and_nested_price_are_normalized(self):
+        payload = {
+            "tradeInfo": {"variants": [{
+                "skuId": "sku-400",
+                "priceInfo": {"priceInCent": 25000},
+                "properties": [{"valueText": "400元代金券"}],
+            }]},
+        }
+        records = self.state._collect_sku_records(payload)
+        self.assertEqual(1, len(records))
+        self.assertEqual(25000, records[0]["priceInCent"])
+        self.assertEqual("400元代金券", records[0]["propertyList"][0]["valueText"])
+
     @patch("v2_backend.XianyuApis", FakeXianyuApis)
     def test_syncs_onsale_text_without_sending_images_to_ai(self):
         result = self.state.sync_products()
@@ -92,6 +106,45 @@ class BackendSyncTests(unittest.TestCase):
         self.assertIn("https://img.alicdn.com/detail.jpg", product["image_urls"])
         self.assertIn("工作日午餐可用", self.summary_calls[0])
         self.assertNotIn("image_url", self.summary_calls[0])
+
+    @patch("v2_backend.XianyuApis", FakeXianyuApis)
+    def test_ai_timeout_is_reported_as_warning_after_product_sync_succeeds(self):
+        def timeout(_source_text):
+            raise TimeoutError("Request timed out.")
+
+        self.state._generate_summary = timeout
+        result = self.state.sync_products(["30003"])
+
+        self.assertEqual(1, result["synced"])
+        self.assertEqual([], result["failed"])
+        self.assertEqual(1, len(result["warnings"]))
+        product = self.state.store.get_v2_product("30003")
+        self.assertEqual("summary_failed", product["sync_status"])
+        self.assertIn("工作日午餐可用", product["raw_text"])
+
+    @patch("v2_backend.XianyuApis", FakeXianyuApis)
+    def test_existing_platform_sku_change_waits_for_explicit_approval(self):
+        original = json.dumps({
+            "title": "小江溪125元代金券", "description": "旧页面规则", "sku": [{
+                "skuId": "sku-old", "priceInCent": 6900, "quantity": 8,
+                "propertyList": [{"valueText": "100元代金券"}],
+            }],
+        }, ensure_ascii=False)
+        self.state.store.upsert_synced_product({
+            "item_id": "30003", "title": "小江溪125元代金券",
+            "platform_summary": original, "item_status": "onsale",
+        })
+        self.state.store.save_v2_product("30003", "小江溪125元代金券", "人工知识")
+
+        result = self.state.sync_products(["30003"])
+
+        self.assertEqual(1, result["synced"])
+        staged = self.state.store.get_v2_product("30003")
+        self.assertEqual(["100元代金券"], [row["sku_name"] for row in staged["skus"]])
+        self.assertTrue(staged["source_update"]["sku_changes"]["has_changes"])
+        self.assertIn("skus", staged["source_update"]["pending_sections"])
+        applied = self.state.store.apply_source_update("30003", ["skus"])
+        self.assertEqual([], applied["skus"])
 
     @patch("v2_backend.XianyuApis", FakeXianyuApis)
     def test_lists_lightweight_onsale_products_for_selective_sync(self):
@@ -133,6 +186,15 @@ class BackendSyncTests(unittest.TestCase):
             self.state._release_service_mutex()
         other._acquire_service_mutex()
         other._release_service_mutex()
+
+    def test_packaged_backend_tracks_its_desktop_parent(self):
+        self.assertIsNone(_start_parent_watchdog(0))
+        root = Path(__file__).resolve().parents[1]
+        main = (root / "desktop_v2" / "electron" / "main.cjs").read_text(encoding="utf-8")
+        backend = (root / "v2_backend.py").read_text(encoding="utf-8")
+        self.assertIn("'--parent-pid', String(process.pid)", main)
+        self.assertIn('parser.add_argument("--parent-pid"', backend)
+        self.assertIn("_start_parent_watchdog(args.parent_pid)", backend)
 
     @patch("v2_backend.XianyuApis", FakeXianyuApis)
     def test_resync_never_overwrites_manual_knowledge(self):
