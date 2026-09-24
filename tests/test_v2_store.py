@@ -6524,6 +6524,43 @@ class V2StoreTests(unittest.TestCase):
             ["source:lunch-adult", "source:dinner-child"],
             [sku["sku_key"] for sku in product["skus"]],
         )
+
+    def test_condition_price_uses_current_synced_package_sku_before_ai_summary(self):
+        platform_summary = json.dumps({
+            "title": "鹤一烤肉自助餐",
+            "description": "",
+            "price": "155",
+            "sku": [
+                {
+                    "skuId": "holiday-double", "priceInCent": 31000, "quantity": 49,
+                    "propertyList": [{"actualValueText": "节假日双人经典自助"}],
+                },
+                {
+                    "skuId": "holiday-triple", "priceInCent": 46500, "quantity": 153,
+                    "propertyList": [{"actualValueText": "节假日三人经典自助"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "direct-package-skus", "title": "鹤一烤肉自助餐",
+            "platform_summary": platform_summary, "image_urls": [], "price": "155",
+        })
+
+        product = self.store.get_v2_product("direct-package-skus")
+        self.assertEqual({}, product["structured"])
+        result = self.store.resolve_deterministic(
+            "direct-package-skus", "2026年9月26日中午双人",
+        )
+        self.assertEqual("price", result["kind"])
+        self.assertIn("9月26日中午可用的", result["reply"])
+        self.assertIn("节假日双人经典自助", result["reply"])
+        self.assertIn("310元", result["reply"])
+        self.assertNotIn("暂时无法准确报价", result["reply"])
+        self.assertEqual(
+            "source:holiday-double",
+            result["query_context_update"]["selected_sku_key"],
+        )
+
     def test_amount_question_matrix_covers_prefix_suffix_and_chinese_forms(self):
         self.store.save_v2_product(
             "amount-matrix", "代金券",
