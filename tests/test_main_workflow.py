@@ -424,7 +424,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     def test_disabled_purchase_order_first_reply_silences_only_greetings(self):
         product = {"coupon_type": "purchase_order", "first_reply_enabled": False}
-        for message in ("你好", "您好", "在吗？", "hello"):
+        for message in ("你好", "您好", "在吗？", "hello", "1"):
             self.assertTrue(
                 XianyuLive.should_silence_disabled_purchase_order_greeting(product, message)
             )
@@ -440,6 +440,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     def test_pure_greeting_classifier_does_not_treat_questions_as_greetings(self):
         self.assertTrue(XianyuLive.should_send_first_reply("你好", {"kind": "greeting"}))
+        self.assertTrue(XianyuLive.should_send_first_reply("1", {"kind": "greeting"}))
         for message in ("周末能用吗", "南昌万象城能用吗", "两个人多少钱", "怎么付款"):
             with self.subTest(message=message):
                 self.assertFalse(XianyuLive.should_send_first_reply(message, {"kind": "stores"}))
@@ -600,7 +601,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         websocket = object()
         self.assertTrue(await greeting_live.handle_purchase_order_buyer_message(
             websocket, "chat-1", "buyer-1", "scope-1", "item-1", product,
-            {"first_reply_sent": 1}, "你好",
+            {"first_reply_sent": 1}, "1",
         ))
         greeting_live.send_msg.assert_awaited_once_with(
             websocket, "chat-1", "buyer-1", XianyuLive.PURCHASE_ORDER_GREETING_REPLY
@@ -786,6 +787,7 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         # The live workflow uses this narrow gate before its manual-review
         # notice, while retaining takeover for subsequent substantive issues.
         self.assertTrue(XianyuLive.should_send_first_reply("你好"))
+        self.assertTrue(XianyuLive.should_send_first_reply("1"))
         self.assertFalse(XianyuLive.should_send_first_reply("券码核销失败"))
 
     def test_message_id_is_preferred_for_deduplication(self):
