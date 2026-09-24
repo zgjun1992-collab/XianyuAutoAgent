@@ -140,6 +140,28 @@ class V2StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "没有已生成的AI草稿"):
             self.store.adopt_ai_draft("10001", "页面旧摘要289元")
 
+    def test_legacy_ai_draft_moves_blackout_dates_out_of_raw_fallback(self):
+        legacy = (
+            "【使用时间】\n适用门店营业时间内可用。\n\n"
+            "【原文规则保留】\n"
+            "2026年9月25日、9月30日及国庆节10月1日至10月7日不可用。\n"
+            "仅限堂食。"
+        )
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE v2_products SET ai_draft_summary=? WHERE item_id=?",
+                (legacy, "10001"),
+            )
+
+        product = self.store.get_v2_product("10001")
+
+        self.assertIn(
+            "【不可用日期】\n2026年9月25日、9月30日及国庆节10月1日至10月7日不可用。",
+            product["ai_draft_summary"],
+        )
+        self.assertIn("【使用规则】\n仅限堂食。", product["ai_draft_summary"])
+        self.assertNotIn("【原文规则保留】", product["ai_draft_summary"])
+
     def test_each_sku_profile_inherits_common_rules_but_keeps_own_difference(self):
         text = self.store._sku_profile_summary({
             "common_rules": {"stack_rule": "同面额可无限叠加", "meal_period": "全天"},

@@ -1235,7 +1235,7 @@ class V2Store(AppStore):
         if not current:
             raise ValueError("商品不存在")
         now = self._now()
-        summary = str(summary or "").strip()
+        summary = self._repair_legacy_summary_sections(summary)
         normalized_product = dict(current)
         # ``platform_summary`` contains the complete title/description/SKU JSON.
         # Feeding the condensed AI summary back into the completeness pass made
@@ -1351,7 +1351,7 @@ class V2Store(AppStore):
         current = self.get_v2_product(item_id)
         if not current:
             raise ValueError("商品不存在")
-        summary = str(summary or "").strip()
+        summary = self._repair_legacy_summary_sections(summary)
         if not summary:
             raise ValueError("模型未返回可用的归纳结果")
         structured_text = json.dumps(structured or {}, ensure_ascii=False)
@@ -1721,6 +1721,33 @@ class V2Store(AppStore):
             else:
                 remaining.append(line)
         return groups, remaining
+
+    @classmethod
+    def _repair_legacy_summary_sections(cls, summary: object) -> str:
+        """Move recognizable rules out of a saved legacy fallback section."""
+        text = str(summary or "").strip()
+        if "【原文规则保留】" not in text:
+            return text
+        pattern = re.compile(
+            r"(?ms)^【原文规则保留】[ \t]*\n(.*?)(?=^【[^】]+】[ \t]*$|\Z)"
+        )
+
+        def replace(match):
+            lines = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+            grouped, remaining = cls._group_uncovered_source_rules(lines)
+            chunks = []
+            for title, rule_lines in grouped.items():
+                if not rule_lines:
+                    continue
+                if title in text:
+                    remaining.extend(rule_lines)
+                    continue
+                chunks.append(title + "\n" + "\n".join(rule_lines))
+            if remaining:
+                chunks.append("【原文规则保留】\n" + "\n".join(remaining))
+            return "\n\n".join(chunks)
+
+        return pattern.sub(replace, text).strip()
 
     @staticmethod
     def _format_number(value: object) -> str:
@@ -7961,6 +7988,8 @@ class V2Store(AppStore):
         if not row:
             return None
         result = dict(row)
+        for key in ("ai_summary", "ai_draft_summary"):
+            result[key] = self._repair_legacy_summary_sections(result.get(key))
         try:
             result["image_urls"] = json.loads(result.pop("image_urls_json") or "[]")
         except json.JSONDecodeError:
@@ -7995,6 +8024,8 @@ class V2Store(AppStore):
         result = []
         for row in rows:
             item = dict(row)
+            for key in ("ai_summary", "ai_draft_summary"):
+                item[key] = self._repair_legacy_summary_sections(item.get(key))
             try:
                 item["image_urls"] = json.loads(item.pop("image_urls_json") or "[]")
             except json.JSONDecodeError:
