@@ -96,6 +96,45 @@ AFTERSALE_POLICY_PROMPT = """你是餐饮电子卡券售后政策整理员。
 没有资料的栏目写“未说明”，不要输出Markdown、JSON或解释。"""
 
 
+def _wait_for_parent_exit(parent_pid: int):
+    """Terminate this backend when its owning desktop process disappears."""
+    if parent_pid <= 0:
+        return
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x00100000, False, parent_pid)  # SYNCHRONIZE
+        if not handle:
+            if ctypes.get_last_error() == 87:  # ERROR_INVALID_PARAMETER: parent already exited
+                os._exit(0)
+            return
+        try:
+            kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        while os.getppid() == parent_pid:
+            time.sleep(1)
+    os._exit(0)
+
+
+def _start_parent_watchdog(parent_pid: int):
+    if int(parent_pid or 0) <= 0:
+        return None
+    watcher = threading.Thread(
+        target=_wait_for_parent_exit,
+        args=(int(parent_pid),),
+        name="xianyu-parent-watchdog",
+        daemon=True,
+    )
+    watcher.start()
+    return watcher
+
+
 class BackendState:
     def __init__(self, data_dir: str):
         self.data_dir = os.path.abspath(data_dir)
@@ -217,19 +256,35 @@ class BackendState:
                 {"role": "user", "content": source_text},
             ],
             "temperature": 0,
-            "max_tokens": 6000,
-            "timeout": 45,
+            # The SKU-aware prompt can be several thousand characters before
+            # the page description is added.  Forty-five seconds was too short
+            # for qwen-plus and made an otherwise successful product/SKU sync
+            # look like a complete failure.
+            "max_tokens": 4000,
+            "timeout": 120,
         }
-        try:
-            result = self.ai_client().chat.completions.create(
-                **request, response_format={"type": "json_object"}
-            )
-        except Exception as exc:
-            # Some OpenAI-compatible gateways do not implement response_format.
-            if "response_format" not in str(exc).lower() and "400" not in str(exc):
+        last_error = None
+        for use_json_mode in (True, False):
+            try:
+                kwargs = dict(request)
+                if use_json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                result = self.ai_client().chat.completions.create(**kwargs)
+                return self._parse_summary(result.choices[0].message.content or "")
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                unsupported_json = "response_format" in message or "json_object" in message or "400" in message
+                transient = any(marker in message for marker in (
+                    "timed out", "timeout", "connection", "temporarily", "rate limit", "429", "502", "503", "504",
+                ))
+                # Retry once without JSON mode for compatible-mode gateways.
+                # The same retry also covers transient timeouts; source data is
+                # already persisted independently by the sync path.
+                if use_json_mode and (unsupported_json or transient):
+                    continue
                 raise
-            result = self.ai_client().chat.completions.create(**request)
-        return self._parse_summary(result.choices[0].message.content or "")
+        raise last_error
 
     @staticmethod
     def _summary_sku_record(row):
@@ -285,7 +340,8 @@ class BackendState:
                 if manual else "页面文案仅补充SKU未携带的使用规则。"
             ),
         }
-        return json.dumps(payload, ensure_ascii=False, indent=2), canonical_skus
+        # Compact JSON materially reduces latency for products with many SKUs.
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), canonical_skus
 
     @staticmethod
     def _normalize_summary_structure(structured, canonical_skus):
@@ -479,29 +535,48 @@ class BackendState:
         found = []
         seen = set()
 
-        def looks_like_sku(row):
+        def normalize_record(row):
+            normalized = dict(row)
+            price_info = row.get("priceInfo") or row.get("price_info") or {}
+            if isinstance(price_info, dict):
+                for key in ("priceInCent", "price", "soldPrice"):
+                    if normalized.get(key) in (None, "") and price_info.get(key) not in (None, ""):
+                        normalized[key] = price_info[key]
+            if not normalized.get("propertyList") and isinstance(row.get("properties"), list):
+                normalized["propertyList"] = row["properties"]
+            return normalized
+
+        def looks_like_sku(row, parent_key=""):
             if not isinstance(row, dict):
                 return False
+            normalized = normalize_record(row)
             has_price = any(
-                row.get(key) not in (None, "")
+                normalized.get(key) not in (None, "")
                 for key in ("priceInCent", "price", "soldPrice")
             )
             has_identity = bool(
-                row.get("propertyList") or row.get("skuId") or row.get("id")
-                or row.get("name") or row.get("title") or row.get("features")
+                normalized.get("propertyList") or normalized.get("skuId") or normalized.get("sku_id")
+                or normalized.get("id") or normalized.get("name") or normalized.get("title")
+                or normalized.get("features")
             )
-            return has_price and has_identity
+            sku_evidence = bool(
+                "sku" in str(parent_key).lower()
+                or normalized.get("skuId") or normalized.get("sku_id")
+                or normalized.get("propertyList") or normalized.get("features")
+            )
+            return has_price and has_identity and sku_evidence
 
         def walk(node, parent_key=""):
             if isinstance(node, dict):
                 for key, child in node.items():
-                    if isinstance(child, list) and "sku" in str(key).lower():
+                    if isinstance(child, list):
                         for row in child:
-                            if looks_like_sku(row):
-                                fingerprint = json.dumps(row, ensure_ascii=False, sort_keys=True)
+                            if looks_like_sku(row, str(key)):
+                                normalized = normalize_record(row)
+                                fingerprint = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
                                 if fingerprint not in seen:
                                     seen.add(fingerprint)
-                                    found.append(row)
+                                    found.append(normalized)
                     walk(child, str(key))
             elif isinstance(node, list):
                 for child in node:
@@ -579,6 +654,7 @@ class BackendState:
         synced = []
         skipped = []
         failed = []
+        warnings = []
         for card in cards:
             listed = self._onsale_card_data(card)
             if not listed:
@@ -607,7 +683,7 @@ class BackendState:
                     "stock": item_do.get("quantity"),
                     "sku": sku_records,
                 }
-                platform_summary = json.dumps(platform, ensure_ascii=False)
+                incoming_platform_summary = json.dumps(platform, ensure_ascii=False)
                 images = self._collect_image_urls(item_do)
                 thumbnail = str((data.get("picInfo") or {}).get("picUrl") or "").strip()
                 if thumbnail.startswith("//"):
@@ -615,6 +691,14 @@ class BackendState:
                 if thumbnail and thumbnail not in images:
                     images.insert(0, thumbnail)
                 old = self.store.get_v2_product(item_id)
+                platform_summary = self.store._merge_platform_summary(
+                    old.get("platform_summary") if old else "",
+                    incoming_platform_summary,
+                )
+                sku_changes = self.store.platform_sku_changes(
+                    old.get("platform_summary") if old else "",
+                    platform_summary,
+                )
                 unchanged = bool(
                     old and old.get("platform_summary") == platform_summary
                     and old.get("ai_summary")
@@ -624,6 +708,9 @@ class BackendState:
                     "item_id": item_id, "title": title, "platform_summary": platform_summary,
                     "thumbnail_url": thumbnail, "image_urls": images, "price": str(price),
                     "item_status": "onsale",
+                    # Existing products stage SKU identity changes for explicit
+                    # approval, while title/price/images still refresh now.
+                    "defer_platform_summary": bool(old and sku_changes.get("has_changes")),
                 })
                 incomplete = not str(platform.get("description") or "").strip() and not platform.get("sku")
                 if unchanged:
@@ -644,6 +731,7 @@ class BackendState:
                         # not from the operator's still-effective manual knowledge.
                         source_product["manual_edited"] = False
                         source_product["raw_text"] = ""
+                        source_product["platform_summary"] = platform_summary
                         source_text, canonical_skus = self._summary_source_payload(source_product)
                         summary, structured = self._generate_summary(source_text)
                         structured = self._normalize_summary_structure(structured, canonical_skus)
@@ -656,25 +744,31 @@ class BackendState:
                         # A model timeout must not discard rules/stores already
                         # present in the complete marketplace payload.
                         fallback = description or platform_summary
-                        has_effective_knowledge = bool(
-                            old and (str(old.get("raw_text") or "").strip()
-                                     or str(old.get("ai_summary") or "").strip())
-                        )
-                        if has_effective_knowledge:
-                            self.store.stage_source_update(item_id, fallback, {}, description)
+                        if old:
+                            self.store.stage_source_update(
+                                item_id, fallback, {}, description,
+                                platform_summary=platform_summary,
+                                sku_changes=sku_changes,
+                                summary_error=str(summary_exc),
+                            )
                         else:
                             self.store.save_synced_summary(item_id, fallback, {})
                             self.store.sync_platform_store_list(
                                 item_id, title, description, {}
                             )
                             self.store.mark_summary_failed(item_id)
-                        failed.append({
+                        warnings.append({
                             "item_id": item_id,
                             "error": f"AI归纳失败，已保留完整商品页面资料：{summary_exc}",
                         })
+                        synced.append(item_id)
                         continue
                     if old:
-                        self.store.stage_source_update(item_id, summary, structured, description)
+                        self.store.stage_source_update(
+                            item_id, summary, structured, description,
+                            platform_summary=platform_summary,
+                            sku_changes=sku_changes,
+                        )
                     else:
                         self.store.save_synced_summary(item_id, summary, structured)
                         self.store.sync_platform_store_list(
@@ -697,10 +791,14 @@ class BackendState:
         scope_label = "选中商品" if selected_only else "闲鱼在售商品"
         self.store.add_event(
             event_type,
-            f"{scope_label}同步完成：更新 {len(synced)}，未变化 {len(skipped)}，失败 {len(failed)}",
-            {"synced": synced, "skipped": skipped, "failed": failed},
+            f"{scope_label}同步完成：更新 {len(synced)}，未变化 {len(skipped)}，"
+            f"AI归纳待重试 {len(warnings)}，失败 {len(failed)}",
+            {"synced": synced, "skipped": skipped, "warnings": warnings, "failed": failed},
         )
-        return {"synced": len(synced), "unchanged": len(skipped), "failed": failed, "total": len(seen)}
+        return {
+            "synced": len(synced), "unchanged": len(skipped),
+            "warnings": warnings, "failed": failed, "total": len(seen),
+        }
 
     def save_image_asset(self, payload):
         item_id = str(payload.get("item_id") or "").strip()
@@ -1293,5 +1391,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--data-dir", default=os.path.join(os.getcwd(), "data", "v2"))
+    parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
+    _start_parent_watchdog(args.parent_pid)
     serve(args.port, args.data_dir)

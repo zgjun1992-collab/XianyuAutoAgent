@@ -1,5 +1,5 @@
 const { app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage, dialog, Notification, shell, Menu, Tray, nativeImage } = require('electron')
-const { spawn } = require('child_process')
+const { spawn, execFile } = require('child_process')
 const fs = require('fs')
 const net = require('net')
 const os = require('os')
@@ -11,6 +11,7 @@ const { normalizeServiceStatus, isRecordedBackend } = require('./tray-policy.cjs
 const { requestLocalBackend } = require('./local-backend-client.cjs')
 const { stageStoreImport } = require('./import-file-policy.cjs')
 const { stringifyAsciiJson } = require('./rpc-codec.cjs')
+const { staleBackendPids } = require('./backend-process-policy.cjs')
 
 console.error('XianyuCardAI V3 main process starting')
 process.on('uncaughtException', (error) => console.error('V3 uncaughtException:', error))
@@ -105,6 +106,34 @@ const OFFICIAL_LICENSE_SERVER_URL = 'https://api.yituan123.com'
 const DEFAULT_LICENSE_SERVER_URL = isDev
   ? (process.env.XIANYU_LICENSE_SERVER_URL || OFFICIAL_LICENSE_SERVER_URL)
   : OFFICIAL_LICENSE_SERVER_URL
+
+function tasklistOutput(imageName) {
+  if (process.platform !== 'win32') return Promise.resolve('')
+  return new Promise((resolve) => {
+    execFile(
+      'tasklist.exe', ['/FI', `IMAGENAME eq ${imageName}`, '/FO', 'CSV', '/NH'],
+      { windowsHide: true, encoding: 'utf8' },
+      (_error, stdout) => resolve(String(stdout || ''))
+    )
+  })
+}
+
+async function cleanupStaleBackendProcesses(imageName) {
+  const stale = staleBackendPids(await tasklistOutput(imageName), imageName, backendProcess?.pid || 0)
+  if (!stale.length) return []
+  const stopped = []
+  for (const pid of stale) {
+    try {
+      process.kill(pid)
+      stopped.push(pid)
+      appendBackendLog('INFO', `cleaned stale ${imageName} PID ${pid}`)
+    } catch (error) {
+      appendBackendLog('WARN', `unable to clean stale PID ${pid}: ${error?.message || error}`)
+    }
+  }
+  if (stopped.length) await new Promise((resolve) => setTimeout(resolve, 750))
+  return stopped
+}
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'desktop-settings.json')
@@ -812,13 +841,13 @@ async function startBackend() {
   let args
   if (isDev) {
     executable = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
-    args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir]
+    args = [path.join(projectRoot, 'v2_backend.py'), '--port', String(backendPort), '--data-dir', dataDir, '--parent-pid', String(process.pid)]
   } else {
     executable = path.join(
       process.resourcesPath, 'backend', 'xianyu-cloud-preview-backend',
       'xianyu-cloud-preview-backend.exe'
     )
-    args = ['--port', String(backendPort), '--data-dir', dataDir]
+    args = ['--port', String(backendPort), '--data-dir', dataDir, '--parent-pid', String(process.pid)]
   }
   if (!fs.existsSync(executable)) {
     throw new Error(`本地AI服务文件不存在，安装包可能不完整：${executable}`)
@@ -1095,6 +1124,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     await configureGoofishProxy(goofishSession)
     console.error('V3 stage: network route ready')
     await cleanupRecordedBackend()
+    if (!isDev) await cleanupStaleBackendProcesses('xianyu-cloud-preview-backend.exe')
     await startBackend()
     console.error('V3 stage: backend ready')
     await ensureMainWindow()

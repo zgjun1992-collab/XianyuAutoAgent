@@ -512,6 +512,25 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         live.send_message_template.assert_not_awaited()
         self.assertEqual({"scope-menu"}, live.app_store.first_reply_scopes)
 
+    async def test_generated_first_reply_is_skipped_for_colloquial_store_question(self):
+        live = self.make_live()
+        live.app_store.classify_buyer_intents = classify_buyer_message
+        live.send_message_template = AsyncMock()
+        product = {
+            "coupon_type": "meituan", "item_status": "onsale", "enabled": 1,
+            "first_reply_enabled": True, "first_reply_text": "很长的自动商品介绍",
+            "first_reply_manual": False,
+        }
+
+        sent = await live.send_required_first_reply(
+            object(), "chat-1", "buyer-1", "scope-store", "item-1", product,
+            {"first_reply_sent": 0}, "汕头的用的了吗",
+        )
+
+        self.assertFalse(sent)
+        live.send_message_template.assert_not_awaited()
+        self.assertEqual({"scope-store"}, live.app_store.first_reply_scopes)
+
     async def test_promotion_purchase_question_uses_only_the_sales_reply_path(self):
         live = self.make_live()
         live.app_store.promotion_purchase_intent = lambda message: message == "怎么买"

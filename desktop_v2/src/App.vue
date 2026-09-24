@@ -287,7 +287,8 @@ async function syncProducts() {
   syncReport.value = await call('POST', '/products/sync', {})
   await refresh()
   if (snapshot.products.length) selectProduct(snapshot.products[0])
-  notify(`同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${syncReport.value.failed.length ? `，失败 ${syncReport.value.failed.length} 个` : ''}`)
+  const warningCount = (syncReport.value.warnings || []).length
+  notify(`同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${warningCount ? `，AI归纳待重试 ${warningCount} 个` : ''}${syncReport.value.failed.length ? `，抓取失败 ${syncReport.value.failed.length} 个` : ''}`)
 }
 
 async function openProductSyncPicker() {
@@ -313,11 +314,12 @@ async function syncSelectedProducts() {
   await refresh()
   const selected = snapshot.products.find((item) => item.item_id === itemIds[0])
   if (selected) selectProduct(selected)
-  notify(`选中商品同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${syncReport.value.failed.length ? `，失败 ${syncReport.value.failed.length} 个` : ''}`)
+  const warningCount = (syncReport.value.warnings || []).length
+  notify(`选中商品同步完成：更新 ${syncReport.value.synced} 个，未变化 ${syncReport.value.unchanged} 个${warningCount ? `，AI归纳待重试 ${warningCount} 个` : ''}${syncReport.value.failed.length ? `，抓取失败 ${syncReport.value.failed.length} 个` : ''}`)
 }
 
 async function applySourceUpdate(section) {
-  const labels = { knowledge: '商品知识', stores: '适用门店', first_reply: '首次回复' }
+  const labels = { skus: '商品SKU', knowledge: '商品知识', stores: '适用门店', first_reply: '首次回复' }
   if (!window.confirm(`允许本次闲鱼同步修改当前商品的${labels[section]}吗？旧版本会保留在本机。`)) return
   const updated = await call('POST', `/products/${encodeURIComponent(productDraft.item_id)}/apply-source-update`, { sections: [section] })
   selectProduct(updated)
@@ -1014,7 +1016,7 @@ onBeforeUnmount(() => {
           <div class="product-list-scroll">
             <div v-for="product in filteredProducts" :key="product.item_id" :class="['product-row', { active: productDraft.item_id === product.item_id }]" @click="openProductKnowledge(product)">
               <span class="product-thumb image"><img v-if="product.thumbnail_url" :src="product.thumbnail_url" /><b v-else>券</b></span>
-              <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? '闲鱼来源有更新' : product.sync_status === 'summary_failed' ? 'AI归纳失败·已保留页面资料' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
+              <span><strong>{{ product.title || '未命名商品' }}</strong><small>¥{{ product.price || '—' }} · {{ product.store_lists?.reduce((sum, item) => sum + item.store_count, 0) || 0 }} 家门店</small><em>{{ product.item_status === 'offline' ? '已下架' : product.sync_status === 'source_updated' ? (product.source_update?.summary_error ? '来源待确认 · AI归纳待重试' : '闲鱼来源有更新') : product.sync_status === 'summary_failed' ? 'AI归纳待重试·页面资料已同步' : !product.coupon_type ? '卡券类型待补充' : '知识已就绪' }}</em></span>
               <span class="product-row-actions"><button class="ai-toggle" :class="{ off: !product.enabled }" :title="product.enabled ? '点击关闭当前商品AI客服' : '点击开启当前商品AI客服'" @click.stop="setProductAiEnabled(product)">{{ product.enabled ? 'AI开' : 'AI关' }}</button><button title="打开商品页面" @click.stop="confirmOpenProductPage(product)">↗</button><button class="danger-icon" title="删除本地商品" @click.stop="deleteProduct(product)">删</button></span>
             </div>
             <div v-if="!filteredProducts.length" class="empty-card">{{ productSearch ? '没有找到匹配标题或ID的商品。' : '登录闲鱼后点击“同步全部”或“同步选中”。' }}</div>
@@ -1029,15 +1031,23 @@ onBeforeUnmount(() => {
           <div class="product-tabs"><button :class="{ active: productTab === 'knowledge' }" @click="productTab = 'knowledge'">商品资料与知识</button><button :class="{ active: productTab === 'firstReply' }" @click="productTab = 'firstReply'">首次回复</button><button :class="{ active: productTab === 'stores' }" @click="productTab = 'stores'">适用门店 <b>{{ productDraft.store_lists.reduce((sum, item) => sum + item.store_count, 0) }}</b></button><button :class="{ active: productTab === 'images' }" @click="productTab = 'images'">关键词触发 <b>{{ keywordImageAssets.length }}</b></button></div>
 
           <article v-if="productDraft.sync_status === 'source_updated'" class="knowledge-card source-update-card">
-            <div class="knowledge-head"><div><span class="number">新</span><div><strong>闲鱼页面发现更新</strong><small>当前生效知识、门店和首次回复均未被覆盖；只有你确认的项目才会修改。</small></div></div><span class="authority">等待人工允许</span></div>
+            <div class="knowledge-head"><div><span class="number">新</span><div><strong>闲鱼页面发现更新</strong><small>当前SKU、知识、门店和首次回复不会被静默覆盖；只有你确认的项目才会修改。</small></div></div><span class="authority">等待人工允许</span></div>
+            <p v-if="productDraft.source_update?.summary_error" class="warning-text">商品卡片和SKU已抓取，AI归纳暂时失败：{{ productDraft.source_update.summary_error }}。可先更新SKU，稍后再重新归纳。</p>
+            <div v-if="productDraft.source_update?.sku_changes?.has_changes" class="sku-change-summary">
+              <strong>SKU变化：原 {{ productDraft.source_update.sku_changes.before_count }} 个 → 新 {{ productDraft.source_update.sku_changes.after_count }} 个</strong>
+              <span v-for="sku in productDraft.source_update.sku_changes.added" :key="`add-${sku.sku_key}`">新增：{{ sku.name }} · ¥{{ sku.sale_price || '待同步' }}</span>
+              <span v-for="sku in productDraft.source_update.sku_changes.removed" :key="`remove-${sku.sku_key}`">下架：{{ sku.name }}</span>
+              <span v-for="sku in productDraft.source_update.sku_changes.changed" :key="`change-${sku.sku_key}`">变更：{{ sku.name }}（{{ Object.keys(sku.fields).join('、') }}）</span>
+            </div>
             <details v-if="productDraft.source_update?.summary" class="source-update-preview">
               <summary>查看闲鱼页面待更新内容</summary>
               <pre>{{ productDraft.source_update.summary }}</pre>
             </details>
             <div class="button-row end">
-              <button :disabled="productDraft.source_update?.resolved_sections?.includes('knowledge')" @click="applySourceUpdate('knowledge')">允许更新商品知识</button>
-              <button :disabled="productDraft.source_update?.resolved_sections?.includes('stores')" @click="applySourceUpdate('stores')">允许更新适用门店</button>
-              <button :disabled="productDraft.source_update?.resolved_sections?.includes('first_reply')" class="primary" @click="applySourceUpdate('first_reply')">允许更新首次回复</button>
+              <button v-if="productDraft.source_update?.pending_sections?.includes('skus')" :disabled="productDraft.source_update?.resolved_sections?.includes('skus')" class="primary" @click="applySourceUpdate('skus')">允许更新SKU</button>
+              <button v-if="!productDraft.source_update?.pending_sections || productDraft.source_update.pending_sections.includes('knowledge')" :disabled="productDraft.source_update?.resolved_sections?.includes('knowledge')" @click="applySourceUpdate('knowledge')">允许更新商品知识</button>
+              <button v-if="!productDraft.source_update?.pending_sections || productDraft.source_update.pending_sections.includes('stores')" :disabled="productDraft.source_update?.resolved_sections?.includes('stores')" @click="applySourceUpdate('stores')">允许更新适用门店</button>
+              <button v-if="!productDraft.source_update?.pending_sections || productDraft.source_update.pending_sections.includes('first_reply')" :disabled="productDraft.source_update?.resolved_sections?.includes('first_reply')" @click="applySourceUpdate('first_reply')">允许更新首次回复</button>
             </div>
           </article>
 
