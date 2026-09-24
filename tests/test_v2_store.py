@@ -5611,7 +5611,10 @@ class V2StoreTests(unittest.TestCase):
         )
         result = self.store.resolve_deterministic("10001", "中秋节可以用吗")
         self.assertEqual("date_use", result["kind"])
-        self.assertIn("没有可用的商品规格", result["reply"])
+        self.assertEqual(
+            "中秋节不能使用哦。当前在售规格仅限工作日使用。",
+            result["reply"],
+        )
 
     def test_bare_number_without_matching_sale_price_becomes_consumption_plan(self):
         self.store.save_v2_product(

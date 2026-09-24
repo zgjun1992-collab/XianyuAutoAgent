@@ -3473,6 +3473,10 @@ class V2Store(AppStore):
         use_intent = bool(re.search(r"(?:可以|能|可)(?:使用|用)|能不能用|是否可用|用得了", text))
         target = self._query_date(text)
         holiday_name = next((name for name in ("中秋", "国庆", "春节", "元旦", "劳动节") if name in text), "")
+        holiday_label = {
+            "中秋": "中秋节", "国庆": "国庆节", "春节": "春节",
+            "元旦": "元旦", "劳动节": "劳动节",
+        }.get(holiday_name, holiday_name)
         if not use_intent or (not target and not holiday_name):
             return None
         # A concrete meal period is more specific than a date-only question.
@@ -3496,7 +3500,7 @@ class V2Store(AppStore):
             if re.search(r"(?:法定)?节假日[^。；\n]{0,12}(?:不可用|不能用|不适用)", knowledge):
                 holiday_unavailable = True
         if holiday_unavailable:
-            return {"reply": f"{holiday_name}在商品标注的不可用日期范围内，不能使用哦。",
+            return {"reply": f"{holiday_label}在商品标注的不可用日期范围内，不能使用哦。",
                     "source": "当前商品明确不可用节日", "decision": "allow", "kind": "date_use"}
         if target and self._date_is_explicitly_unavailable(knowledge, target):
             label = f"{target.month}月{target.day}日"
@@ -3546,7 +3550,17 @@ class V2Store(AppStore):
             if self._option_matches_time(item, day_type="holiday")
         ]
         if holiday_options and not compatible_holiday:
-            return {"reply": f"{holiday_name}没有可用的商品规格哦。",
+            allowed_labels = [
+                label for day_type, label in (
+                    ("weekday", "工作日"), ("weekend", "周末"),
+                )
+                if any(day_type in self._option_day_types(item) for item in holiday_options)
+            ]
+            scope = (
+                f"当前在售规格仅限{'、'.join(allowed_labels)}使用。"
+                if allowed_labels else "当前在售规格不支持节假日使用。"
+            )
+            return {"reply": f"{holiday_label}不能使用哦。{scope}",
                     "source": "当前商品SKU节日适用范围", "decision": "allow", "kind": "date_use"}
         if compatible_holiday:
             brand = self.extract_brand(product)
@@ -3555,11 +3569,11 @@ class V2Store(AppStore):
                 for option in compatible_holiday
             )
             return {"reply": (
-                        f"{holiday_name}期间可以使用，请选择以下节假日适用的在售规格：\n"
+                        f"{holiday_label}期间可以使用，请选择以下节假日适用的在售规格：\n"
                         f"{choices}\n请在使用当天购买、当天使用。"
                     ),
                     "source": "当前商品SKU节日适用范围", "decision": "allow", "kind": "date_use"}
-        return {"reply": f"{holiday_name}期间可以使用哦，请在使用当天购买、当天使用。",
+        return {"reply": f"{holiday_label}期间可以使用哦，请在使用当天购买、当天使用。",
                 "source": "当前商品节日适用范围", "decision": "allow", "kind": "date_use"}
 
     def day_availability_reply(self, product: Dict, message: str) -> Optional[Dict]:
