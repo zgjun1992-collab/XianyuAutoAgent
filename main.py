@@ -1022,7 +1022,8 @@ class XianyuLive:
             str(product.get("coupon_type") or "") == "purchase_order"
             and not bool(product.get("first_reply_enabled", True))
             and re.fullmatch(
-                r"(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)(?:呀|啊|哦|呢|吗)?[？?。！!]*",
+                r"(?:1|(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)"
+                r"(?:呀|啊|哦|呢|吗)?)[？?。！!]*",
                 re.sub(r"\s+", "", str(message or "")), re.I,
             )
         )
@@ -1058,7 +1059,8 @@ class XianyuLive:
         """Recognize a pure greeting for the manual-takeover exception."""
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or "")).lower()
         return bool(re.fullmatch(
-            r"(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)(?:呀|啊|哦|呢|吗)?",
+            r"(?:1|(?:你好|您好|在吗|有人吗|哈喽|嗨|hi|hello|hey|有人不)"
+            r"(?:呀|啊|哦|呢|吗)?)",
             compact, re.I,
         ))
 
@@ -1995,7 +1997,10 @@ class XianyuLive:
                 next_store_context.update(deterministic.get("store_context_update") or {})
                 self._store_contexts[scope_id] = next_store_context
             elif not deterministic or deterministic.get("kind") not in {
-                "stores", "media", "media_context",
+                "stores", "stores_sku_recommendation", "stores_clarify",
+                "media", "media_context", "stacking", "redemption_plan",
+                "consumption_plan", "sku_purchase", "sku_price",
+                "sku_availability", "voucher_value", "discount", "multi_intent",
             }:
                 self._store_contexts.pop(scope_id, None)
             if deterministic and deterministic.get("kind") == "offline":

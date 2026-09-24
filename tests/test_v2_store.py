@@ -880,6 +880,191 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("剩余100元", alternative["reply"])
         self.assertNotIn("300元代金券", alternative["reply"])
 
+    def test_platform_group_context_carries_through_stack_and_purchase_followups(self):
+        self.store.save_v2_product(
+            "platform-context", "双平台代金券",
+            "美团200（可叠加2张）：售价118元\n"
+            "抖音50x4（可叠加4张）：售价129元\n"
+            "抖音200（可叠加4张）：售价138元\n"
+            "抖音300（可叠加4张）：售价205元\n"
+            "抖音500（可叠加4张）：售价345元",
+        )
+        douyin_stores = self.store.import_store_text(
+            "【广东省】\n【广州】广州江南西店", "抖音门店", [],
+        )
+        meituan_stores = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳皇庭广场店", "美团门店", [],
+        )
+        for sku in self.store.get_v2_product("platform-context")["skus"]:
+            list_id = (
+                douyin_stores["id"]
+                if "抖音" in sku["sku_name"] else meituan_stores["id"]
+            )
+            self.store.set_sku_store_rule(
+                "platform-context", sku["sku_key"], sku["sku_name"],
+                "custom", [list_id],
+            )
+
+        initial = self.store.resolve_deterministic(
+            "platform-context", "广州江南西店可以吗",
+        )
+        context = {
+            "query": initial["store_query"],
+            "matches": initial["store_matches"],
+            "store_sku_matrix": initial["store_sku_matrix"],
+            "status": "available",
+        }
+        platform = self.store.resolve_deterministic(
+            "platform-context", "抖音款", store_context=context,
+        )
+        self.assertEqual("stores_sku_recommendation", platform["kind"])
+        self.assertEqual("抖音", platform["query_context_update"]["selected_platform"])
+        self.assertEqual(4, len(platform["query_context_update"]["selected_sku_keys"]))
+        context.update(platform["query_context_update"])
+        context.update(platform.get("store_context_update") or {})
+
+        limit = self.store.resolve_deterministic(
+            "platform-context", "有没有限制用多少张", store_context=context,
+        )
+        self.assertEqual("stacking", limit["kind"])
+        self.assertIn("抖音款", limit["reply"])
+        self.assertIn("最多使用4张", limit["reply"])
+        self.assertNotIn("最多使用2张", limit["reply"])
+
+        plan = self.store.resolve_deterministic(
+            "platform-context", "如果我消费400我就买2张200", store_context=context,
+        )
+        self.assertIn("抖音200", plan["reply"])
+        self.assertIn("共支付276元", plan["reply"])
+        self.assertNotIn("美团200", plan["reply"])
+        self.assertNotIn("236元", plan["reply"])
+
+    def test_synced_terse_voucher_sku_answers_price_and_denomination_stock(self):
+        platform_summary = json.dumps({
+            "title": "半秋山西餐厅60代100",
+            "description": "64代100可叠3张【工作日】，单次限用3张。",
+            "price": "50",
+            "sku": [
+                {
+                    "skuId": "weekday-100", "priceInCent": 6400, "quantity": 199,
+                    "propertyList": [{"actualValueText": "100工作日（可叠加3）"}],
+                },
+                {
+                    "skuId": "soldout-50", "priceInCent": 5000, "quantity": 492,
+                    "propertyList": [{"actualValueText": "50代金（售罄）"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "terse-voucher", "title": "半秋山100元代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "50",
+        })
+        product = self.store.get_v2_product("terse-voucher")
+        options = self.store.extract_product_options(product)
+        self.assertEqual(1, len(options))
+        self.assertEqual("100", options[0]["face_value"])
+        self.assertEqual("64", options[0]["sale_price"])
+        self.assertNotIn("50代金", "\n".join(option["name"] for option in options))
+
+        source_sku = next(
+            sku for sku in self.store.list_product_skus("terse-voucher", product)
+            if sku["sku_key"] == "source:weekday-100"
+        )
+        self.assertEqual("voucher", source_sku["option_type"])
+        self.assertEqual("100", source_sku["face_value"])
+
+        price_stock = self.store.resolve_deterministic(
+            "terse-voucher", "64的木有了吗",
+        )
+        self.assertEqual("sku_availability", price_stock["kind"])
+        self.assertIn("有的", price_stock["reply"])
+        self.assertIn("售价64元", price_stock["reply"])
+        self.assertIn("100元代金券", price_stock["reply"])
+
+        with patch.object(V2Store, "_current_day_type", return_value="weekday"):
+            denomination_stock = self.store.resolve_deterministic(
+                "terse-voucher", "100代金券没有了吗",
+            )
+        self.assertEqual("sku_availability", denomination_stock["kind"])
+        self.assertEqual("allow", denomination_stock["decision"])
+        self.assertIn("有的", denomination_stock["reply"])
+        self.assertIn("售价64元", denomination_stock["reply"])
+        self.assertNotIn("当前商品没有100元代金券", denomination_stock["reply"])
+
+    def test_synced_platform_skus_replace_stale_ai_rows_and_keep_store_bindings(self):
+        self.store.save_v2_product(
+            "sku-reconcile", "甬江烟火代金券",
+            "100元代金券：售价69元\n200元代金券：售价148元\n300元代金券：售价206元",
+        )
+        self.store.save_ai_summary("sku-reconcile", "旧AI规格", {
+            "products": [
+                {"name": "100元代金券", "option_type": "代金券", "face_value": "100",
+                 "sale_price": "69", "composition": "100元券1张", "max_stack": 2},
+                {"name": "200元代金券", "option_type": "代金券", "face_value": "200",
+                 "sale_price": "148", "composition": "200元券1张", "max_stack": 5},
+                {"name": "300元代金券", "option_type": "代金券", "face_value": "300",
+                 "sale_price": "206", "composition": "300元券1张", "max_stack": 1},
+            ],
+        })
+        default_list = self.store.import_store_text(
+            "【浙江省】\n【宁波】默认店", "默认门店", ["sku-reconcile"],
+        )
+        custom_lists = {
+            face: self.store.import_store_text(
+                f"【浙江省】\n【宁波】{face}专属店", f"{face}专属门店", [],
+            )
+            for face in ("100", "200", "300")
+        }
+        legacy = {
+            sku["face_value"]: sku
+            for sku in self.store.get_v2_product("sku-reconcile")["skus"]
+        }
+        for face, sku in legacy.items():
+            self.store.set_sku_store_rule(
+                "sku-reconcile", sku["sku_key"], sku["sku_name"],
+                "custom", [custom_lists[face]["id"]],
+            )
+
+        platform_summary = json.dumps({
+            "title": "甬江烟火代金券", "description": "餐饮代金券",
+            "sku": [
+                {"skuId": "m100", "priceInCent": 6990, "quantity": 171,
+                 "propertyList": [{"actualValueText": "美团100（可叠加2张）"}]},
+                {"skuId": "m100x2", "priceInCent": 13980, "quantity": 159,
+                 "propertyList": [{"actualValueText": "美团100x2"}]},
+                {"skuId": "m300", "priceInCent": 20900, "quantity": 148,
+                 "propertyList": [{"actualValueText": "美团300（仅限一张）"}]},
+                {"skuId": "d200", "priceInCent": 14800, "quantity": 174,
+                 "propertyList": [{"actualValueText": "抖音200（可叠加5张）"}]},
+                {"skuId": "notice", "priceInCent": 99900, "quantity": 50,
+                 "propertyList": [{"actualValueText": "拍前务必咨询门店！！！"}]},
+                {"skuId": "dessert", "priceInCent": 5800, "quantity": 20,
+                 "propertyList": [{"actualValueText": "单品龙眼雪花冰"}]},
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "sku-reconcile", "title": "甬江烟火代金券",
+            "platform_summary": platform_summary, "item_status": "onsale",
+        })
+
+        skus = self.store.get_v2_product("sku-reconcile")["skus"]
+        by_name = {sku["sku_name"]: sku for sku in skus}
+        self.assertEqual(6, len(skus))
+        self.assertNotIn("100元代金券", by_name)
+        self.assertEqual("69.9", by_name["美团100（可叠加2张）"]["sale_price"])
+        self.assertEqual("139.8", by_name["美团100x2"]["sale_price"])
+        self.assertEqual("inherit", by_name["美团100x2"]["mode"])
+        self.assertEqual([default_list["id"]], by_name["美团100x2"]["effective_list_ids"])
+        for name, face in (
+            ("美团100（可叠加2张）", "100"),
+            ("抖音200（可叠加5张）", "200"),
+            ("美团300（仅限一张）", "300"),
+        ):
+            self.assertEqual("custom", by_name[name]["mode"])
+            self.assertEqual(
+                [custom_lists[face]["id"]], by_name[name]["effective_list_ids"],
+            )
+
     def test_same_store_amount_followups_recommend_purchase_plan(self):
         self.store.save_v2_product(
             "10001", "多规格代金券",
@@ -3339,6 +3524,20 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("courtesy", thanks["kind"])
         self.assertIn("不客气", thanks["reply"])
 
+    def test_standalone_one_is_a_greeting_not_a_price_or_quantity(self):
+        for message in ("1", "１", "1。"):
+            with self.subTest(message=message):
+                profile = self.store.classify_buyer_intents(message)
+                self.assertTrue(profile["is_pure_social"])
+                self.assertEqual("greeting", profile["social_kind"])
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("greeting", result["kind"])
+                self.assertIn("您好", result["reply"])
+
+        quantity = self.store.classify_buyer_intents("1张多少钱")
+        self.assertFalse(quantity["is_pure_social"])
+        self.assertEqual("price", quantity["primary_intent"])
+
     def test_intent_profile_separates_action_entities_and_social_tone(self):
         cases = {
             "你好，什么价格": ("price", "catalog_price"),
@@ -5518,6 +5717,40 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("multi_intent", result["kind"])
         self.assertIn("100元代金券（售价64元）", result["reply"])
         self.assertNotIn("300元代金券", result["reply"])
+
+    def test_store_time_and_amount_price_excludes_unsupported_platform_skus(self):
+        self.store.save_v2_product(
+            "10001", "蚂蚁洞烤肉200/300代金券",
+            "美团200（可叠加2张）：售价118元，发200元券1张\n"
+            "抖音50x4：售价129元，发50元券4张\n"
+            "抖音200（可叠加4张）：售价138元，发200元券1张\n"
+            "抖音300（可叠加4张）：售价205元，发300元券1张",
+        )
+        meituan = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳皇庭广场店", "美团门店", [],
+        )
+        douyin = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳壹方城店", "抖音门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = meituan["id"] if "美团" in sku["sku_name"] else douyin["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        result = self.store.resolve_deterministic(
+            "10001", "今天晚上深圳壹方城蚂蚁洞可以用吗200块代金券多少钱",
+        )
+
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertEqual("available", result["store_status"])
+        self.assertEqual("深圳壹方城店", result["store_query"])
+        self.assertIn("抖音50x4", result["reply"])
+        self.assertIn("售价129元", result["reply"])
+        self.assertIn("抖音200", result["reply"])
+        self.assertIn("售价138元", result["reply"])
+        self.assertNotIn("美团200", result["reply"])
+        self.assertNotIn("售价118元", result["reply"])
 
     def test_store_and_paid_face_relation_rejects_unsupported_sku(self):
         self.store.save_v2_product(
