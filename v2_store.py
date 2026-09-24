@@ -4067,17 +4067,21 @@ class V2Store(AppStore):
         prefixes = []
         day = slots.get("day_type")
         meal = slots.get("meal_period")
+        meal_label = {
+            "breakfast": "早餐", "lunch": "中午", "dinner": "晚餐",
+            "afternoon_tea": "下午茶",
+        }.get(meal, "") if meal and not cls._meal_periods(name) else ""
         if slots.get("date_label"):
-            prefixes.append(f"{slots['date_label']}可用的")
+            prefixes.append(f"{slots['date_label']}{meal_label}可用的")
+            meal_label = ""
         elif day and not cls._day_types(name):
-            prefixes.append({
-                "weekday": "工作日可用的", "weekend": "周末可用的", "holiday": "节假日可用的",
-            }.get(day, ""))
-        if meal and not cls._meal_periods(name):
-            prefixes.append({
-                "breakfast": "早餐可用的", "lunch": "中午可用的", "dinner": "晚餐可用的",
-                "afternoon_tea": "下午茶可用的",
-            }.get(meal, ""))
+            day_label = {
+                "weekday": "工作日", "weekend": "周末", "holiday": "节假日",
+            }.get(day, "")
+            prefixes.append(f"{day_label}{meal_label}可用的" if day_label else "")
+            meal_label = ""
+        if meal_label:
+            prefixes.append(f"{meal_label}可用的")
         details = [f"售价{option['sale_price']}元"]
         if option.get("composition"):
             details.append(f"发{option['composition']}")
@@ -4089,16 +4093,26 @@ class V2Store(AppStore):
     ) -> Optional[Dict]:
         """Resolve amount, quantity, people, day and meal slots from real choices."""
         text = str(message or "").strip()
+        if available_options is None:
+            # get_v2_product() exposes the currently sellable marketplace SKUs
+            # after inventory/status filtering and any configured price override.
+            # Use that hydrated list for buyer replies.  Falling back directly
+            # to prose/AI extraction here made a freshly synced package SKU
+            # visible in the editor but invisible to Q&A when structured_json
+            # had not been regenerated yet.
+            hydrated_skus = [
+                sku for sku in (product.get("skus") or [])
+                if sku.get("sellable", True) and sku.get("sale_price")
+            ]
+            option_source = hydrated_skus or self.extract_sale_options(product)
+        else:
+            option_source = available_options
         source_options = [
             {
                 **option,
                 "name": str(option.get("name") or option.get("sku_name") or "").strip(),
             }
-            for option in (
-                available_options
-                if available_options is not None
-                else self.extract_sale_options(product)
-            )
+            for option in option_source
         ]
         price_intent = bool(re.search(
             r"多少钱|多钱|几多钱|什么价格|价格多少|价钱|售价|什么价|啥价|怎么卖|"
@@ -8842,6 +8856,9 @@ class V2Store(AppStore):
 
     @classmethod
     def sku_key_for_option(cls, option: Dict) -> str:
+        existing_key = str(option.get("sku_key") or "").strip()
+        if existing_key:
+            return existing_key
         source_id = str(option.get("sku_id") or option.get("id") or option.get("option_id") or "").strip()
         if source_id:
             return f"source:{source_id}"
