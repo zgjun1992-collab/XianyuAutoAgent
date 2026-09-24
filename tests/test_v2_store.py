@@ -6561,6 +6561,106 @@ class V2StoreTests(unittest.TestCase):
             result["query_context_update"]["selected_sku_key"],
         )
 
+    def test_named_synced_sku_price_is_remembered_for_people_followup(self):
+        platform_summary = json.dumps({
+            "title": "一绪和牛自助",
+            "price": "139",
+            "sku": [
+                {
+                    "skuId": "light-single", "priceInCent": 19800, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】轻享和牛单人"}],
+                },
+                {
+                    "skuId": "value-single", "priceInCent": 16990, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】超值单人"}],
+                },
+                {
+                    "skuId": "premium-single", "priceInCent": 21800, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】尊享刺身和牛单人"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "named-sku-context", "title": "一绪和牛自助",
+            "platform_summary": platform_summary, "image_urls": [], "price": "139",
+        })
+
+        first = self.store.resolve_deterministic("named-sku-context", "轻享多少钱")
+        self.assertEqual("price", first["kind"])
+        self.assertIn("轻享和牛单人", first["reply"])
+        self.assertIn("198元", first["reply"])
+        self.assertEqual(
+            "source:light-single",
+            first["query_context_update"]["selected_sku_key"],
+        )
+
+        followup = self.store.resolve_deterministic(
+            "named-sku-context", "两个人",
+            store_context=first["query_context_update"],
+        )
+        self.assertEqual("price", followup["kind"])
+        self.assertIn("2人需要购买2份【深圳】轻享和牛单人", followup["reply"])
+        self.assertIn("共396元", followup["reply"])
+        self.assertNotIn("超值单人", followup["reply"])
+
+    def test_unknown_numeric_price_question_clarifies_meaning_then_continues(self):
+        self.store.upsert_synced_product({
+            "item_id": "ambiguous-number", "title": "200元代金券",
+            "price": "161.5", "image_urls": [],
+            "platform_summary": json.dumps({
+                "title": "200元代金券", "description": "200元代金券，最多叠加3张",
+                "price": "161.5", "sku": [],
+            }, ensure_ascii=False),
+        })
+        first = self.store.resolve_deterministic("ambiguous-number", "278什么价格")
+        self.assertEqual("price_clarify", first["kind"])
+        self.assertEqual("allow", first["decision"])
+        self.assertIn("278元消费金额", first["reply"])
+        self.assertIn("278元代金券面额", first["reply"])
+        self.assertIn("商品编号", first["reply"])
+        self.assertEqual(
+            "amount_meaning",
+            first["query_context_update"]["price_filters"]["awaiting"],
+        )
+
+        # Once the SKU price is available, the clarification context can be
+        # completed without asking the buyer to repeat the number.
+        self.store.save_v2_product(
+            "ambiguous-number", "200元代金券",
+            "200元代金券：售价161.5元，最多叠加3张",
+        )
+
+        consumption = self.store.resolve_deterministic(
+            "ambiguous-number", "消费金额",
+            store_context=first["query_context_update"],
+        )
+        self.assertIn("200元代金券", consumption["reply"])
+        self.assertIn("剩余78元", consumption["reply"])
+
+        denomination = self.store.resolve_deterministic(
+            "ambiguous-number", "代金券面额",
+            store_context=first["query_context_update"],
+        )
+        self.assertIn("没有278元代金券", denomination["reply"])
+        self.assertIn("200元", denomination["reply"])
+
+    def test_generic_offer_questions_use_real_sku_and_restrictions(self):
+        self.store.save_v2_product(
+            "offer-overview", "NEED韩国料理100元代金券",
+            "100元代金券：售价66元，最多叠加5张\n"
+            "仅限堂食；不可使用包间；不与门店其他额外优惠同享。",
+        )
+        for message in ("什么优惠", "有优惠么", "结账是什么优惠"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("offer-overview", message)
+                self.assertEqual("offer_overview", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertIn("100元代金券", result["reply"])
+                self.assertIn("售价66元", result["reply"])
+                self.assertIn("可抵扣100元", result["reply"])
+                self.assertIn("最多使用5张", result["reply"])
+                self.assertIn("不与门店其他额外优惠同享", result["reply"])
+
     def test_amount_question_matrix_covers_prefix_suffix_and_chinese_forms(self):
         self.store.save_v2_product(
             "amount-matrix", "代金券",

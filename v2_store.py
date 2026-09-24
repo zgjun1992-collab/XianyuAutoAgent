@@ -4068,6 +4068,8 @@ class V2Store(AppStore):
             text,
         ))
         previous = dict((query_context or {}).get("price_filters") or {})
+        selected_sku_key = str((query_context or {}).get("selected_sku_key") or "").strip()
+        selected_sku_name = str((query_context or {}).get("selected_sku_name") or "").strip()
         previous_time = str(previous.get("updated_at") or "")
         if previous_time:
             try:
@@ -4092,6 +4094,14 @@ class V2Store(AppStore):
         _, package_tier_intent = self._requested_package_tier_options(
             condition_package_options, text,
         )
+        selected_sku_people_followup = bool(
+            (selected_sku_key or selected_sku_name)
+            and direct_slots.get("people_count")
+            and not any(direct_slots.get(key) for key in (
+                "day_type", "meal_period", "target_amount", "purchase_quantity",
+            ))
+            and len(normalize_text(text)) <= 12
+        )
         condition_people_counts = {
             int(count)
             for option in condition_package_options
@@ -4108,7 +4118,7 @@ class V2Store(AppStore):
                 direct_slots.get("people_count")
                 and (
                     direct_slots.get("day_type") or direct_slots.get("meal_period")
-                    or package_tier_intent
+                    or package_tier_intent or selected_sku_people_followup
                 )
             )
             or condition_only_package_query
@@ -4130,6 +4140,28 @@ class V2Store(AppStore):
             return None
         awaiting = str(previous.get("awaiting") or "")
         pending_filled = False
+        if awaiting == "amount_meaning" and previous.get("target_amount"):
+            if re.search(r"消费|预算|账单|结账|买单|抵扣|凑单|实付|应付", text):
+                direct_slots["target_amount"] = previous["target_amount"]
+                direct_slots["amount_kind"] = "consumption"
+                pending_filled = True
+            elif re.search(r"面额|代金券|优惠券|抵扣券|现金券|SKU|sku|规格", text):
+                direct_slots["target_amount"] = previous["target_amount"]
+                direct_slots["amount_kind"] = "option"
+                pending_filled = True
+            elif re.search(r"编号|序号|商品号|链接里的|图片里的", text):
+                return {
+                    "reply": (
+                        f"明白，{self._format_number(previous['target_amount'])}是编号，不是金额。"
+                        "请把该编号对应的商品名称或规格名称发我，我再按当前商品资料准确回答。"
+                    ),
+                    "source": "买家确认数字是商品或规格编号",
+                    "decision": "allow", "kind": "price_clarify",
+                    "query_context_update": {"price_filters": {
+                        **previous, "awaiting": "product_reference",
+                        "updated_at": datetime.now(CHINA_TZ).isoformat(timespec="seconds"),
+                    }},
+                }
         bare_value = re.fullmatch(
             r"\s*(?:我们|我这边|一共|总共|就)?\s*"
             r"([一二两三四五六七八九十单双俩仨\d]+)\s*"
@@ -4165,6 +4197,7 @@ class V2Store(AppStore):
         if not (
             price_intent or availability_intent or implicit_condition_price or pending_filled
             or bool(direct_slots.get("purchase_quantity"))
+            or selected_sku_people_followup
             or ((referential or context_followup or tier_followup) and previous)
         ) or not (has_direct_slot or previous):
             return None
@@ -4202,6 +4235,20 @@ class V2Store(AppStore):
         if not any(slots.get(key) not in (None, "") for key in slot_keys):
             return None
         options = [option for option in source_options if option.get("sale_price")]
+        if selected_sku_people_followup:
+            selected_options = [
+                option for option in options
+                if (
+                    selected_sku_key
+                    and self.sku_key_for_option(option) == selected_sku_key
+                ) or (
+                    selected_sku_name
+                    and normalize_text(option.get("name") or "").lower()
+                    == normalize_text(selected_sku_name).lower()
+                )
+            ]
+            if selected_options:
+                options = selected_options
         # A short quantity follow-up inherits the SKU scope from the latest
         # store answer. This preserves “该店只支持200券” for “能拍2张吗”.
         if direct_slots.get("purchase_quantity"):
@@ -4316,6 +4363,47 @@ class V2Store(AppStore):
             if option.get("option_type") == "voucher" and option.get("face_value")
         ]
         package_matches = [option for option in matched if option.get("option_type") == "package"]
+
+        # A bare unknown number followed by a generic price phrase is ambiguous:
+        # it may be a consumption amount, a coupon face value, or an external
+        # product/SKU number.  Do not invent an unavailable denomination before
+        # the buyer tells us what the number means.
+        ambiguous_numeric_price = bool(
+            target_amount
+            and slots.get("amount_kind") == "option"
+            and not options
+            and re.fullmatch(
+                r"\s*\d+(?:\.\d+)?\s*(?:元|块)?\s*(?:的)?\s*"
+                r"(?:多少钱|多钱|多少|什么价|什么价格|价格多少|价格|价钱|怎么卖)"
+                r"\s*[？?。！!]*\s*",
+                text,
+            )
+        )
+        target = self._format_number(target_amount or "")
+        known_numeric_option = bool(target) and any(
+            target in {
+                self._format_number(option.get("face_value") or ""),
+                self._format_number(option.get("sale_price") or ""),
+                self._option_total_value(option),
+            }
+            or bool(re.search(
+                rf"(?<![\d.]){re.escape(target)}(?:\.0+)?\s*(?:元|人|位|份|套)",
+                str(option.get("name") or ""),
+            ))
+            for option in options
+        )
+        if ambiguous_numeric_price and not known_numeric_option:
+            context_update = make_context("amount_meaning")
+            return {
+                "reply": (
+                    f"请问您说的“{target}”是指{target}元消费金额、"
+                    f"{target}元代金券面额、商品编号，还是其他含义？"
+                    "请补充一下，我再按当前商品准确回答。"
+                ),
+                "source": "裸数字未匹配当前商品的真实SKU或面额",
+                "decision": "allow", "kind": "price_clarify",
+                "query_context_update": context_update,
+            }
 
         # Prefer an exact people-count package. If none exists, combine compatible
         # one-/multi-person packages from the same product family. This covers
@@ -5437,6 +5525,95 @@ class V2Store(AppStore):
                 prefix += "不是，"
         return prefix + "；".join(lines) + "。" if lines else ""
 
+    def offer_overview_reply(self, product: Dict, message: str) -> str:
+        """Describe the current listing's real benefit for generic offer questions."""
+        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
+        compact = re.sub(r"^(?:你好|您好|请问|老板|亲)+", "", compact)
+        direct_questions = {
+            "什么优惠", "啥优惠", "有啥优惠", "有什么优惠", "有优惠吗", "有优惠么",
+            "有优惠嘛", "有没有优惠", "优惠是什么", "优惠有哪些", "怎么优惠",
+            "结账是什么优惠", "结账有优惠吗", "结账有优惠么", "结账有什么优惠",
+            "买单是什么优惠", "买单有优惠吗", "买单有优惠么", "买单有什么优惠",
+        }
+        if compact not in direct_questions and not re.fullmatch(
+            r"(?:结账|买单)(?:时)?(?:是|有|有没有|有什么|享受什么)?优惠(?:吗|么|嘛)?",
+            compact,
+        ):
+            return ""
+
+        candidates = [
+            {
+                **sku,
+                "name": str(sku.get("name") or sku.get("sku_name") or "").strip(),
+            }
+            for sku in (product.get("skus") or [])
+            if sku.get("sellable", True) and sku.get("sale_price")
+        ]
+        if not candidates:
+            candidates = [
+                option for option in self.extract_product_options(product)
+                if option.get("sale_price")
+            ]
+        voucher_candidates = [
+            option for option in candidates
+            if option.get("option_type") == "voucher" or option.get("face_value")
+        ]
+        if voucher_candidates:
+            candidates = voucher_candidates
+        unique = []
+        seen = set()
+        for option in candidates:
+            key = str(option.get("sku_key") or "") or (
+                normalize_text(option.get("name") or "").lower(),
+                self._format_number(option.get("sale_price") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(option)
+
+        lines = []
+        for option in unique:
+            name = str(option.get("name") or "当前规格").strip()
+            price = self._format_number(option.get("sale_price") or "")
+            if option.get("option_type") == "voucher" or option.get("face_value"):
+                value = self._option_total_value(option)
+                line = f"{name}售价{price}元"
+                if value:
+                    line += f"，可抵扣{value}元"
+            else:
+                line = f"{name}售价{price}元"
+            try:
+                maximum = int(Decimal(str(option.get("max_stack") or "0")))
+            except (InvalidOperation, ValueError):
+                maximum = 0
+            if maximum > 0:
+                line += f"，每次最多使用{maximum}张"
+            lines.append(line + "。")
+
+        if not lines:
+            title = str(product.get("title") or "当前商品").strip()
+            price = self._format_number(product.get("price") or "")
+            if not price:
+                return "当前商品资料暂未明确具体优惠，请告诉我想咨询的规格或消费金额。"
+            lines.append(f"当前商品为{title}，页面售价{price}元。")
+
+        knowledge = self._product_rule_knowledge(product)
+        restriction_clauses = []
+        for pattern in (
+            r"不与门店其他额外优惠同享",
+            r"团购用户不可同时享受商家其他优惠",
+            r"(?:不可|不能|不支持|不得)与其他(?:券|优惠券|优惠)"
+            r"(?:同时使用|一起使用|叠加|混用|同享)?",
+        ):
+            match = re.search(pattern, knowledge)
+            if match:
+                restriction_clauses.append(match.group(0))
+        restrictions = ""
+        if restriction_clauses:
+            restrictions = "\n使用限制：" + "；".join(dict.fromkeys(restriction_clauses)) + "。"
+        return "当前商品优惠如下：\n" + "\n".join(lines) + restrictions
+
     def purchase_entry_reply(self, product: Dict, message: str) -> str:
         """Guide purchase from the current listing using only sellable SKUs."""
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
@@ -5786,10 +5963,7 @@ class V2Store(AppStore):
             if amount and amount >= 20:
                 return self.price_reply(product, f"{amount}元代金券多少钱")
 
-        options = [
-            option for option in self.extract_product_options(product)
-            if option.get("sale_price")
-        ]
+        options = self._named_price_options(product)
         subject_key = normalize_text(subject).lower()
         matched = []
         for option in options:
@@ -5823,6 +5997,60 @@ class V2Store(AppStore):
                 + "\n".join(self.format_product_option(option, brand) for option in options)
             )
         return f"当前商品没有“{subject}”这一规格。"
+
+    def _named_price_options(self, product: Dict) -> List[Dict]:
+        """Return priced named options, preferring freshly synced marketplace SKUs."""
+        candidates = [
+            {
+                **sku,
+                "name": str(sku.get("name") or sku.get("sku_name") or "").strip(),
+            }
+            for sku in (product.get("skus") or [])
+            if sku.get("sellable", True) and sku.get("sale_price")
+        ]
+        candidates.extend(
+            option for option in self.extract_product_options(product)
+            if option.get("sale_price")
+        )
+        unique = []
+        seen = set()
+        for option in candidates:
+            key = str(option.get("sku_key") or "") or (
+                normalize_text(option.get("name") or "").lower(),
+                self._format_number(option.get("sale_price") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(option)
+        return unique
+
+    def _selected_named_price_option(self, product: Dict, message: str) -> Optional[Dict]:
+        """Identify the single real SKU selected by a named price question."""
+        query, _ = split_social_business_text(message)
+        match = re.fullmatch(
+            r"(?:请问)?(.+?)\s*(?:多少钱|多钱|的多少|什么价格|价格多少|卖多少|怎么卖|几块钱|几元)[？?]?",
+            query,
+        )
+        if not match:
+            return None
+        subject = match.group(1).strip(" ，,。.!！?？~～")
+        subject = re.sub(r"(?:是|为|卖|要)$", "", subject).strip()
+        if not subject or re.fullmatch(
+            r"(?:\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*(?:元|块)?\s*(?:的)?\s*"
+            r"(?:代金券|优惠券|券)?",
+            subject,
+        ):
+            return None
+        subject_key = normalize_text(subject).lower()
+        matched = [
+            option for option in self._named_price_options(product)
+            if subject_key and (
+                subject_key in normalize_text(option.get("name") or "").lower()
+                or normalize_text(option.get("name") or "").lower() in subject_key
+            )
+        ]
+        return matched[0] if len(matched) == 1 else None
 
     def coupon_catalog_reply(self, product: Dict, message: str = "") -> str:
         """List only real coupon SKUs; package products must not invent coupons."""
@@ -13424,6 +13652,15 @@ class V2Store(AppStore):
                 "kind": "discount",
             }
 
+        offer_overview = self.offer_overview_reply(product, message)
+        if offer_overview:
+            return {
+                "reply": offer_overview,
+                "source": "当前商品真实SKU优惠与使用限制",
+                "decision": "allow",
+                "kind": "offer_overview",
+            }
+
         combination = self.benefit_combination_reply(product, message)
         if combination:
             return {
@@ -13514,11 +13751,23 @@ class V2Store(AppStore):
 
         named_sku_price = self.named_sku_price_reply(product, message)
         if named_sku_price:
+            selected_named_option = self._selected_named_price_option(product, message)
+            context_update = {}
+            if selected_named_option:
+                context_update = {
+                    "selected_sku_key": self.sku_key_for_option(selected_named_option),
+                    "selected_sku_name": str(
+                        selected_named_option.get("name")
+                        or selected_named_option.get("sku_name")
+                        or "商品规格"
+                    ).strip(),
+                }
             return {
                 "reply": named_sku_price,
                 "source": "当前商品真实SKU价格",
                 "decision": "review" if "需要人工核实" in named_sku_price else "allow",
                 "kind": "price",
+                **({"query_context_update": context_update} if context_update else {}),
             }
 
         price_terms = (
