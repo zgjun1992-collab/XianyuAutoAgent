@@ -1015,6 +1015,80 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("售价64元", denomination_stock["reply"])
         self.assertNotIn("当前商品没有100元代金券", denomination_stock["reply"])
 
+    def test_sale_price_identity_query_uses_real_synced_sku_name(self):
+        platform_summary = json.dumps({
+            "title": "一绪寿喜烧深圳+一绪に和牛寿喜烧大闸蟹放题自助",
+            "sku": [
+                {
+                    "skuId": "light", "priceInCent": 19800, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】轻享和牛单人"}],
+                },
+                {
+                    "skuId": "value", "priceInCent": 16990, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】超值单人"}],
+                },
+                {
+                    "skuId": "premium", "priceInCent": 21800, "quantity": 20,
+                    "propertyList": [{"actualValueText": "【深圳】尊享刺身和牛单人"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "sale-price-name",
+            "title": "一绪寿喜烧深圳+一绪に和牛寿喜烧大闸蟹放题自助",
+            "platform_summary": platform_summary, "image_urls": [], "price": "169.9",
+        })
+
+        for message in ("169.9 的是哪个券", "售价169.9的是哪款", "哪个规格是169.9元"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("sale-price-name", message)
+                self.assertEqual("sku_price_lookup", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertEqual(
+                    "售价169.9元的是一绪【深圳】超值单人。", result["reply"],
+                )
+                self.assertEqual(
+                    "【深圳】超值单人",
+                    result["query_context_update"]["selected_sku_name"],
+                )
+                self.assertNotIn("没有169.9元代金券", result["reply"])
+
+        for message in ("169的是哪个券", "售价169是哪款", "169"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("sale-price-name", message)
+                self.assertEqual("sku_price_lookup", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertEqual(
+                    "您询问的是一绪【深圳】超值单人，售价169.9元吗？",
+                    result["reply"],
+                )
+
+        missing = self.store.resolve_deterministic(
+            "sale-price-name", "177的是哪个规格",
+        )
+        self.assertEqual("sku_price_lookup", missing["kind"])
+        self.assertEqual("deny", missing["decision"])
+        self.assertEqual("当前商品没有售价177元的规格。", missing["reply"])
+
+        stock = self.store.resolve_deterministic("sale-price-name", "169.9还有吗")
+        self.assertEqual("sku_availability", stock["kind"])
+        self.assertIn("一绪【深圳】超值单人", stock["reply"])
+        self.assertIn("售价169.9元", stock["reply"])
+
+        approximate_stock = self.store.resolve_deterministic(
+            "sale-price-name", "169还有吗",
+        )
+        self.assertEqual("sku_availability", approximate_stock["kind"])
+        self.assertEqual(
+            "您想问的是一绪【深圳】超值单人么？现在还有，售价169.9元。",
+            approximate_stock["reply"],
+        )
+
+        amount_plan = self.store.resolve_deterministic(
+            "sale-price-name", "消费169.9元怎么买",
+        )
+        self.assertNotEqual("sku_price_lookup", amount_plan["kind"])
+
     def test_synced_platform_skus_replace_stale_ai_rows_and_keep_store_bindings(self):
         self.store.save_v2_product(
             "sku-reconcile", "甬江烟火代金券",
@@ -5633,8 +5707,9 @@ class V2StoreTests(unittest.TestCase):
             "300元代金券：售价208.8元，发300元券1张。",
         )
         result = self.store.resolve_deterministic("10001", "208")
-        self.assertEqual("sku_price", result["kind"])
-        self.assertIn("300元代金券售价208.8元", result["reply"])
+        self.assertEqual("sku_price_lookup", result["kind"])
+        self.assertIn("300元代金券", result["reply"])
+        self.assertIn("售价208.8元吗", result["reply"])
 
     def test_bare_number_without_sale_price_match_uses_non_overage_plan(self):
         self.store.save_v2_product(
