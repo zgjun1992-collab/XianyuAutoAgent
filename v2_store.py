@@ -5899,8 +5899,120 @@ class V2Store(AppStore):
     def sku_price_availability_reply(
         self, item_id: str, product: Dict, message: str,
     ) -> Optional[Dict]:
-        """Resolve colloquial stock questions that identify an SKU by sale price."""
-        compact = re.sub(r"[\s，,。.!！?？~～]+", "", str(message or ""))
+        """Resolve SKU identity/stock questions that identify it by sale price."""
+        compact = re.sub(r"[\s，,。!！?？~～]+", "", str(message or ""))
+        compact = re.sub(r"(?<!\d)\.|\.(?!\d)", "", compact)
+        sku_catalog = self.list_product_skus(item_id, product)
+        product_brand = str(self.extract_brand(product) or "").strip()
+
+        def buyer_sku_name(sku: Dict) -> str:
+            name = str(sku.get("sku_name") or "当前规格").strip()
+            if (
+                product_brand and product_brand not in name
+                and name.startswith(("【", "["))
+            ):
+                return f"{product_brand}{name}"
+            return name
+
+        def sale_price_matches(raw_price: str) -> tuple[str, List[Dict], bool]:
+            """Match exact prices first, then an omitted decimal fraction."""
+            normalized = self._format_number(raw_price)
+            exact = [
+                sku for sku in sku_catalog
+                if self._format_number(sku.get("sale_price") or "") == normalized
+            ]
+            if exact or "." in str(raw_price):
+                return normalized, exact, False
+            try:
+                whole = Decimal(normalized)
+            except InvalidOperation:
+                return normalized, [], False
+            approximate = []
+            for sku in sku_catalog:
+                try:
+                    candidate = Decimal(str(sku.get("sale_price") or ""))
+                except InvalidOperation:
+                    continue
+                if whole < candidate < whole + 1:
+                    approximate.append(sku)
+            return normalized, approximate, bool(approximate)
+
+        # A bare number in "169.9的是哪个券" is the marketplace sale price,
+        # not a voucher denomination.  Resolve it against the authoritative
+        # source-SKU catalog before denomination/consumption planning gets a
+        # chance to reinterpret the amount.
+        identity_match = None
+        bare_price_query = False
+        for pattern in (
+            r"(?:售价|卖价|价格)?(?P<price>\d+(?:\.\d+)?)"
+            r"(?:元|块钱|块)?(?:的)?(?:是)?"
+            r"(?:哪个|哪一个|哪款|什么)(?:券|代金券|优惠券|规格|套餐|商品|选项)?",
+            r"(?:哪个|哪一个|哪款|什么)(?:券|代金券|优惠券|规格|套餐|商品|选项)?"
+            r"(?:是|售价(?:是|为)?|卖价(?:是|为)?|价格(?:是|为)?)?"
+            r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?",
+        ):
+            identity_match = re.fullmatch(pattern, compact)
+            if identity_match:
+                break
+        if not identity_match:
+            identity_match = re.fullmatch(r"(?P<price>\d+)", compact)
+            bare_price_query = bool(identity_match)
+        if identity_match:
+            price, matched, approximate = sale_price_matches(identity_match.group("price"))
+            available = [sku for sku in matched if sku.get("sellable", True)]
+            if not matched:
+                if bare_price_query:
+                    return None
+                return {
+                    "reply": f"当前商品没有售价{price}元的规格。",
+                    "source": "当前商品源SKU售价与规格名称",
+                    "decision": "deny", "kind": "sku_price_lookup",
+                }
+            if not available:
+                names = "、".join(
+                    str(sku.get("sku_name") or f"{price}元规格") for sku in matched
+                )
+                return {
+                    "reply": f"售价{price}元的是{names}，但该规格已经售罄。",
+                    "source": "当前商品源SKU售价、规格名称与在售状态",
+                    "decision": "deny", "kind": "sku_price_lookup",
+                }
+
+            raw_names = [
+                str(sku.get("sku_name") or "当前规格").strip() for sku in available
+            ]
+            names = [buyer_sku_name(sku) for sku in available]
+            actual_prices = [
+                self._format_number(sku.get("sale_price") or "") for sku in available
+            ]
+            if (approximate or bare_price_query) and len(names) == 1:
+                reply = f"您询问的是{names[0]}，售价{actual_prices[0]}元吗？"
+            elif approximate or bare_price_query:
+                choices = "、".join(
+                    f"{name}（售价{actual_price}元）"
+                    for name, actual_price in zip(names, actual_prices)
+                )
+                reply = f"您询问的是以下哪个规格：{choices}？"
+            else:
+                reply = (
+                    f"售价{price}元的是{names[0]}。" if len(names) == 1 else
+                    f"售价{price}元的在售规格有：{'、'.join(names)}。"
+                )
+            selected_keys = [
+                str(sku.get("sku_key") or self.sku_key_for_option(sku))
+                for sku in available
+            ]
+            return {
+                "reply": reply,
+                "source": "当前商品源SKU售价、规格名称与在售状态",
+                "decision": "allow", "kind": "sku_price_lookup",
+                "query_context_update": {
+                    "selected_sku_key": selected_keys[0],
+                    "selected_sku_keys": selected_keys,
+                    "selected_sku_name": raw_names[0],
+                },
+            }
+
         match = re.fullmatch(
             r"(?:售价|卖|价格)?(?P<price>\d+(?:\.\d+)?)\s*(?:元|块|块钱)?"
             r"(?:的|那个|那款|这个|这款|这个规格|规格)?"
@@ -5912,11 +6024,7 @@ class V2Store(AppStore):
         )
         if not match:
             return None
-        price = self._format_number(match.group("price"))
-        matched = [
-            sku for sku in self.list_product_skus(item_id, product)
-            if self._format_number(sku.get("sale_price") or "") == price
-        ]
+        price, matched, approximate = sale_price_matches(match.group("price"))
         if not matched:
             return None
         available = [sku for sku in matched if sku.get("sellable", True)]
@@ -5930,11 +6038,28 @@ class V2Store(AppStore):
                 "decision": "deny", "kind": "sku_availability",
             }
 
+        if approximate and len(available) == 1:
+            sku = available[0]
+            name = buyer_sku_name(sku)
+            actual_price = self._format_number(sku.get("sale_price") or price)
+            return {
+                "reply": f"您想问的是{name}么？现在还有，售价{actual_price}元。",
+                "source": "当前商品源SKU售价、规格名称与在售状态",
+                "decision": "allow", "kind": "sku_availability",
+                "query_context_update": {
+                    "selected_sku_key": str(
+                        sku.get("sku_key") or self.sku_key_for_option(sku)
+                    ),
+                    "selected_sku_name": str(sku.get("sku_name") or "").strip(),
+                },
+            }
+
         details = []
         for sku in available:
-            name = str(sku.get("sku_name") or "当前规格").strip()
+            name = buyer_sku_name(sku)
             face = self._format_number(sku.get("face_value") or "")
-            line = f"{name}当前有货，售价{price}元"
+            actual_price = self._format_number(sku.get("sale_price") or price)
+            line = f"{name}当前有货，售价{actual_price}元"
             if face and (sku.get("option_type") or "voucher") == "voucher":
                 option = {**sku, "name": name}
                 line += f"，购买后发{self._purchase_contents_label(option)}"
