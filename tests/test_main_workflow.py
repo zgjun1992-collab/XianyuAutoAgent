@@ -297,6 +297,19 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         payload = {"order": {"actualPaidAmount": "67.90"}}
         self.assertEqual("67.90", XianyuLive.extract_actual_paid_amount(payload))
 
+    def test_delivered_coupon_expiry_uses_image_filename_not_url_date(self):
+        history = [{
+            "role": "assistant",
+            "content": (
+                "卡号：订单-100元代金券-2026 09 28.png"
+                "密码：https://example.invalid/2026/08/29/code.png\n"
+                "卡券有效期如图片中所示。"
+            ),
+        }]
+        self.assertEqual(
+            "2026-09-28", XianyuLive.extract_coupon_valid_until(history),
+        )
+
     async def test_order_event_preserves_actual_paid_amount_for_next_buyer_message(self):
         live = self.make_live()
         event = {

@@ -5981,6 +5981,10 @@ class V2Store(AppStore):
         """Resolve SKU identity/stock questions that identify it by sale price."""
         compact = re.sub(r"[\s，,。!！?？~～]+", "", str(message or ""))
         compact = re.sub(r"(?<!\d)\.|\.(?!\d)", "", compact)
+        compact = re.sub(
+            r"(?P<whole>\d+)(?:元|块)(?P<fraction>\d{1,2})(?=\D|$)",
+            r"\g<whole>.\g<fraction>", compact,
+        )
         sku_catalog = self.list_product_skus(item_id, product)
         product_brand = str(self.extract_brand(product) or "").strip()
 
@@ -6022,15 +6026,29 @@ class V2Store(AppStore):
         # chance to reinterpret the amount.
         identity_match = None
         bare_price_query = False
+        choice_word = (
+            r"(?:哪一个|那一个|哪一款|那一款|哪一种|那一种|哪一份|那一份|"
+            r"哪一档|那一档|哪个|那个|哪款|那款|哪种|那种|哪份|那份|"
+            r"哪档|那档|第几个|什么|啥)"
+        )
+        sku_word = r"(?:券|代金券|优惠券|规格|套餐|商品|选项|款式|档位|价位|SKU)?"
+        question_tail = r"(?:吗|么|嘛|呀|啊|呢|哦|哈|哇)?"
+        price_token = r"(?:￥|¥)?(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?"
         for pattern in (
-            r"(?:售价|卖价|价格)?(?P<price>\d+(?:\.\d+)?)"
-            r"(?:元|块钱|块)?(?:的)?(?:是)?"
-            r"(?:哪个|哪一个|哪款|什么)(?:券|代金券|优惠券|规格|套餐|商品|选项)?",
-            r"(?:哪个|哪一个|哪款|什么)(?:券|代金券|优惠券|规格|套餐|商品|选项)?"
-            r"(?:是|售价(?:是|为)?|卖价(?:是|为)?|价格(?:是|为)?)?"
-            r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?",
+            rf"(?:售价|卖价|价格|价钱)?{price_token}(?:的)?"
+            rf"(?:对应(?:的)?(?:是)?|是|为|卖(?:的)?(?:是)?|属于)?"
+            rf"{choice_word}{sku_word}{question_tail}",
+            rf"{choice_word}{sku_word}(?:的)?"
+            rf"(?:对应(?:的)?(?:是|为)?|是(?:卖)?|为|售价(?:是|为)?|"
+            rf"卖价(?:是|为)?|卖(?:的)?(?:是|为)?|价格(?:是|为)?)?"
+            rf"{price_token}(?:的)?{question_tail}",
+            rf"(?:售价|卖价|价格|价钱)?{price_token}(?:的)?"
+            rf"(?:那个|那款|这个|这款)(?:是|叫)?(?:什么|啥){sku_word}{question_tail}",
+            rf"(?:售价|卖价|价格|价钱)?{price_token}(?:的)?"
+            rf"(?:券|代金券|优惠券|规格|套餐|商品|选项|款式|档位|价位)"
+            rf"(?:对应(?:的)?(?:是)?|是|为)?{choice_word}{sku_word}{question_tail}",
         ):
-            identity_match = re.fullmatch(pattern, compact)
+            identity_match = re.fullmatch(pattern, compact, re.I)
             if identity_match:
                 break
         if not identity_match:
@@ -6093,13 +6111,22 @@ class V2Store(AppStore):
             }
 
         match = re.fullmatch(
-            r"(?:售价|卖|价格)?(?P<price>\d+(?:\.\d+)?)\s*(?:元|块|块钱)?"
+            r"(?:售价|卖价|卖|价格|价钱)?(?:￥|¥)?"
+            r"(?P<price>\d+(?:\.\d+)?)\s*(?:元|块钱|块)?"
             r"(?:的|那个|那款|这个|这款|这个规格|规格)?"
-            r"(?:还有(?:货)?(?:了)?(?:吗|么|嘛)?|有(?:货)?(?:吗|么|嘛)|"
-            r"木有(?:了)?(?:吗|么|嘛)?|没(?:有)?(?:了)?(?:吗|么|嘛)?|"
-            r"是不是(?:没|没有)(?:了)?|卖完(?:了)?(?:吗|么|嘛)?|"
-            r"售罄(?:了)?(?:吗|么|嘛)?)",
+            r"(?:还有(?:货)?(?:没有|没|不|了)?(?:吗|么|嘛|呀|啊|呢)?|"
+            r"还在(?:售|卖)?(?:吗|么|嘛|呀|啊|呢)?|还卖(?:吗|么|嘛|呀|啊|呢)?|"
+            r"有(?:货)?(?:不|没|吗|么|嘛|呀|啊|呢)?|有没有(?:货)?|"
+            r"木有(?:货)?(?:了)?(?:吗|么|嘛|呀|啊|呢)?|"
+            r"没(?:货|有)?(?:了)?(?:吗|么|嘛|呀|啊|呢)?|"
+            r"(?:能|可以)(?:不能|不可以)?(?:拍|买|下单)(?:吗|么|嘛|呀|啊|呢)?|"
+            r"能不能(?:拍|买|下单)|可不可以(?:拍|买|下单)|"
+            r"是不是(?:没|没有|下架|卖完|售罄)(?:了)?|"
+            r"下架(?:了)?(?:吗|么|嘛|没|没有)?|"
+            r"卖完(?:了)?(?:吗|么|嘛|没|没有)?|"
+            r"售罄(?:了)?(?:吗|么|嘛|没|没有)?)",
             compact,
+            re.I,
         )
         if not match:
             return None
@@ -13251,6 +13278,15 @@ class V2Store(AppStore):
             selected = [part for part in parts if any(word in part for word in keywords)]
             return "\n\n".join(part.rstrip("。；; ") + "。" for part in selected) or fallback
 
+        def delivered_validity_date():
+            raw_value = str((order_context or {}).get("coupon_valid_until") or "").strip()
+            if not raw_value:
+                return None
+            try:
+                return datetime.strptime(raw_value, "%Y-%m-%d").date()
+            except ValueError:
+                return None
+
         media_marker = bool(re.search(MEDIA_MARKER_PATTERN, message))
         if media_marker:
             text_only = strip_media_markers(message)
@@ -14277,6 +14313,53 @@ class V2Store(AppStore):
                 "decision": "deny",
                 "kind": "same_day_use",
             }
+        short_delay_validity_question = bool(
+            re.search(r"等会|等下|待会|一会儿?|过一会|稍后|晚点|晚些时候|今天晚上", message)
+            and re.search(r"结账|买单|使用|核销|用", message)
+            and re.search(r"过期|失效|有效|还能用|可以用|能用|行不行|行吗", message)
+        )
+        if short_delay_validity_question:
+            valid_until = delivered_validity_date()
+            if valid_until:
+                today = datetime.now(CHINA_TZ).date()
+                date_label = f"{valid_until.year}年{valid_until.month}月{valid_until.day}日"
+                if valid_until < today:
+                    reply = (
+                        f"根据已发券记录，这张券标注的有效期已到{date_label}。"
+                        "请先不要继续核销，并核对券页面显示的有效期。"
+                    )
+                elif valid_until == today:
+                    reply = "不会，等会结账仍可以使用；这张券今天到期，请在今天结束前完成核销。"
+                else:
+                    reply = (
+                        f"不会。您刚收到的券有效期至{date_label}，等会结账仍在有效期内，"
+                        "请在到期日前完成核销。"
+                    )
+                return {
+                    "reply": reply,
+                    "source": "当前会话已发券记录中的有效期",
+                    "decision": "allow",
+                    "kind": "coupon_validity",
+                }
+
+            effective_policy = policy_text()
+            same_day_required = bool(re.search(
+                r"当天[^。；\n]{0,10}(?:购买|使用)|(?:购买|使用)[^。；\n]{0,10}当天",
+                effective_policy,
+            ))
+            if same_day_required:
+                reply = "可以，等会结账仍属于当天使用；请在今天完成核销，不要留到明天。"
+            else:
+                reply = (
+                    "当前商品资料没有写明具体失效时间。请查看已收到券页面显示的有效期；"
+                    "只要结账时仍在券面有效期内即可核销。"
+                )
+            return {
+                "reply": reply,
+                "source": "当前商品有效期规则",
+                "decision": "allow",
+                "kind": "coupon_validity",
+            }
         same_day_confirmation = bool(re.search(
             r"(?:现在|今天).{0,10}(?:买|购买|拍|下单).{0,10}(?:就|马上|当天).{0,5}(?:用|使用)|"
             r"(?:买|购买|拍|下单)(?:了|后)?(?:是不是|是否|就)?(?:要|得|需要|必须)?"
@@ -14394,8 +14477,19 @@ class V2Store(AppStore):
             }
 
         if any(word in message for word in (
-            "有效期", "什么时候过期", "改天能用", "以后能用", "隔天能用", "长期有效",
+            "有效期", "什么时候过期", "什么时候失效", "多久过期", "多久失效",
+            "哪天过期", "哪天失效", "到哪天", "到几号", "会过期吗", "会不会过期",
+            "最晚什么时候用", "能用到什么时候", "改天能用", "以后能用", "隔天能用", "长期有效",
         )):
+            valid_until = delivered_validity_date()
+            if valid_until:
+                date_label = f"{valid_until.year}年{valid_until.month}月{valid_until.day}日"
+                return {
+                    "reply": f"您刚收到的券有效期至{date_label}，请在到期日前完成核销。",
+                    "source": "当前会话已发券记录中的有效期",
+                    "decision": "allow",
+                    "kind": "coupon_validity",
+                }
             effective_policy = policy_text()
             same_day_required = bool(re.search(
                 r"当天[^。；\n]{0,10}(?:购买|使用)|(?:购买|使用)[^。；\n]{0,10}当天",

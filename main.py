@@ -892,6 +892,43 @@ class XianyuLive:
 
         return walk(message)
 
+    @staticmethod
+    def extract_coupon_valid_until(history):
+        """Extract a delivered coupon's expiry date without retaining voucher secrets."""
+        if not isinstance(history, list):
+            return ""
+
+        explicit_pattern = re.compile(
+            r"(?:有效期(?:至|截止(?:到)?)?|截至|最晚使用日期)"
+            r"[^\d]{0,12}(20\d{2})[年./\-_\s]+(\d{1,2})[月./\-_\s]+(\d{1,2})日?"
+        )
+        image_name_pattern = re.compile(
+            r"(?<!\d)(20\d{2})[年./\-_\s]+(\d{1,2})[月./\-_\s]+(\d{1,2})日?"
+            r"(?=\.(?:png|jpe?g|webp))",
+            re.IGNORECASE,
+        )
+        delivery_markers = ("卡号", "密码", "券码", "领取链接", "点击上方链接", "有效期如图片")
+
+        for entry in reversed(history):
+            if not isinstance(entry, dict) or str(entry.get("role") or "") != "assistant":
+                continue
+            content = str(entry.get("content") or "")
+            if not any(marker in content for marker in delivery_markers):
+                continue
+            candidates = []
+            for pattern in (explicit_pattern, image_name_pattern):
+                for match in pattern.finditer(content):
+                    year, month, day = map(int, match.groups())
+                    try:
+                        parsed = time.strptime(f"{year:04d}-{month:02d}-{day:02d}", "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    candidates.append((parsed.tm_year, parsed.tm_mon, parsed.tm_mday))
+            if candidates:
+                year, month, day = max(candidates)
+                return f"{year:04d}-{month:02d}-{day:02d}"
+        return ""
+
     def check_toggle_keywords(self, message):
         """检查消息是否包含切换关键词"""
         message_stripped = message.strip()
@@ -1871,7 +1908,12 @@ class XianyuLive:
             deterministic = None
             image_match = None
             image_asset = None
-            order_context = getattr(self, "_order_routes", {}).get(scope_id) or {}
+            order_context = dict(getattr(self, "_order_routes", {}).get(scope_id) or {})
+            delivered_valid_until = self.extract_coupon_valid_until(
+                self.context_manager.get_context_by_chat(scope_id)
+            )
+            if delivered_valid_until:
+                order_context["coupon_valid_until"] = delivered_valid_until
             actual_paid_amount = (
                 self.extract_actual_paid_amount(message)
                 or order_context.get("actual_paid_amount")

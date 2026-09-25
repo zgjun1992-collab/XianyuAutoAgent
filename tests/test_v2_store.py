@@ -1039,7 +1039,20 @@ class V2StoreTests(unittest.TestCase):
             "platform_summary": platform_summary, "image_urls": [], "price": "169.9",
         })
 
-        for message in ("169.9 的是哪个券", "售价169.9的是哪款", "哪个规格是169.9元"):
+        for message in (
+            "169.9 的是哪个券", "169.9是那一个？", "169.9是那个",
+            "售价169.9的是哪款", "哪个规格是169.9元", "那款是169.9元",
+            "169.9对应哪个规格", "169.9对应的是哪一款呀",
+            "169.9卖的是哪种套餐", "价格169.9属于哪一档",
+            "￥169.9是啥套餐", "哪一份售价是169.9",
+            "哪个选项卖169.9元", "什么款式价格为169.9呢",
+            "169.9那个是什么规格", "169.9这个是啥套餐",
+            "169.9的券是哪一个", "169.9元的套餐对应哪款",
+            "169块9是哪一个", "169元9对应什么规格",
+            "哪个SKU是169.9", "169.9是第几个", "169.90是哪款",
+            "哪款对应169.9", "那一档卖价是169.9",
+            "169.9价位是哪个",
+        ):
             with self.subTest(message=message):
                 result = self.store.resolve_deterministic("sale-price-name", message)
                 self.assertEqual("sku_price_lookup", result["kind"])
@@ -1053,7 +1066,12 @@ class V2StoreTests(unittest.TestCase):
                 )
                 self.assertNotIn("没有169.9元代金券", result["reply"])
 
-        for message in ("169的是哪个券", "售价169是哪款", "169"):
+        for message in (
+            "169的是哪个券", "售价169是哪款", "169",
+            "169对应的是哪款呀", "哪一种卖169元的", "￥169是哪一个",
+            "169元的套餐是什么", "169那个叫啥套餐", "169块是哪款",
+            "哪一档价格为169呢", "169是第几个", "那款是169元啊",
+        ):
             with self.subTest(message=message):
                 result = self.store.resolve_deterministic("sale-price-name", message)
                 self.assertEqual("sku_price_lookup", result["kind"])
@@ -1083,6 +1101,26 @@ class V2StoreTests(unittest.TestCase):
             "您想问的是一绪【深圳】超值单人么？现在还有，售价169.9元。",
             approximate_stock["reply"],
         )
+
+        for message in (
+            "169还有没有", "169还有货不", "169还在售吗", "169还卖吗",
+            "169有货没", "169能拍吗", "169能不能买", "169可不可以下单",
+            "169下架了吗", "169卖完没", "169售罄了吗", "￥169有货吗",
+            "169块还有吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("sale-price-name", message)
+                self.assertEqual("sku_availability", result["kind"])
+                self.assertEqual(
+                    "您想问的是一绪【深圳】超值单人么？现在还有，售价169.9元。",
+                    result["reply"],
+                )
+
+        for message in ("169块9是哪款", "169元9是哪个", "169块9还有吗"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("sale-price-name", message)
+                self.assertIn("一绪【深圳】超值单人", result["reply"])
+                self.assertIn("169.9元", result["reply"])
 
         amount_plan = self.store.resolve_deterministic(
             "sale-price-name", "消费169.9元怎么买",
@@ -2627,6 +2665,42 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("需要在购买当天使用", result["reply"])
         self.assertIn("还请您理解", result["reply"])
         self.assertNotIn("不退不补", result["reply"])
+
+    def test_short_delay_expiry_question_uses_delivered_coupon_date(self):
+        order_context = {"coupon_valid_until": "2026-09-28"}
+        for message in (
+            "等会结账会过期吗", "晚点买单会不会失效", "过一会再核销还能用吗",
+            "今天晚上用行不行", "待会使用有效吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic(
+                    "10001", message, order_context=order_context,
+                )
+                self.assertEqual("coupon_validity", result["kind"])
+                self.assertIn("2026年9月28日", result["reply"])
+                self.assertNotIn("人工", result["reply"])
+                self.assertNotIn("72小时", result["reply"])
+
+    def test_short_delay_expiry_question_without_known_date_does_not_escalate(self):
+        result = self.store.resolve_deterministic("10001", "等会结账会过期吗")
+        self.assertEqual("coupon_validity", result["kind"])
+        self.assertTrue(
+            "券页面显示的有效期" in result["reply"] or "当天使用" in result["reply"]
+        )
+        self.assertNotIn("人工", result["reply"])
+
+    def test_general_validity_phrasings_use_delivered_coupon_date(self):
+        for message in (
+            "什么时候失效", "多久过期", "哪天过期", "有效到几号",
+            "会不会过期", "最晚什么时候用", "能用到什么时候",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic(
+                    "10001", message,
+                    order_context={"coupon_valid_until": "2026-09-28"},
+                )
+                self.assertEqual("coupon_validity", result["kind"])
+                self.assertIn("2026年9月28日", result["reply"])
 
     def test_store_query_discards_pronouns_and_accepts_city(self):
         self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
