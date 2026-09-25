@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.47",
+  "version": "0.11.48",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.47：买家按售价询问SKU时优先使用实时SKU资料；支持169匹配169.9等省略小数的问法，并在报价或库存回复中先确认真实SKU名称。继续包含推广模式、混合发卡、SKU知识归纳、SKU实时同步、上下文报价、优惠概览、日期、餐段、人数、门店、城市、平台、不可用日期及节日规则修复。"
+      "releaseNotes": "0.11.48：补齐169/169.9按售价询问SKU名称与库存的口语问法；买家询问等会、稍后或晚点结账是否过期时，优先读取当前会话已发券记录中的有效期并直接回答，不再误转人工。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
