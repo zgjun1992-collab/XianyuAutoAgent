@@ -5896,6 +5896,119 @@ class V2Store(AppStore):
             "decision": "allow", "kind": "sku_availability",
         }
 
+    def named_coupon_availability_reply(
+        self, item_id: str, product: Dict, message: str,
+    ) -> Optional[Dict]:
+        """Answer availability questions that name a dish/service coupon.
+
+        Buyers often call a sellable SKU a ``券码`` (for example
+        ``有红烧肉的券码吗``).  ``券码`` alone normally belongs to delivery or
+        aftersale routing, but in this sentence it qualifies the named SKU and
+        must therefore be matched against the authoritative SKU catalog first.
+        """
+        original = str(message or "").strip()
+        compact = re.sub(r"[\s，,。.!！?？~～：:；;]+", "", original).lower()
+        coupon_noun = r"券码|卡券|电子券|优惠券|代金券|抵扣券|现金券|单品券|券"
+        if not compact or not re.search(coupon_noun, compact):
+            return None
+        # Code failures/retrieval/operations are aftersale questions, not stock
+        # checks. Leave them to the coupon troubleshooting branches.
+        if re.search(
+            r"无效|失效|错误|不能用|用不了|核销|没收到|未收到|没发|漏发|"
+            r"发错|过期|刷新|换码|补发|重发|重新发|链接|在哪里|在哪|怎么领|怎么用",
+            compact,
+        ):
+            return None
+        if not re.search(
+            r"(?:^有|有没有|有无|还有|有货|卖不卖|能买|能买吗|能拍|可以拍|可拍)|"
+            r"(?:有吗|有么|有嘛|还有吗|还有么|还有嘛|有货吗|卖不卖|能买吗|能拍吗|可以拍吗)$|"
+            rf"(?:有|还有)(?:{coupon_noun})(?:吗|么|嘛|呢)?$",
+            compact,
+        ):
+            return None
+
+        text = re.sub(r"^(?:请问|咨询一下|想问一下|想问|这个商品|当前商品|商品)", "", compact)
+        text = re.sub(r"(?:吗|么|嘛|呢)$", "", text)
+        text = re.sub(r"(?:还有|有货|有|卖不卖|能买|能买吗|能拍|可以拍|可拍)$", "", text)
+        target = ""
+        leading = re.fullmatch(
+            r"(?:有没有|有无|还有|卖不卖|有)(.+?)(?:的)?"
+            rf"(?:{coupon_noun})",
+            text,
+        )
+        if leading:
+            target = leading.group(1)
+        if not target:
+            middle = re.fullmatch(
+                rf"(.+?)(?:有|还有)(?:{coupon_noun})",
+                text,
+            )
+            if middle:
+                target = middle.group(1)
+        if not target:
+            trailing = re.fullmatch(
+                rf"(.+?)(?:的)?(?:{coupon_noun})",
+                text,
+            )
+            if trailing:
+                target = trailing.group(1)
+        target = re.sub(r"^(?:这个|这款|当前商品)", "", str(target or ""))
+        target = re.sub(r"的$", "", target)
+        if len(target) < 2:
+            return None
+        # Any Arabic amount belongs to the mature denomination/SKU resolver,
+        # which also understands day labels, stock and coupon composition.
+        if re.search(r"\d", target):
+            return None
+        denomination_target = re.sub(
+            r"^(?:能不能拍|能不能买|能拍|可以拍|可拍|能买|可以买|可买|拍|买)",
+            "", target,
+        )
+        if re.fullmatch(
+            r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万]+)(?:元|块)?",
+            denomination_target,
+        ) or denomination_target in {"什么", "哪些", "啥", "优惠", "代金", "抵扣", "现金"}:
+            return None
+
+        sellable = [
+            sku for sku in self.list_product_skus(item_id, product)
+            if sku.get("sellable", True)
+        ]
+        matched = [
+            sku for sku in sellable
+            if target in normalize_text(sku.get("sku_name") or "").lower()
+        ]
+        if not matched:
+            return {
+                "reply": f"当前在售SKU中没有找到“{target}”对应的券。",
+                "source": "当前商品真实在售SKU",
+                "decision": "deny", "kind": "named_coupon_availability",
+            }
+
+        lines = []
+        for sku in matched[:6]:
+            name = str(sku.get("sku_name") or "当前规格").strip()
+            price = self._format_number(sku.get("sale_price") or "")
+            line = f"“{name}”"
+            line += f"，售价{price}元" if price else "，售价尚未同步"
+            lines.append(line)
+        reply = "有的，当前有" + "；".join(lines) + "。付款后发送对应电子券码。"
+        context_update = {
+            "intent": "named_coupon_availability",
+            "selected_sku_keys": [str(sku.get("sku_key") or "") for sku in matched[:6]],
+        }
+        if len(matched) == 1:
+            context_update.update({
+                "selected_sku_key": str(matched[0].get("sku_key") or ""),
+                "selected_sku_name": str(matched[0].get("sku_name") or ""),
+            })
+        return {
+            "reply": reply,
+            "source": "当前商品真实在售SKU及售价",
+            "decision": "allow", "kind": "named_coupon_availability",
+            "query_context_update": context_update,
+        }
+
     def sku_price_availability_reply(
         self, item_id: str, product: Dict, message: str,
     ) -> Optional[Dict]:
@@ -13167,13 +13280,33 @@ class V2Store(AppStore):
         if social_kind:
             message = business_message
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
+        query_context = store_context if isinstance(store_context, dict) else {}
 
-        if re.fullmatch(r"(?:请)?(?:帮我)?(?:转|换|找)?(?:一下)?人工(?:客服)?", compact):
+        confirmed_manual = bool(re.fullmatch(
+            r"(?:确认|确定|同意)(?:转|换|找)?(?:一下)?人工(?:客服)?", compact,
+        ))
+        if (
+            query_context.get("intent") == "manual_handoff_confirmation"
+            and re.fullmatch(r"(?:确认|确定|同意|是|是的|好的|好|要|需要|可以)", compact)
+        ):
+            confirmed_manual = True
+        if confirmed_manual:
             return {
                 "reply": "已切换至人工处理，请稍候。后续消息将保留给人工查看。",
-                "source": "买家明确要求人工接管",
+                "source": "买家二次确认人工接管",
                 "decision": "allow",
                 "kind": "manual_handoff",
+            }
+        if re.fullmatch(r"(?:请)?(?:帮我)?(?:转|换|找)?(?:一下)?人工(?:客服)?", compact):
+            return {
+                "reply": (
+                    "请先告诉我具体遇到的问题，我先帮您处理；"
+                    "如果仍未解决，再回复“确认转人工”。"
+                ),
+                "source": "优先由当前客服解决，未解决再确认转人工",
+                "decision": "allow",
+                "kind": "manual_handoff_confirmation",
+                "query_context_update": {"intent": "manual_handoff_confirmation"},
             }
 
         def policy_text() -> str:
@@ -13246,6 +13379,11 @@ class V2Store(AppStore):
             compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
 
         query_context = store_context if isinstance(store_context, dict) else {}
+        named_coupon = self.named_coupon_availability_reply(
+            item_id, product, message,
+        )
+        if named_coupon:
+            return named_coupon
         package_content = self.package_content_reply(product, message, query_context)
         if package_content:
             return package_content
@@ -13391,7 +13529,13 @@ class V2Store(AppStore):
             r"(?:还没|没有|未|尚未)(?:验|核销|使用|用)(?:过)?|没验",
             message,
         ))
-        actual_failure = bool(re.search(
+        conditional_failure = bool(re.search(
+            r"(?:如果|万一|要是)(?:这张|这个|到店|门店)?(?:券|卡券|券码)?"
+            r"(?:不能用|用不了|无法核销|核销失败)(?:了)?"
+            r"(?:怎么办|咋办|怎么处理|如何处理|呢)?",
+            message,
+        ))
+        actual_failure = conditional_failure or bool(re.search(
             r"(?:券码|卡券|码).{0,8}(?:不能用|用不了|无效|核销失败|无法核销|核销不了|发错|已过期)|"
             r"(?:不能用|用不了|无效|核销失败|无法核销|核销不了).{0,8}(?:券码|卡券|码)|"
             r"(?:买了|购买后|付款后|收到后|已付款|已经付款).{0,10}(?:不能用|用不了|核销不了|核销失败)|"
@@ -13990,7 +14134,7 @@ class V2Store(AppStore):
                 "kind": "delivery_method",
             }
 
-        store_negative = self.store_negative_confirmation_reply(
+        store_negative = None if actual_failure else self.store_negative_confirmation_reply(
             item_id, product, message, store_context
         )
         if store_negative:
@@ -14050,9 +14194,9 @@ class V2Store(AppStore):
                 "kind": "expiry_quality",
             }
 
-        # An actual code/redemption failure is aftersales evidence by itself.
-        # A bare “不能用吗” is intentionally excluded and remains available to
-        # the existing store/time intent resolvers above.
+        # An actual code/redemption failure, or an explicit contingency such as
+        # “如果不能用咋办”, is aftersales evidence by itself. A bare “不能用吗”
+        # is intentionally excluded and remains available to store/time intent.
         if actual_failure and not refund_request:
             return {
                 "reply": (
@@ -14061,6 +14205,21 @@ class V2Store(AppStore):
                 ),
                 "source": "卡券核销异常先排查，买家尚未提出退款",
                 "decision": "allow", "kind": "coupon_troubleshooting",
+            }
+
+        if conditional_failure and refund_request:
+            guidance = policy_sentences(
+                ("质量", "异常", "仅退款", "72", "人工"),
+                (
+                    "如果购买后确实因券码无效、核销失败等卡券自身原因无法使用，"
+                    "可以按当前商品退款政策申请；请保留脱敏后的页面提示或门店反馈。"
+                ),
+            )
+            return {
+                "reply": "可以申请退款，但需要先核实无法使用的原因。" + guidance,
+                "source": "购买前咨询卡券无法使用时的退款政策",
+                "decision": "allow",
+                "kind": "refund_policy",
             }
 
         if actual_failure and refund_request:

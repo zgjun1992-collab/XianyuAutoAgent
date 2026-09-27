@@ -3355,6 +3355,29 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("coupon_troubleshooting", result["kind"])
         self.assertNotIn("仅退款", result["reply"])
 
+    def test_hypothetical_coupon_failure_never_becomes_a_store_query(self):
+        for message in (
+            "如果不能用咋办?", "万一用不了怎么办", "要是到店无法核销怎么处理",
+            "如果这张券不能用呢",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("coupon_troubleshooting", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertIn("重新打开券码", result["reply"])
+                self.assertNotIn("城市", result["reply"])
+                self.assertNotIn("可用门店", result["reply"])
+                self.assertNotIn("已转交人工", result["reply"])
+
+    def test_hypothetical_coupon_failure_refund_question_uses_aftersale_policy(self):
+        result = self.store.resolve_deterministic("10001", "我拍下要是不能用能退吗")
+        self.assertEqual("refund_policy", result["kind"])
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("可以申请退款", result["reply"])
+        self.assertIn("核实", result["reply"])
+        self.assertNotIn("城市", result["reply"])
+        self.assertNotIn("可用门店", result["reply"])
+
     def test_historical_version_can_be_restored(self):
         self.store.save_v2_product("10001", "测试券", "旧知识", note="旧版本")
         old = self.store.list_versions("10001")[0]
@@ -4477,7 +4500,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("aftersale_clarify", applied["kind"])
         self.assertIn("无法直接核验", applied["reply"])
         manual = self.store.resolve_deterministic("10001", "人工")
-        self.assertEqual("manual_handoff", manual["kind"])
+        self.assertEqual("manual_handoff_confirmation", manual["kind"])
+        self.assertIn("确认转人工", manual["reply"])
 
     def test_atomic_coupon_facts_ground_composed_paid_and_face_value(self):
         self.store.save_v2_product(
@@ -4532,8 +4556,8 @@ class V2StoreTests(unittest.TestCase):
                 "不同面额的券不能混用。",
             ),
             "人工": (
-                "manual_handoff",
-                "已切换至人工处理，请稍候。后续消息将保留给人工查看。",
+                "manual_handoff_confirmation",
+                "请先告诉我具体遇到的问题，我先帮您处理；如果仍未解决，再回复“确认转人工”。",
             ),
         }
         actual = {
@@ -7040,6 +7064,47 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("product_attribute", profile["primary_intent"])
         self.assertEqual("option_by_included_item", profile["primary_subtype"])
         self.assertIn("大闸蟹", profile["entities"]["content_items"])
+
+    def test_named_dish_coupon_code_question_uses_real_sku(self):
+        platform_summary = json.dumps({
+            "title": "小菜园电子券", "description": "付款后发送电子券码",
+            "sku": [
+                {"skuId": "pork", "priceInCent": 1290, "quantity": 10,
+                 "propertyList": [{"actualValueText": "小菜园红烧肉单品券"}]},
+                {"skuId": "voucher", "priceInCent": 6900, "quantity": 10,
+                 "propertyList": [{"actualValueText": "小菜园100元代金券"}]},
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "named-coupon", "title": "小菜园电子券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "12.9",
+        })
+        for message in (
+            "有红烧肉的券码吗", "有没有红烧肉券", "红烧肉有券吗",
+            "红烧肉的券码有吗", "红烧肉单品券还有吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("named-coupon", message)
+                self.assertEqual("named_coupon_availability", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertIn("小菜园红烧肉单品券", result["reply"])
+                self.assertIn("售价12.9元", result["reply"])
+                self.assertIn("电子券码", result["reply"])
+
+    def test_manual_handoff_requires_confirmation(self):
+        first = self.store.resolve_deterministic("10001", "人工")
+        self.assertEqual("manual_handoff_confirmation", first["kind"])
+        self.assertNotIn("已切换至人工处理", first["reply"])
+        self.assertIn("我先帮您处理", first["reply"])
+        second = self.store.resolve_deterministic(
+            "10001", "确认",
+            store_context=first["query_context_update"],
+        )
+        self.assertEqual("manual_handoff", second["kind"])
+        self.assertIn("已切换至人工处理", second["reply"])
+
+        explicit = self.store.resolve_deterministic("10001", "确认转人工")
+        self.assertEqual("manual_handoff", explicit["kind"])
 
     def test_knowledge_summary_separates_purchase_combinations_and_rule_sections(self):
         raw_text = (
