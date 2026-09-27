@@ -39,6 +39,7 @@
 【槽位和证据】
 slots 只允许使用 store_query、sku_amount、paid_amount、face_value、date_text。没有明确值就留空。
 - store_query 必须原样来自 current_message；仅在 uses_context=true 且上下文对象唯一时，才可来自 known_context。
+- store_query 只能填写地点实体本身：省、市、区县、街道、商圈、商场、广场或完整门店名。必须删除“帮我、核对一下、查询、能不能用、有什么优惠”等请求词和问题描述，禁止把整句 evidence 填入 store_query。
 - sku_amount、paid_amount、face_value、date_text 中的数字或日期必须来自 current_message，或来自明确允许使用的唯一上下文。
 - 不得把错别字、同音词改成你认为正确的官方门店名；只保留买家原文，由本地门店表处理。
 - 不得根据 product_title 或 sku_names 宣称某个规格存在，它们只用于理解当前消息中的指代。
@@ -52,6 +53,9 @@ current_message="2大1小周末晚市多少钱"
 
 current_message="西安200元周末券能用吗"
 输出={"questions":[{"intent":"store","evidence":"西安200元周末券能用吗","slots":{"store_query":"西安","sku_amount":"200"},"uses_context":false,"confidence":0.98}],"needs_clarification":false}
+
+current_message="帮我核对一下 佛山万科广场店"
+输出={"questions":[{"intent":"store","evidence":"帮我核对一下 佛山万科广场店","slots":{"store_query":"佛山万科广场店"},"uses_context":false,"confidence":0.99}],"needs_clarification":false}
 
 current_message="现在能用吗"
 输出={"questions":[{"intent":"conditions","evidence":"现在能用吗","slots":{},"uses_context":false,"confidence":0.99}],"needs_clarification":false}

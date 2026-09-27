@@ -711,6 +711,56 @@ class V2StoreTests(unittest.TestCase):
             {**context, "store_sku_matrix": stale_matrix},
         ))
 
+    def test_store_catalog_question_and_elliptical_followups_use_store_skus(self):
+        self.store.save_v2_product(
+            "10001", "蚂蚁洞烤肉代金券",
+            "抖音50x4：售价129元，发50元券4张\n"
+            "抖音200（可叠加4张）：售价138元，发200元券1张\n"
+            "适用门店营业时间内可用。",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳布吉万象汇店",
+            "深圳通用门店", ["10001"],
+        )
+
+        initial = self.store.resolve_deterministic(
+            "10001", "深圳布吉万象汇店有什么券可以用呢",
+        )
+        self.assertEqual("multi_intent", initial["kind"])
+        self.assertEqual("available", initial["store_status"])
+        self.assertTrue(initial["store_sku_matrix"])
+        self.assertIn("深圳布吉万象汇店", initial["reply"])
+        self.assertIn("抖音50x4（售价129元）", initial["reply"])
+        self.assertIn("抖音200元代金券（可叠加4张）（售价138元）", initial["reply"])
+        self.assertNotIn("深圳布吉万象汇店可用。", initial["reply"])
+
+        context = {
+            "query": initial["store_query"],
+            "matches": initial["store_matches"],
+            "status": initial["store_status"],
+            "store_sku_matrix": initial["store_sku_matrix"],
+        }
+        for question in (
+            "有什么的", "有多少的", "都有什么", "有哪些", "有哪几种券",
+            "有什么面额", "有多少面额的",
+        ):
+            with self.subTest(question=question):
+                followup = self.store.resolve_deterministic(
+                    "10001", question, store_context=context,
+                )
+                self.assertEqual("stores_sku_recommendation", followup["kind"])
+                self.assertIn("深圳布吉万象汇店", followup["reply"])
+                self.assertIn("抖音50x4（售价129元）", followup["reply"])
+                self.assertIn("抖音200元代金券（可叠加4张）（售价138元）", followup["reply"])
+                self.assertEqual(2, len(
+                    followup["query_context_update"]["selected_sku_keys"]
+                ))
+
+        promotion = self.store.resolve_deterministic(
+            "10001", "有什么优惠", store_context=context,
+        )
+        self.assertNotEqual("stores_sku_recommendation", promotion["kind"])
+
     def test_multi_sku_city_up_to_three_lists_each_store_specs(self):
         self.store.save_v2_product(
             "10001", "多规格代金券",
@@ -1392,6 +1442,45 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("上海万象城店", result["reply"])
         self.assertIn("\n\n2. 适用门店", result["reply"])
 
+    def test_semantic_store_slot_is_reduced_to_location_entity_before_matching(self):
+        self.store.save_v2_product(
+            "10001", "测试代金券", "100元代金券：售价66元",
+        )
+        self.store.import_store_text(
+            "【广东省】\n【佛山】佛山南海万科广场店、佛山金融中心店、佛山顺德万象汇店",
+            "佛山门店", ["10001"],
+        )
+        message = "帮我核对一下 佛山万科广场店，100的可以直接拍吗"
+        analysis = {
+            "questions": [
+                {
+                    "intent": "store",
+                    "evidence": "帮我核对一下 佛山万科广场店",
+                    # Deliberately simulate an over-wide model slot. The local
+                    # resolver must still match only the extracted entity.
+                    "slots": {"store_query": "帮我核对一下 佛山万科广场店"},
+                    "confidence": 0.99,
+                },
+                {
+                    "intent": "purchase", "evidence": "100的可以直接拍吗",
+                    "slots": {"sku_amount": "100"}, "confidence": 0.98,
+                },
+            ],
+            "needs_clarification": False,
+        }
+        result = self.store.resolve_semantic_analysis(
+            "10001", message, analysis,
+            original_result={"kind": "stores", "decision": "allow"},
+        )
+        self.assertEqual("semantic_multi_intent", result["kind"])
+        self.assertEqual("佛山万科", result["store_query"])
+        self.assertEqual(
+            ["佛山南海万科广场店"],
+            [row["branch"] for row in result["store_matches"]],
+        )
+        self.assertNotIn("佛山金融中心店", result["reply"])
+        self.assertNotIn("佛山顺德万象汇店", result["reply"])
+
     def test_semantic_single_question_never_replaces_existing_rule_result(self):
         analysis = {
             "questions": [{
@@ -1526,6 +1615,34 @@ class V2StoreTests(unittest.TestCase):
         for message, expected in cases.items():
             with self.subTest(message=message):
                 self.assertEqual(expected, extract_store_query(message))
+
+    def test_store_request_verbs_are_removed_before_entity_matching(self):
+        self.store.import_store_text(
+            "【广东省】\n【佛山】佛山南海万科广场店、佛山金融中心店、佛山顺德万象汇店",
+            "佛山门店", ["10001"],
+        )
+        for message in (
+            "帮我核对一下 佛山万科广场店",
+            "麻烦核实下佛山万科广场店",
+            "请帮我确认下佛山万科广场店",
+            "能不能帮忙查一下佛山万科广场店",
+            "佛山万科广场店 帮我看一下",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual("佛山万科广场店", extract_store_query(message))
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("stores", result["kind"])
+                self.assertEqual("available", result["store_status"])
+                self.assertEqual(
+                    ["佛山南海万科广场店"],
+                    [row["branch"] for row in result["store_matches"]],
+                )
+                self.assertNotIn("佛山金融中心店", result["reply"])
+                self.assertNotIn("佛山顺德万象汇店", result["reply"])
+
+        city = self.store.resolve_deterministic("10001", "帮我查一下佛山")
+        self.assertEqual("佛山", city["store_query"])
+        self.assertEqual(3, len(city["store_matches"]))
 
     def test_store_query_strips_only_current_product_brand_noise(self):
         product = {"title": "NEED韩国料理+need品牌美团电子券"}
@@ -3029,6 +3146,73 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("price", without_context["kind"])
         self.assertIn("哪种面额", without_context["reply"])
         self.assertNotIn("没有不超过该消费金额", without_context["reply"])
+
+    def test_bare_quantity_followup_reuses_selected_package_sku(self):
+        platform_summary = json.dumps({
+            "title": "一绪品牌自助餐",
+            "sku": [
+                {
+                    "skuId": "light", "priceInCent": 19800, "quantity": 30,
+                    "propertyList": [{"actualValueText": "一绪【深圳】轻享和牛单人"}],
+                },
+                {
+                    "skuId": "premium", "priceInCent": 21800, "quantity": 20,
+                    "propertyList": [{"actualValueText": "一绪【深圳】尊享和牛单人"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "selected-package-quantity", "title": "一绪品牌自助餐",
+            "platform_summary": platform_summary, "image_urls": [], "price": "198",
+        })
+
+        first = self.store.resolve_deterministic(
+            "selected-package-quantity", "轻享和牛单人多少钱",
+        )
+        self.assertIn("轻享和牛单人", first["reply"])
+        self.assertIn("售价198元", first["reply"])
+        self.assertTrue(first.get("query_context_update", {}).get("selected_sku_key"))
+
+        quantity_cases = {
+            "一张": "售价198元", "两张": "396元", "2张": "396元",
+            "三张": "594元", "5张": "990元", "十份": "1980元",
+            "12张": "2376元", "就两份": "396元",
+            "三张多少钱": "594元", "买5张要付多少": "990元",
+            "12张总价多少": "2376元", "如果买4份一共多少钱": "792元",
+            "拍十张怎么收费": "1980元",
+        }
+        for message, expected_total in quantity_cases.items():
+            with self.subTest(message=message):
+                followup = self.store.resolve_deterministic(
+                    "selected-package-quantity", message,
+                    store_context=first["query_context_update"],
+                )
+                self.assertEqual("price", followup["kind"])
+                self.assertIn("轻享和牛单人", followup["reply"])
+                self.assertIn(expected_total, followup["reply"])
+                self.assertNotIn("尊享和牛单人", followup["reply"])
+                self.assertTrue(
+                    followup.get("query_context_update", {}).get("selected_sku_key")
+                )
+
+        for message in ("几张多少钱", "买多少张什么价", "几份一共多少钱"):
+            with self.subTest(message=message):
+                clarify = self.store.resolve_deterministic(
+                    "selected-package-quantity", message,
+                    store_context=first["query_context_update"],
+                )
+                self.assertEqual("price", clarify["kind"])
+                self.assertIn("轻享和牛单人", clarify["reply"])
+                self.assertIn("售价198元", clarify["reply"])
+                self.assertIn("具体需要几", clarify["reply"])
+                self.assertNotIn("尊享和牛单人", clarify["reply"])
+
+        without_context = self.store.resolve_deterministic(
+            "selected-package-quantity", "两张",
+        )
+        self.assertTrue(
+            without_context is None or "396元" not in without_context.get("reply", "")
+        )
 
     def test_bare_quantity_and_face_uses_real_two_coupon_bundle(self):
         self.store.save_v2_product(
@@ -5626,6 +5810,31 @@ class V2StoreTests(unittest.TestCase):
         pot = self.store.resolve_deterministic("10001", "锅底可以用吗")
         self.assertIn("不可用于锅底", pot["reply"])
 
+    def test_global_scope_question_preserves_every_explicit_exclusion(self):
+        self.store.save_v2_product(
+            "10001", "蚂蚁洞烤肉代金券",
+            "200元代金券：售价118元。除酒水饮料、小料、甜品外，全场通用。\n"
+            "不适用项目：酒水饮料、蘸料费、甜品。\n"
+            "代金券不抵扣蘸料费，不抵扣酒水饮料、甜品。",
+        )
+        for message in (
+            "是全场通用吗", "是不是全场都能用", "所有菜都能抵扣吗", "什么都能抵扣吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("usage_scope", result["kind"])
+                self.assertIn("不是完全无条件通用", result["reply"])
+                for exclusion in ("酒水饮料", "小料", "甜品", "蘸料费"):
+                    self.assertIn(exclusion, result["reply"])
+                self.assertNotIn("含酒水", result["reply"])
+
+        self.store.save_v2_product(
+            "10002", "无排除项代金券", "100元代金券：售价76元。全场通用。",
+        )
+        unrestricted = self.store.resolve_deterministic("10002", "全场可用吗")
+        self.assertEqual("usage_scope", unrestricted["kind"])
+        self.assertEqual("是的，当前商品规则明确写明全场通用。", unrestricted["reply"])
+
     def test_usage_scope_falls_back_to_complete_marketplace_description(self):
         product = {
             "raw_text": "【商品规格】\n100元代金券：售价76元。",
@@ -6201,6 +6410,53 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertEqual("available", result["store_status"])
         self.assertIn("聚宝源798店", result["reply"])
+
+    def test_store_question_uses_unique_synced_sku_sale_price_as_selector(self):
+        platform_summary = json.dumps({
+            "title": "北京芈重山老火锅套餐",
+            "description": "",
+            "price": "138",
+            "sku": [
+                {
+                    "skuId": "limited", "priceInCent": 13800, "quantity": 200,
+                    "propertyList": [{"actualValueText": "必吃双人餐（限顺义店）"}],
+                },
+                {
+                    "skuId": "beijing", "priceInCent": 15800, "quantity": 192,
+                    "propertyList": [{"actualValueText": "必吃双人餐（北京通用）"}],
+                },
+                {
+                    "skuId": "decimal", "priceInCent": 16990, "quantity": 30,
+                    "propertyList": [{"actualValueText": "超值单人餐（北京通用）"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "sale-price-store", "title": "北京芈重山老火锅套餐",
+            "platform_summary": platform_summary, "image_urls": [], "price": "138",
+        })
+        self.store.import_store_text(
+            "【北京市】\n【北京】亦庄店", "北京门店", ["sale-price-store"],
+        )
+
+        exact = self.store.resolve_deterministic(
+            "sale-price-store", "158的亦庄可以用吗",
+        )
+        self.assertEqual("multi_intent", exact["kind"])
+        self.assertEqual(["sku", "store"], exact["resolved_intents"])
+        self.assertIn("必吃双人餐（北京通用）", exact["reply"])
+        self.assertIn("售价158元", exact["reply"])
+        self.assertIn("亦庄店", exact["reply"])
+        self.assertNotIn("没有158元代金券", exact["reply"])
+        self.assertNotIn("售价138元", exact["reply"])
+
+        decimal = self.store.resolve_deterministic(
+            "sale-price-store", "169的亦庄能用吗",
+        )
+        self.assertEqual("multi_intent", decimal["kind"])
+        self.assertIn("超值单人餐（北京通用）", decimal["reply"])
+        self.assertIn("售价169.9元", decimal["reply"])
+        self.assertNotIn("169元代金券", decimal["reply"])
 
     def test_number_inside_branch_name_is_not_reclassified_as_sku(self):
         self.store.save_v2_product(
@@ -6778,6 +7034,45 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("2人需要购买2份【深圳】轻享和牛单人", followup["reply"])
         self.assertIn("共396元", followup["reply"])
         self.assertNotIn("超值单人", followup["reply"])
+
+    def test_split_course_package_messages_reuse_context_and_source_skus(self):
+        platform_summary = json.dumps({
+            "title": "北京芈重山老火锅必吃双人餐",
+            "description": "美团售价207元（9荤9素，门市价270+）。",
+            "price": "138",
+            "sku": [
+                {
+                    "skuId": "shunyi-double", "priceInCent": 13800, "quantity": 200,
+                    "propertyList": [{"actualValueText": "必吃双人餐（限顺义店）"}],
+                },
+                {
+                    "skuId": "beijing-double", "priceInCent": 15800, "quantity": 192,
+                    "propertyList": [{"actualValueText": "必吃双人餐（北京通用）"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "split-package-context", "title": "北京芈重山双人套餐",
+            "platform_summary": platform_summary, "image_urls": [], "price": "138",
+        })
+
+        direct = self.store.resolve_deterministic("split-package-context", "九荤九素")
+        self.assertEqual("sku_catalog", direct["kind"])
+        self.assertIn("九荤九素双人套餐", direct["reply"])
+        self.assertIn("必吃双人餐（限顺义店）：售价138元", direct["reply"])
+        self.assertIn("必吃双人餐（北京通用）：售价158元", direct["reply"])
+
+        followup = self.store.resolve_deterministic(
+            "split-package-context", "套餐",
+            store_context={"previous_user_message": "九荤九素"},
+        )
+        self.assertEqual("sku_catalog", followup["kind"])
+        self.assertIn("您问的是九荤九素双人套餐吧", followup["reply"])
+        self.assertNotIn("没有“套餐”", followup["reply"])
+        self.assertEqual(
+            ["source:shunyi-double", "source:beijing-double"],
+            followup["query_context_update"]["selected_sku_keys"],
+        )
 
     def test_unknown_numeric_price_question_clarifies_meaning_then_continues(self):
         self.store.upsert_synced_product({
