@@ -1909,8 +1909,9 @@ class XianyuLive:
             image_match = None
             image_asset = None
             order_context = dict(getattr(self, "_order_routes", {}).get(scope_id) or {})
+            conversation_history = self.context_manager.get_context_by_chat(scope_id)
             delivered_valid_until = self.extract_coupon_valid_until(
-                self.context_manager.get_context_by_chat(scope_id)
+                conversation_history
             )
             if delivered_valid_until:
                 order_context["coupon_valid_until"] = delivered_valid_until
@@ -1928,6 +1929,17 @@ class XianyuLive:
             query_context = dict(conversation.get("query_context") or {})
             query_context.update(self._query_contexts.get(scope_id) or {})
             query_context.update(self._store_contexts.get(scope_id) or {})
+            previous_user_message = next((
+                str(entry.get("content") or "").strip()
+                for entry in reversed(conversation_history)
+                if entry.get("role") == "user"
+                and str(entry.get("content") or "").strip()
+                and str(entry.get("content") or "").strip() != send_message
+            ), "")
+            if previous_user_message:
+                # Ephemeral context only: it helps join consecutive buyer
+                # bubbles, but is not persisted as a selected SKU or rule.
+                query_context["previous_user_message"] = previous_user_message
 
             # Resolve high-confidence business questions locally first.  The
             # model is only an intent/slot parser for unresolved or genuinely
@@ -1981,7 +1993,7 @@ class XianyuLive:
                         "last_selected_sku": str(query_context.get("selected_sku_name") or ""),
                         "pending_store_query": str(query_context.get("pending_store_query") or ""),
                     }
-                    semantic_history = self.context_manager.get_context_by_chat(scope_id)
+                    semantic_history = conversation_history
                     semantic_analysis = await asyncio.to_thread(
                         semantic_parser, send_message, semantic_history, semantic_context,
                     )
