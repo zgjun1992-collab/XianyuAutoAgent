@@ -1,6 +1,6 @@
 {
   "name": "xianyu-card-ai-cloud-preview",
-  "version": "0.11.49",
+  "version": "0.11.50",
   "private": true,
   "author": "Yituan",
   "description": "闲鱼餐饮卡券 AI 客服 V3.6 云端内测版",
@@ -68,7 +68,7 @@
       }
     ],
     "releaseInfo": {
-      "releaseNotes": "0.11.49：具名菜品券按真实在售SKU和售价回答；‘如果不能用/能退吗’按核销与退款政策处理，不再误判门店；买家单独发送‘人工’时优先由AI客服继续解决，二次确认后才转人工。"
+      "releaseNotes": "0.11.50：连续追问继承真实SKU与门店上下文，张数、价格和库存按真实规格回答；门店咨询只提取城市、区县、商圈、商场或门店实体进行匹配，不再用整句误检；补齐套餐追问和适用范围排除规则。"
     },
     "win": {
       "icon": "assets/xianyu-ai.ico",
