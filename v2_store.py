@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app_store import AppStore
+from app_store import AppStore, MANUAL_HELP_FIRST_NOTICE, MANUAL_REVIEW_NOTICE
 from privacy_guard import contains_sensitive_voucher_data
 
 try:
@@ -82,7 +82,8 @@ KNOWN_PROVINCE_NAMES = {
 
 STORE_LANDMARK_WORDS = (
     "门店", "店里", "店能", "店可", "商场", "商圈", "广场", "购物中心", "万达", "万象城",
-    "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士", "太古里", "印象城", "奥特莱斯",
+    "万象汇", "壹方城", "壹方天地", "万科里", "天街", "银泰", "吾悦", "大悦城", "来福士",
+    "太古里", "印象城", "海岸城", "奥特莱斯",
     "天虹", "总店", "旗舰店", "分店", "ifs", "mall", "地址", "位置", "在哪", "电话", "号码",
     "营业", "开门", "打烊",
 )
@@ -10094,6 +10095,26 @@ class V2Store(AppStore):
         names = [self._store_display_name(row) for row in candidates]
         if not names:
             return None
+        # A shared mall suffix alone is weak evidence: for example, an
+        # unavailable "怀德万象汇" must not be guessed as "佛山顺德万象汇".
+        # Low-scoring fuzzy candidates are safer to treat as not found than to
+        # make the buyer confirm a different city or branch.
+        best_score = max(
+            (int(row.get("match_score") or 0) for row in candidates),
+            default=0,
+        )
+        weak_fuzzy_only = bool(candidates) and all(
+            str(row.get("match_quality") or "") == "fuzzy"
+            for row in candidates
+        )
+        if best_score < 70 and weak_fuzzy_only:
+            return {
+                "reply": self.format_store_unavailable(query),
+                "source": "门店名称相似度不足，禁止以通用商场词猜测可用门店",
+                "decision": "deny", "kind": "stores",
+                "store_matches": [], "store_query": query,
+                "store_status": "unavailable",
+            }
         if len(matches) > 3:
             reply = (
                 f"根据“{query}”找到多家名称相近的门店，请再补充区县、商圈"
@@ -11149,6 +11170,25 @@ class V2Store(AppStore):
                 for part in re.split(r"[·•・|丨/\\\s]+", display)
                 if len(normalize_match_text(part)) >= 2
             )
+            # Store sheets often keep the restaurant category in the brand
+            # column ("芈重山老火锅"), while buyers naturally type only the
+            # merchant name ("芈重山").  Derive this alias exclusively from
+            # the configured brand and a trailing category, so a city/branch
+            # phrase such as “北京望京芈重山” can be split into three grounded
+            # entities instead of treating the brand as unresolved location
+            # text.  Never remove these words from arbitrary buyer input.
+            normalized = normalize_match_text(display)
+            for suffix in (
+                "老火锅店", "老火锅", "火锅店", "火锅",
+                "烤肉店", "烤肉", "烧肉店", "烧肉",
+                "烤鱼店", "烤鱼", "涮肉店", "涮肉",
+                "餐厅", "饭店", "酒楼", "小馆",
+            ):
+                suffix_key = normalize_match_text(suffix)
+                if normalized.endswith(suffix_key):
+                    merchant = normalized[:-len(suffix_key)]
+                    if len(merchant) >= 2:
+                        aliases.add(cls._store_fuzzy_key(merchant))
         elif field == "branch":
             normalized = normalize_match_text(display)
             for suffix in ("旗舰店", "分店", "门店", "店"):
@@ -12923,7 +12963,22 @@ class V2Store(AppStore):
         # store dictionary so “深圳五和店三人明天中午” and a bare city/address
         # can join the condition-price task without requiring “能用吗”.
         statement_probe = None
-        if not store_trigger and is_meaningful_store_query(store_query):
+        statement_party_slots = self._conditional_query_slots(text)
+        party_price_without_location = bool(
+            statement_party_slots.get("people_count")
+            and not statement_party_slots.get("audience_counts")
+            and not statement_party_slots.get("audience_types")
+            and re.search(
+                r"多少钱|多钱|价格|售价|什么价|啥价|几元|几块|怎么卖",
+                text,
+            )
+            and not any(word.lower() in text.lower() for word in STORE_LANDMARK_WORDS)
+        )
+        if (
+            not store_trigger
+            and not party_price_without_location
+            and is_meaningful_store_query(store_query)
+        ):
             statement_scope = self._multi_sku_store_scope(item_id, product)
             statement_union = (
                 statement_scope.get("list_ids")
@@ -13220,6 +13275,24 @@ class V2Store(AppStore):
                 item_id, f"{store_query_value}可以用吗", actual_paid_amount,
                 child_store_context or None, order_context, _allow_multi=False,
             )
+            # A date can be valid while the named location is not. For a
+            # combined store/date question, never emit the date-only "可以使用"
+            # answer until the store itself has been verified as available.
+            # Return the store denial/clarification directly so buyers cannot
+            # mistake a calendar result for a location-availability claim.
+            store_status = str((store_child_cache or {}).get("store_status") or "")
+            store_verified = store_status == "available" or str(
+                (store_child_cache or {}).get("kind") or ""
+            ) == "stores_sku_recommendation"
+            store_condition_kinds = {task[1] for task in tasks}
+            if (
+                store_child_cache
+                and store_condition_kinds.issubset({
+                    "store", "date", "day", "conditions", "current_time",
+                })
+                and not store_verified
+            ):
+                return store_child_cache
             # A product can have several SKUs that all share the same store
             # list. The ordinary store reply intentionally omits a matrix in
             # that case, but a simultaneous “有什么券” question still needs
@@ -13586,6 +13659,11 @@ class V2Store(AppStore):
     ) -> Optional[Dict]:
         """Resolve facts that must never be invented by the language model."""
         message = str(message or "").strip()
+        # Buyers often repeat the first character while typing a relative date
+        # ("今今天/明明天/后后天"). Leaving it behind makes that character look
+        # like an unresolved store-name prefix, allowing the date resolver to
+        # answer before the named location has been verified.
+        message = re.sub(r"([今明后])(?=\1(?:天|日))", "", message)
         compact = re.sub(r"[\s，,。.!！?？~～]+", "", message).lower()
         product = self.get_v2_product(item_id) or {}
 
@@ -13649,17 +13727,17 @@ class V2Store(AppStore):
             confirmed_manual = True
         if confirmed_manual:
             return {
-                "reply": "已切换至人工处理，请稍候。后续消息将保留给人工查看。",
+                "reply": (
+                    "已记录并转交人工。人工每天24点统一查阅一次，无法即时回复；"
+                    "后续消息将保留给人工查看。"
+                ),
                 "source": "买家二次确认人工接管",
                 "decision": "allow",
                 "kind": "manual_handoff",
             }
         if re.fullmatch(r"(?:请)?(?:帮我)?(?:转|换|找)?(?:一下)?人工(?:客服)?", compact):
             return {
-                "reply": (
-                    "请先告诉我具体遇到的问题，我先帮您处理；"
-                    "如果仍未解决，再回复“确认转人工”。"
-                ),
+                "reply": MANUAL_HELP_FIRST_NOTICE,
                 "source": "优先由当前客服解决，未解决再确认转人工",
                 "decision": "allow",
                 "kind": "manual_handoff_confirmation",
@@ -14393,19 +14471,85 @@ class V2Store(AppStore):
 
         date_use = self.date_availability_reply(product, message)
         if date_use:
+            # Buyers frequently send a branch and its date question as two
+            # consecutive bubbles ("深圳怀德店" -> "今天能用吗").  The first
+            # bubble may still be waiting in the inbound debounce window, so
+            # no in-memory store context has been created yet.  Re-resolve the
+            # immediately preceding buyer message and, only when it is a real
+            # store query, join both bubbles into the existing store/date
+            # multi-intent path.  This keeps an unavailable branch from being
+            # overwritten by a product-wide "today is available" answer.
+            contextual_store_query = str(query_context.get("query") or "").strip()
+            previous_user_message = str(
+                query_context.get("previous_user_message") or ""
+            ).strip()
+            if not contextual_store_query and previous_user_message:
+                previous_context = dict(query_context)
+                previous_context.pop("previous_user_message", None)
+                previous_result = self.resolve_deterministic(
+                    item_id, previous_user_message, actual_paid_amount,
+                    previous_context or None, order_context, _allow_multi=False,
+                )
+                if str((previous_result or {}).get("kind") or "") in {
+                    "stores", "stores_sku_recommendation", "stores_clarify",
+                }:
+                    contextual_store_query = str(
+                        (previous_result or {}).get("store_query")
+                        or extract_store_query(
+                            previous_user_message,
+                            product=product,
+                            product_brand=self.extract_brand(product),
+                        )
+                        or ""
+                    ).strip()
+            if contextual_store_query:
+                contextual = self.resolve_multi_question(
+                    item_id, product,
+                    f"{contextual_store_query} {message}",
+                    actual_paid_amount, query_context, order_context,
+                )
+                if contextual:
+                    return contextual
             return date_use
 
         day_use = self.day_availability_reply(product, message)
         if day_use:
             return day_use
 
+        # “晚市双人多少钱/两个人” names a party-size SKU, not an audience
+        # category.  Resolve this before the adult/child/student fare handler;
+        # otherwise a previous “两张” quantity can make the audience branch
+        # ask an unnecessary clarification even though the real double-person
+        # SKU and price are present.
+        party_slots = self._conditional_query_slots(message)
+        requested_party_size = int(party_slots.get("people_count") or 0)
+        has_named_party_package = any(
+            str(option.get("option_type") or "") == "package"
+            and requested_party_size in {
+                int(count) for count in (option.get("people_counts") or []) if count
+            }
+            for option in self.extract_sale_options(product)
+        )
+        generic_party_query = bool(
+            requested_party_size
+            and has_named_party_package
+            and not party_slots.get("audience_counts")
+            and not party_slots.get("audience_types")
+        )
+        conditional_sale = None
+        if generic_party_query:
+            conditional_sale = self.conditional_sale_reply(product, message, store_context)
+            if conditional_sale:
+                return conditional_sale
+
         audience_price = self.audience_price_reply(product, message, store_context)
         if audience_price:
             return audience_price
 
-        conditional_sale = self.conditional_sale_reply(product, message, store_context)
-        if conditional_sale:
-            return conditional_sale
+        if not generic_party_query:
+            conditional_sale = self.conditional_sale_reply(product, message, store_context)
+            if conditional_sale:
+                return conditional_sale
 
         quantity_price = self.quantity_price_reply(product, message)
         if quantity_price:
@@ -15035,7 +15179,7 @@ class V2Store(AppStore):
 
         if any(word in message for word in ("链接失效", "显示错误", "页面报错", "还是打不开", "依然打不开", "复制到浏览器也打不开")):
             return {
-                "reply": "该链接需要人工核实，我已为您转人工处理，请稍等。",
+                "reply": "该链接需要人工核实。" + MANUAL_REVIEW_NOTICE,
                 "source": "券码链接二次失败",
                 "decision": "review",
                 "kind": "code_link_escalation",
@@ -15053,7 +15197,7 @@ class V2Store(AppStore):
             "重新发一个", "重新发过", "再发一个", "重新发送", "再次发送",
         )):
             return {
-                "reply": "券码刷新、换码或补发需要人工授权处理，已经为您记录并转交人工，我们会在72小时内核实处理。",
+                "reply": "券码刷新、换码或补发需要人工授权处理。" + MANUAL_REVIEW_NOTICE,
                 "source": "券码操作需要人工授权",
                 "decision": "review",
                 "kind": "code_operation_review",
@@ -15063,7 +15207,7 @@ class V2Store(AppStore):
             "刚刚那个取消了", "刚才那个取消了", "上一个取消了",
         )):
             return {
-                "reply": "撤销后的重新处理需要人工核实，已经为您记录并转交人工，我们会在72小时内处理。",
+                "reply": "撤销后的重新处理需要人工核实。" + MANUAL_REVIEW_NOTICE,
                 "source": "撤销后的重新处理需要人工授权",
                 "decision": "review",
                 "kind": "code_operation_review",
@@ -15090,8 +15234,8 @@ class V2Store(AppStore):
         if any(word in message for word in anomaly_words):
             return {
                 "reply": (
-                    "券码异常或无法核销需要人工核实，已经为您记录并转交人工，"
-                    "我们会在72小时内处理。请保留相关页面提示。"
+                    "券码异常或无法核销需要人工核实。" + MANUAL_REVIEW_NOTICE
+                    + "请保留相关页面提示。"
                 ),
                 "source": "券码异常需要人工核实",
                 "decision": "review",
@@ -15244,6 +15388,51 @@ class V2Store(AppStore):
                 query if pending_mode == "generic_landmark" else message
             ) else {}
         )
+        # Continue an area-first conversation across turns.  A common buyer
+        # flow is "深圳" -> "万象汇店": the landmark is ambiguous nationwide,
+        # but the immediately preceding verified result already establishes a
+        # unique city.  Restrict only ambiguous/uncertain searches here; an
+        # independently resolved branch or a newly supplied city must never be
+        # overwritten by stale context.
+        if (
+            trusted_store_context
+            and raw_store_result.get("status") in {"ambiguous_area", "needs_confirmation"}
+            and not any(raw_store_result.get(field) for field in ("province", "city", "district"))
+        ):
+            prior_matches = list((store_context or {}).get("matches") or [])
+            for scope_field in ("district", "city", "province"):
+                prior_scope_values = {
+                    self._admin_key(match.get(scope_field))
+                    for match in prior_matches if self._admin_key(match.get(scope_field))
+                }
+                if len(prior_scope_values) != 1:
+                    continue
+                prior_scope_key = next(iter(prior_scope_values))
+                scoped_matches = [
+                    match for match in list(raw_store_result.get("matches") or [])
+                    if self._admin_key(match.get(scope_field)) == prior_scope_key
+                ]
+                if not scoped_matches:
+                    continue
+                scope_label = str(
+                    next(
+                        (match.get(scope_field) for match in prior_matches
+                         if self._admin_key(match.get(scope_field)) == prior_scope_key),
+                        "",
+                    ) or ""
+                ).strip()
+                scoped_query = f"{scope_label}{query}" if scope_label else query
+                raw_store_result = {
+                    **raw_store_result,
+                    "status": "available",
+                    "matches": scoped_matches,
+                    scope_field: prior_scope_key,
+                    "resolved_query": scoped_query,
+                    "specific_query": scoped_query,
+                    "candidate_count": len(scoped_matches),
+                    "context_scope": scope_label,
+                }
+                break
         if (
             raw_store_result.get("resolved_query")
             and normalize_text(raw_store_result.get("resolved_query")) != normalize_text(message)
@@ -15560,6 +15749,7 @@ class V2Store(AppStore):
 def extract_store_query(message: str, product: Optional[Dict] = None,
                         product_brand: str = "") -> str:
     text = str(message or "").strip()
+    text = re.sub(r"([今明后])(?=\1(?:天|日))", "", text)
     # Tolerate common key-repeat typos without widening fuzzy store matching.
     text = re.sub(r"能{2,}(?=(?:使用|用))", "能", text)
     # Reduce natural service requests to their location entity before any

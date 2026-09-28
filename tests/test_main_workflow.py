@@ -281,8 +281,9 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     def test_buyer_reply_sanitizer_replaces_an_unapproved_promise(self):
         text = XianyuLive.sanitize_buyer_reply("请提供订单号，我帮您补发。")
-        self.assertIn("人工核实", text)
-        self.assertIn("72小时", text)
+        self.assertIn("人工", text)
+        self.assertIn("每天24点", text)
+        self.assertNotIn("72小时", text)
         self.assertNotIn("补发", text)
 
     def test_media_dependent_short_text_detection(self):
@@ -703,8 +704,9 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(ws.send.await_args.args[0])
         encoded = payload["body"][0]["content"]["custom"]["data"]
         sent = json.loads(base64.b64decode(encoded).decode("utf-8"))["text"]["text"]
-        self.assertIn("人工核实", sent)
-        self.assertIn("72小时", sent)
+        self.assertIn("人工", sent)
+        self.assertIn("每天24点", sent)
+        self.assertNotIn("72小时", sent)
 
     def test_ai_and_first_reply_switches_are_independent(self):
         product = {

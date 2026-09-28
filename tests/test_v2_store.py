@@ -4051,7 +4051,8 @@ class V2StoreTests(unittest.TestCase):
         self.assertNotIn("已刷新", unclear["reply"])
         risky = self.store.resolve_deterministic("10001", "帮我刷新券码")
         self.assertEqual("review", risky["decision"])
-        self.assertIn("72小时", risky["reply"])
+        self.assertIn("每天24点", risky["reply"])
+        self.assertNotIn("72小时", risky["reply"])
         self.assertNotIn("已刷新", risky["reply"])
 
     def test_resend_or_cancelled_previous_item_never_promises_reissue(self):
@@ -4060,7 +4061,8 @@ class V2StoreTests(unittest.TestCase):
                 result = self.store.resolve_deterministic("10001", message)
                 self.assertEqual("review", result["decision"])
                 self.assertIn("人工", result["reply"])
-                self.assertIn("72小时", result["reply"])
+                self.assertIn("每天24点", result["reply"])
+                self.assertNotIn("72小时", result["reply"])
                 self.assertNotIn("帮您补发", result["reply"])
 
     def test_code_anomaly_without_refund_intent_starts_troubleshooting(self):
@@ -4360,6 +4362,40 @@ class V2StoreTests(unittest.TestCase):
             row["branch"] for row in followup["store_matches"]
         ])
         self.assertNotIn("暂未查询到", followup["reply"])
+
+    def test_landmark_followup_inherits_previous_city_scope(self):
+        self.store.import_store_text(
+            "【广东省】\n"
+            "【深圳】深圳布吉万象汇店、深圳怀德万象汇店、深圳万象前海店\n"
+            "【佛山】佛山顺德万象汇店\n"
+            "【湖北省】\n【武汉】武汉武昌万象汇店",
+            "多城市万象汇门店", ["10001"],
+        )
+        first = self.store.resolve_deterministic("10001", "深圳")
+        self.assertEqual("stores", first["kind"])
+        self.assertGreater(len(first["store_matches"]), 1)
+        context = {
+            "query": first["store_query"],
+            "matches": first["store_matches"],
+            "status": first.get("store_status", "available"),
+            "verified": True,
+            **(first.get("store_context_update") or {}),
+        }
+
+        followup = self.store.resolve_deterministic(
+            "10001", "万象汇店", store_context=context,
+        )
+
+        self.assertEqual("stores", followup["kind"])
+        self.assertEqual("allow", followup["decision"])
+        self.assertEqual(
+            ["深圳布吉万象汇店", "深圳怀德万象汇店"],
+            sorted(row["branch"] for row in followup["store_matches"]),
+        )
+        self.assertIn("深圳", followup["store_query"])
+        self.assertNotIn("佛山顺德万象汇店", followup["reply"])
+        self.assertNotIn("武汉武昌万象汇店", followup["reply"])
+        self.assertNotIn("请补充城市", followup["reply"])
 
     def test_all_day_and_all_period_options_cover_requested_conditions(self):
         self.store.save_v2_product(
@@ -4741,7 +4777,8 @@ class V2StoreTests(unittest.TestCase):
             ),
             "人工": (
                 "manual_handoff_confirmation",
-                "请先告诉我具体遇到的问题，我先帮您处理；如果仍未解决，再回复“确认转人工”。",
+                "请先告诉我具体遇到的问题，我先帮您处理；如果仍未解决，再回复“确认转人工”。"
+                "人工每天24点统一查阅一次，无法即时接入。",
             ),
         }
         actual = {
@@ -5216,6 +5253,37 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("stores", result["kind"])
         self.assertIn("武汉商场店", result["reply"])
         self.assertNotIn("深圳商场店", result["reply"])
+
+    def test_city_branch_and_brand_without_category_match_configured_store(self):
+        path = os.path.join(self.temp.name, "brand-category-stores.xlsx")
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["店名", "分店名", "省", "市", "区/县", "地址"])
+        sheet.append([
+            "芈重山老火锅", "望京店", "北京", "北京", "朝阳区",
+            "望京西园四区420号楼",
+        ])
+        sheet.append([
+            "芈重山老火锅", "工体店", "北京", "北京", "朝阳区",
+            "工人体育场北路",
+        ])
+        book.save(path)
+        self.store.import_store_list(path, "芈重山门店", ["10001"])
+
+        for message in (
+            "您好，北京望京芈重山可以用吗",
+            "北京芈重山望京店能用吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("10001", message)
+                self.assertEqual("stores", result["kind"])
+                self.assertEqual("available", result["store_status"])
+                self.assertEqual(
+                    ["望京店"],
+                    [row["branch"] for row in result["store_matches"]],
+                )
+                self.assertIn("望京店", result["reply"])
+                self.assertNotIn("工体店", result["reply"])
 
 
     def test_holiday_query_uses_holiday_sku_not_product_wide_weekday_denial(self):
@@ -6377,6 +6445,66 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual(["store", "date"], result["resolved_intents"])
         self.assertIn("西直门店", result["reply"])
 
+    def test_repeated_date_prefix_cannot_turn_unknown_store_into_date_only_yes(self):
+        self.store.import_store_text(
+            "【广东省】\n【佛山】佛山顺德万象汇店", "佛山门店", ["10001"],
+        )
+
+        result = self.store.resolve_deterministic(
+            "10001", "今今天怀德万象汇能用吗",
+        )
+
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("unavailable", result["store_status"])
+        self.assertIn("未查询到可用门店", result["reply"])
+        self.assertNotIn("可以使用", result["reply"])
+        self.assertNotIn("当天购买", result["reply"])
+
+    def test_repeated_date_prefix_still_combines_verified_store_and_date(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳宝安怀德万象汇店", "深圳门店", ["10001"],
+        )
+
+        result = self.store.resolve_deterministic(
+            "10001", "今今天怀德万象汇能用吗",
+        )
+
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertCountEqual(["store", "date"], result["resolved_intents"])
+        self.assertIn("深圳宝安怀德万象汇店", result["reply"])
+        self.assertIn("可以使用", result["reply"])
+
+    def test_date_followup_inherits_available_store_from_previous_bubble(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳宝安怀德店", "深圳门店", ["10001"],
+        )
+
+        result = self.store.resolve_deterministic(
+            "10001", "今天能用吗",
+            store_context={"previous_user_message": "深圳怀德店"},
+        )
+
+        self.assertEqual("multi_intent", result["kind"])
+        self.assertCountEqual(["store", "date"], result["resolved_intents"])
+        self.assertIn("深圳宝安怀德店", result["reply"])
+        self.assertIn("可以使用", result["reply"])
+
+    def test_date_followup_cannot_override_unavailable_previous_store(self):
+        self.store.import_store_text(
+            "【广东省】\n【佛山】佛山顺德万象汇店", "佛山门店", ["10001"],
+        )
+
+        result = self.store.resolve_deterministic(
+            "10001", "今天能用吗",
+            store_context={"previous_user_message": "深圳怀德店"},
+        )
+
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("unavailable", result["store_status"])
+        self.assertIn("未查询到可用门店", result["reply"])
+        self.assertNotIn("可以使用", result["reply"])
+        self.assertNotIn("当天购买", result["reply"])
+
     def test_negative_followup_rechecks_available_store_and_confirms_naturally(self):
         self.store.import_store_text(
             "【山东省】\n【青岛】青岛未来城万科广场店",
@@ -7391,15 +7519,29 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual("manual_handoff_confirmation", first["kind"])
         self.assertNotIn("已切换至人工处理", first["reply"])
         self.assertIn("我先帮您处理", first["reply"])
+        self.assertIn("每天24点", first["reply"])
         second = self.store.resolve_deterministic(
             "10001", "确认",
             store_context=first["query_context_update"],
         )
         self.assertEqual("manual_handoff", second["kind"])
-        self.assertIn("已切换至人工处理", second["reply"])
+        self.assertIn("已记录并转交人工", second["reply"])
+        self.assertIn("每天24点", second["reply"])
 
         explicit = self.store.resolve_deterministic("10001", "确认转人工")
         self.assertEqual("manual_handoff", explicit["kind"])
+
+    def test_manual_midnight_schedule_does_not_replace_refund_72_hour_sla(self):
+        manual = self.store.resolve_deterministic("10001", "确认转人工")
+        self.assertIn("每天24点", manual["reply"])
+        self.assertNotIn("72小时", manual["reply"])
+
+        refund = self.store.resolve_deterministic(
+            "10001", "券码无效，我要退款",
+            order_context={"status": "已付款"},
+        )
+        self.assertEqual("refund_quality", refund["kind"])
+        self.assertIn("72小时", refund["reply"])
 
     def test_knowledge_summary_separates_purchase_combinations_and_rule_sections(self):
         raw_text = (

@@ -43,6 +43,8 @@ class AppStoreTests(unittest.TestCase):
         result = PolicyEngine().evaluate("可以马上退款吗", "我先帮你看看订单。")
         self.assertEqual("review", result.action)
         self.assertIn("人工核实", result.suggested_reply)
+        self.assertIn("72小时", result.suggested_reply)
+        self.assertNotIn("每天24点", result.suggested_reply)
 
     def test_generic_refund_question_is_not_blindly_marked_high_risk(self):
         result = PolicyEngine().evaluate("怎么申请退款", "请按已确认的退款流程操作。")
@@ -66,6 +68,8 @@ class AppStoreTests(unittest.TestCase):
         actual_change = PolicyEngine().evaluate("我拍下你改价吧", "请先拍下。")
         self.assertEqual("review", actual_change.action)
         self.assertIn("人工核实", actual_change.suggested_reply)
+        self.assertIn("每天24点", actual_change.suggested_reply)
+        self.assertNotIn("72小时", actual_change.suggested_reply)
 
     def test_coupon_word_is_not_mistaken_for_bargaining(self):
         result = PolicyEngine().evaluate("这个优惠券怎么用", "到店扫码核销。")

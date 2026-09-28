@@ -39,6 +39,16 @@ LEGACY_AFTERSALE_POLICY_SUMMARY = (
 )
 
 
+MANUAL_HELP_FIRST_NOTICE = (
+    "请先告诉我具体遇到的问题，我先帮您处理；如果仍未解决，再回复“确认转人工”。"
+    "人工每天24点统一查阅一次，无法即时接入。"
+)
+
+MANUAL_REVIEW_NOTICE = (
+    "该事项已记录并转交人工核实。人工每天24点统一查阅一次，请留意后续回复。"
+)
+
+
 DEFAULT_POLICIES = {
     "reply_mode": "review",
     "global_system_prompt": (
@@ -48,10 +58,13 @@ DEFAULT_POLICIES = {
     ),
     "max_reply_rounds": 25,
     "conversation_reset_hours": 24,
-    "safe_fallback": "这个问题需要人工核实，我先为你记录，请稍等。",
-    "manual_review_notice": "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。",
+    "safe_fallback": MANUAL_HELP_FIRST_NOTICE,
+    "manual_review_notice": MANUAL_REVIEW_NOTICE,
     "price_fallback": "您好，当前商品暂不支持议价，实际售价以当前商品资料中的规格价格为准，感谢您的理解。",
-    "refund_fallback": "这个退款问题需要人工核实，已经为您记录并转交人工处理，请稍等。",
+    "refund_fallback": (
+        "这个退款问题需要人工核实，已经为您记录并转交人工处理，"
+        "将在退款申请后的72小时内处理。"
+    ),
     "order_payment_notice_enabled": True,
     "aftersale_policy_raw": (
         "建议在确认适用门店、使用时间和商品规则后再购买，卡券仍需当天购买、当天使用。\n"
@@ -229,7 +242,10 @@ class PolicyEngine:
             reasons.append("买家消息涉及高风险事项：" + "、".join(risk_hits[:5]))
 
         if reasons:
-            fallback = self.policies.get("manual_review_notice") or self.policies["safe_fallback"]
+            if refund_needs_review:
+                fallback = self.policies.get("refund_fallback") or self.policies["safe_fallback"]
+            else:
+                fallback = self.policies.get("manual_review_notice") or self.policies["safe_fallback"]
             return PolicyDecision("review", reasons, fallback)
 
         return PolicyDecision("allow", [], draft)
@@ -344,6 +360,8 @@ class AppStore:
             old_review_notices = (
                 "这个问题需要人工核实，已经为您记录并转交人工处理，请稍等。",
                 "这个问题需要进行人工审核，已经为您记录并转交人工处理，我们会在72小时内处理。",
+                "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。",
+                "该事项已记录并转交人工。人工每天24点统一查阅一次，请留意后续回复。",
             )
             for old_review_notice in old_review_notices:
                 conn.execute(
@@ -353,6 +371,18 @@ class AppStore:
                         self._now(),
                         "manual_review_notice",
                         json.dumps(old_review_notice, ensure_ascii=False),
+                    ),
+                )
+            for old_refund_notice in (
+                "这个退款问题需要人工核实，已经为您记录并转交人工处理，请稍等。",
+            ):
+                conn.execute(
+                    "UPDATE settings SET value=?,updated_at=? WHERE key=? AND value=?",
+                    (
+                        json.dumps(DEFAULT_POLICIES["refund_fallback"], ensure_ascii=False),
+                        self._now(),
+                        "refund_fallback",
+                        json.dumps(old_refund_notice, ensure_ascii=False),
                     ),
                 )
             # Migrate only the former built-in aftersale texts. Merchant-edited

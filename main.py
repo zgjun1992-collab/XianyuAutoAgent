@@ -15,7 +15,10 @@ import random
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
-from app_store import AppStore, PolicyEngine, DEFAULT_POLICIES, find_unauthorized_promises
+from app_store import (
+    AppStore, PolicyEngine, DEFAULT_POLICIES, MANUAL_REVIEW_NOTICE,
+    find_unauthorized_promises,
+)
 from privacy_guard import redact_sensitive_text
 
 
@@ -1856,7 +1859,7 @@ class XianyuLive:
                 self.context_manager.add_message_by_chat(scope_id, send_user_id, item_id, "user", send_message)
                 notice = str(policies.get("manual_review_notice") or "").strip()
                 if not notice:
-                    notice = "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。"
+                    notice = MANUAL_REVIEW_NOTICE
                 await self.send_msg(websocket, chat_id, send_user_id, notice)
                 self.context_manager.add_message_by_chat(
                     scope_id, self.myid, item_id, "assistant", notice
@@ -2245,7 +2248,7 @@ class XianyuLive:
                     self.enter_manual_mode(scope_id)
                 notice = str(policies.get("manual_review_notice") or "").strip()
                 if not notice:
-                    notice = "该事项需要人工核实，已经为您记录并转交人工处理，我们会在72小时内处理。"
+                    notice = MANUAL_REVIEW_NOTICE
                 # 确定性风险规则已经生成了安全的政策说明：先告知买家，
                 # 同时保留审核记录；模型草稿触发风险时仍只发统一审核回执。
                 buyer_notice = final_reply if (
