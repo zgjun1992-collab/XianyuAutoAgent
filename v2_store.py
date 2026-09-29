@@ -5847,16 +5847,35 @@ class V2Store(AppStore):
         100-yuan SKU calculations.
         """
         text = str(message or "").strip()
-        if not re.search(
+        bare_denomination = re.fullmatch(
+            r"\s*(?:(?:我)?(?:要|想要|想买|想问|问下|咨询(?:一下)?|看看|来个|来一份)\s*)?"
+            r"(?P<amount>\d+(?:\.\d+)?|[零一二两三四五六七八九十百千]+)\s*"
+            r"(?:元|块)?\s*(?:的)?\s*"
+            r"(?:代金券|优惠券|抵扣券|现金券|抵用券|券)"
+            r"\s*(?:呢|吗|呀)?\s*[？?。！!]*\s*",
+            text,
+        )
+        stock_question = bool(re.search(
             r"有吗|有没有|有无|有么|有嘛|有货|卖不卖|"
             r"还有(?:吗|么|嘛)?|没有了|没了|木有|卖完|售罄",
             text,
-        ):
+        ))
+        if not (stock_question or bare_denomination):
             return None
-        amount = self._requested_price_amount(text)
+        amount = ""
+        if bare_denomination:
+            raw_amount = str(bare_denomination.group("amount") or "")
+            if re.fullmatch(r"\d+(?:\.\d+)?", raw_amount):
+                amount = self._format_number(raw_amount)
+            else:
+                converted = self._chinese_count(raw_amount)
+                amount = self._format_number(converted) if converted else ""
+        if not amount:
+            amount = self._requested_price_amount(text)
         if not amount:
             match = re.search(
-                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*(?:代金券|优惠券|券|选项|规格)",
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块)?\s*(?:的)?\s*"
+                r"(?:代金券|优惠券|券|选项|规格)",
                 text,
             )
             amount = self._format_number(match.group(1)) if match else ""
@@ -5920,13 +5939,23 @@ class V2Store(AppStore):
                 "decision": "deny", "kind": "sku_availability",
             }
         day_prefix = self._day_reply_prefix(text, day_type) if day_type else ""
-        return {
+        result = {
             "reply": day_prefix + "有的。" + "\n".join(
                 self._atomic_voucher_option_text(option) + "。" for option in exact
             ),
             "source": "当前商品现有有货SKU及同一SKU发券组成",
             "decision": "allow", "kind": "sku_availability",
         }
+        if len(exact) == 1:
+            result["query_context_update"] = {
+                "selected_sku_key": str(
+                    exact[0].get("sku_key") or self.sku_key_for_option(exact[0])
+                ),
+                "selected_sku_name": str(
+                    exact[0].get("name") or exact[0].get("sku_name") or "当前规格"
+                ),
+            }
+        return result
 
     def named_coupon_availability_reply(
         self, item_id: str, product: Dict, message: str,
@@ -6056,6 +6085,11 @@ class V2Store(AppStore):
 
         def buyer_sku_name(sku: Dict) -> str:
             name = str(sku.get("sku_name") or "当前规格").strip()
+            # Some marketplace property labels arrive with a truncated closing
+            # parenthesis (for example “工作日100（可叠加2张”). Repair display
+            # punctuation without changing the authoritative SKU key/name.
+            if name.count("（") > name.count("）"):
+                name += "）"
             if (
                 product_brand and product_brand not in name
                 and name.startswith(("【", "["))
@@ -6092,6 +6126,7 @@ class V2Store(AppStore):
         # chance to reinterpret the amount.
         identity_match = None
         bare_price_query = False
+        purchase_price_query = False
         choice_word = (
             r"(?:哪一个|那一个|哪一款|那一款|哪一种|那一种|哪一份|那一份|"
             r"哪一档|那一档|哪个|那个|哪款|那款|哪种|那种|哪份|那份|"
@@ -6117,6 +6152,34 @@ class V2Store(AppStore):
             identity_match = re.fullmatch(pattern, compact, re.I)
             if identity_match:
                 break
+        # Purchase confirmations commonly put the action before the amount:
+        # “直接拍72的是吗 / 可以直接拍72吗”.  Here 72 is the marketplace
+        # sale price, not a 72-yuan bill or voucher denomination.  Resolve the
+        # amount only when it actually matches a source SKU; otherwise let the
+        # ordinary purchase/consumption resolver continue.
+        if not identity_match and not re.search(
+            r"消费|账单|预算|用餐|结账|买单|应付|抵扣|合计|一共|总共",
+            compact,
+        ) and not re.search(
+            r"\d+(?:\.\d+)?(?:元|块)?(?:的)?(?:代金券|优惠券|抵扣券|现金券|抵用券|券)",
+            compact,
+        ):
+            for pattern in (
+                r"(?:(?:是不是|是否|确认)?(?:可以|能|要|就|就是|应该)?(?:直接)?)"
+                r"(?:拍|买|下单|购买|选择)(?:售价|价格|卖价)?"
+                r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?"
+                r"(?:的|那个|那款|这个|这款|这一档|这个规格)?"
+                r"(?:是吗|对吗|没错吧|可以吗|行吗|吗)?",
+                r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?(?:的)?"
+                r"(?:可以|能|要|就|就是|应该)?直接"
+                r"(?:拍|买|下单|购买|选择)(?:是吗|对吗|没错吧|可以吗|行吗|吗)?",
+                r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?(?:的)?"
+                r"(?:是吗|对吗|没错吧)",
+            ):
+                identity_match = re.fullmatch(pattern, compact, re.I)
+                if identity_match:
+                    purchase_price_query = True
+                    break
         if not identity_match:
             identity_match = re.fullmatch(r"(?P<price>\d+)", compact)
             bare_price_query = bool(identity_match)
@@ -6124,7 +6187,7 @@ class V2Store(AppStore):
             price, matched, approximate = sale_price_matches(identity_match.group("price"))
             available = [sku for sku in matched if sku.get("sellable", True)]
             if not matched:
-                if bare_price_query:
+                if bare_price_query or purchase_price_query:
                     return None
                 return {
                     "reply": f"当前商品没有售价{price}元的规格。",
@@ -6148,7 +6211,20 @@ class V2Store(AppStore):
             actual_prices = [
                 self._format_number(sku.get("sale_price") or "") for sku in available
             ]
-            if (approximate or bare_price_query) and len(names) == 1:
+            if purchase_price_query and not approximate and len(names) == 1:
+                reply = f"是的，直接选择“{names[0]}”规格拍下，售价{actual_prices[0]}元。"
+            elif purchase_price_query and approximate and len(names) == 1:
+                reply = (
+                    f"您想问的是“{names[0]}”吗？该规格实际售价"
+                    f"{actual_prices[0]}元，请按页面显示金额拍下。"
+                )
+            elif purchase_price_query:
+                choices = "、".join(
+                    f"{name}（售价{actual_price}元）"
+                    for name, actual_price in zip(names, actual_prices)
+                )
+                reply = f"该金额对应多个规格：{choices}。请按需要的规格拍下。"
+            elif (approximate or bare_price_query) and len(names) == 1:
                 reply = f"您询问的是{names[0]}，售价{actual_prices[0]}元吗？"
             elif approximate or bare_price_query:
                 choices = "、".join(
@@ -10753,6 +10829,20 @@ class V2Store(AppStore):
         if not compact:
             return None
 
+        # A normal single-store lookup only persists the verified store rows;
+        # it does not always pre-build a per-SKU matrix (especially when every
+        # SKU inherits the same store list).  Rebuild it here so terse follow-up
+        # questions can still be answered from the actual SKU/store bindings.
+        matrix = list(context.get("store_sku_matrix") or [])
+        matches = list(context.get("matches") or [])
+        if (
+            not matrix and matches
+            and str(context.get("status") or "available") == "available"
+        ):
+            matrix = self._store_sku_matrix(
+                item_id, matches, self._multi_sku_store_scope(item_id, product),
+            )
+
         # “有什么的 / 有多少的” are ellipses after a verified store answer:
         # the omitted object is that store's available voucher/SKU catalog.
         # This remains valid when every SKU shares the same physical stores,
@@ -10768,15 +10858,6 @@ class V2Store(AppStore):
             compact,
         ))
         if catalog_followup:
-            matrix = list(context.get("store_sku_matrix") or [])
-            matches = list(context.get("matches") or [])
-            if (
-                not matrix and matches
-                and str(context.get("status") or "available") == "available"
-            ):
-                matrix = self._store_sku_matrix(
-                    item_id, matches, self._multi_sku_store_scope(item_id, product),
-                )
             if not matrix:
                 return None
             query = str(context.get("query") or "刚才查询的门店")
@@ -10800,20 +10881,6 @@ class V2Store(AppStore):
                 "store_context_update": context_update,
             }
 
-        # Store-aware yes/no answers are valid only when SKU applicability
-        # truly differs by physical store. Shared store scopes must keep amount
-        # follow-ups on the ordinary purchase-recommendation path.
-        if not self._multi_sku_store_scope(item_id, product).get("stores_differ"):
-            return None
-        matrix = list(context.get("store_sku_matrix") or [])
-        if not matrix:
-            return None
-
-        # An explicit amount-plan request always asks what to buy, even when
-        # its number happens to equal a real SKU denomination.
-        if self._amount_plan_request(text):
-            return None
-
         ordinal = None
         ordinal_patterns = (
             (0, r"第一(?:家|个)|第1(?:家|个)|前面那家"),
@@ -10824,6 +10891,89 @@ class V2Store(AppStore):
             if re.search(pattern, compact):
                 ordinal = index
                 break
+
+        # “多少钱” after a verified store lookup refers to every sellable SKU
+        # supported by that store.  Handle it before the generic package-price
+        # resolver and regardless of whether SKU store scopes differ.
+        generic_price_followup = bool(re.fullmatch(
+            r"(?:(?:那|那么|请问|所以|然后)?"
+            r"(?:这家|这个店|该店|那家|刚才那家|这里|"
+            r"第一(?:家|个)|第二(?:家|个)|第三(?:家|个)|第[123](?:家|个))的?)?"
+            r"(?:都|全部|所有|分别)?(?:是|卖)?(?:"
+            r"多少钱|多钱|什么价格|什么价|啥价|价钱(?:多少|呢)?|"
+            r"价格(?:是)?(?:多少|呢)?|售价(?:是)?(?:多少|呢)?|"
+            r"卖多少|怎么卖|怎么收)(?:呢|吗|呀)?",
+            compact,
+        ))
+        if generic_price_followup and matrix:
+            if ordinal is not None:
+                if ordinal >= len(matrix):
+                    return {
+                        "reply": "刚才的查询结果中没有这家门店，请发送完整门店名称重新查询。",
+                        "source": "门店上下文序号超出候选范围",
+                        "decision": "allow", "kind": "stores_clarify",
+                        "store_matches": [row.get("store") or {} for row in matrix],
+                        "store_query": str(context.get("query") or ""),
+                        "store_status": "ambiguous",
+                    }
+                price_rows = [matrix[ordinal]]
+            elif len(matrix) == 1:
+                price_rows = matrix
+            else:
+                names = "、".join(
+                    self._store_display_name(row.get("store") or {}) for row in matrix
+                )
+                return {
+                    "reply": f"刚才查询到多家门店：{names}。请发送完整门店名，或回复第一家、第二家再查询价格。",
+                    "source": "多门店上下文中的价格指代不明确",
+                    "decision": "allow", "kind": "stores_clarify",
+                    "store_matches": [row.get("store") or {} for row in matrix],
+                    "store_query": str(context.get("query") or ""),
+                    "store_status": "ambiguous",
+                }
+            price_rows = [
+                {
+                    **row,
+                    "supported_skus": [
+                        sku for sku in row.get("supported_skus") or []
+                        if sku.get("sellable", True)
+                    ],
+                }
+                for row in price_rows
+            ]
+            query = str(context.get("query") or "刚才查询的门店")
+            selected_keys = list(dict.fromkeys(
+                str(sku.get("sku_key") or "")
+                for row in price_rows for sku in row.get("supported_skus") or []
+                if sku.get("sku_key")
+            ))
+            context_update = {
+                "last_sku_catalog": True,
+                "selected_sku_keys": selected_keys,
+            }
+            return {
+                "reply": self._format_store_sku_matrix(query, price_rows),
+                "source": "当前会话已确认门店与真实SKU门店绑定",
+                "decision": "allow", "kind": "stores_sku_recommendation",
+                "store_matches": [row.get("store") or {} for row in price_rows],
+                "store_query": query, "store_status": "available",
+                "store_sku_matrix": price_rows,
+                "query_context_update": context_update,
+                "store_context_update": context_update,
+            }
+
+        # Store-aware yes/no answers are valid only when SKU applicability
+        # truly differs by physical store. Shared store scopes must keep amount
+        # follow-ups on the ordinary purchase-recommendation path.
+        if not self._multi_sku_store_scope(item_id, product).get("stores_differ"):
+            return None
+        if not matrix:
+            return None
+
+        # An explicit amount-plan request always asks what to buy, even when
+        # its number happens to equal a real SKU denomination.
+        if self._amount_plan_request(text):
+            return None
 
         # Treat short SKU questions as continuations of the most recent store
         # lookup. This must stay generic: every real SKU/denomination can be
@@ -10903,47 +11053,6 @@ class V2Store(AppStore):
             r"怎么买|如何买|怎么拍|如何拍|买几张|拍几张|叠加|几张",
             compact,
         ))
-        generic_price_followup = bool(re.fullmatch(
-            r"(?:(?:这家|这个店|该店|那家|刚才那家|"
-            r"第一(?:家|个)|第二(?:家|个)|第三(?:家|个)|第[123](?:家|个))的?)?"
-            r"(?:什么价格呢?|什么价呢?|价格(?:多少|呢)?|多少钱呢?|多钱呢?|卖多少|怎么卖)",
-            compact,
-        ))
-        if generic_price_followup and not selected_skus:
-            if ordinal is not None:
-                if ordinal >= len(matrix):
-                    return {
-                        "reply": "刚才的查询结果中没有这家门店，请发送完整门店名称重新查询。",
-                        "source": "门店上下文序号超出候选范围",
-                        "decision": "allow", "kind": "stores_clarify",
-                        "store_matches": [row.get("store") or {} for row in matrix],
-                        "store_query": str(context.get("query") or ""),
-                        "store_status": "ambiguous",
-                    }
-                price_rows = [matrix[ordinal]]
-            elif len(matrix) == 1:
-                price_rows = matrix
-            else:
-                names = "、".join(
-                    self._store_display_name(row.get("store") or {}) for row in matrix
-                )
-                return {
-                    "reply": f"刚才查询到多家门店：{names}。请发送完整门店名，或回复第一家、第二家再查询价格。",
-                    "source": "多门店上下文中的价格指代不明确",
-                    "decision": "allow", "kind": "stores_clarify",
-                    "store_matches": [row.get("store") or {} for row in matrix],
-                    "store_query": str(context.get("query") or ""),
-                    "store_status": "ambiguous",
-                }
-            query = str(context.get("query") or "刚才查询的门店")
-            return {
-                "reply": self._format_store_sku_matrix(query, price_rows),
-                "source": "当前会话最近一次门店可用SKU及实时售价",
-                "decision": "allow", "kind": "stores_sku_recommendation",
-                "store_matches": [row.get("store") or {} for row in price_rows],
-                "store_query": query, "store_status": "available",
-                "store_sku_matrix": price_rows,
-            }
         spec_followup = (
             bool(amount_followup)
             or bool(selected_skus and sku_followup_words)
@@ -11266,13 +11375,13 @@ class V2Store(AppStore):
                 evidence.append({"type": "branch", "value": candidate, "score": 90})
 
         # Some buyers naturally reverse a mall/operator name and its local
-        # qualifier ("凯德武胜" vs canonical "武胜凯德店"). Accept only an
-        # exact character multiset inside an already grounded administrative
-        # scope; this is intentionally narrower than fuzzy matching.
+        # qualifier ("前海万象" vs canonical "万象前海店"). An exact character
+        # multiset is substantially narrower than fuzzy matching and is safe
+        # without an explicit city: the caller accepts a unique result and
+        # sends competing cross-city candidates to confirmation instead.
         reordered_query = query_key[:-1] if query_key.endswith(("路", "街")) else query_key
         if (
-            score < 90 and (province_scope or city_scope or district_scope)
-            and len(reordered_query) >= 4
+            score < 90 and len(reordered_query) >= 4
         ):
             reordered_aliases = [
                 alias for alias in aliases

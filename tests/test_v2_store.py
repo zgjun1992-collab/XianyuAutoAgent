@@ -373,6 +373,86 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("美团200元代金券（售价119.8元）", followup["reply"])
         self.assertNotIn("抖音300元代金券", followup["reply"])
 
+    def test_store_price_followup_rebuilds_matrix_and_lists_all_supported_skus(self):
+        self.store.save_v2_product(
+            "10001", "门店多规格商品",
+            "港惠单人餐：售价158元\n港惠双人餐：售价298元",
+        )
+        self.store.save_ai_summary("10001", "两个真实在售规格", {
+            "sale_options": [
+                {"name": "港惠单人餐", "sale_price": "158"},
+                {"name": "港惠双人餐", "sale_price": "298"},
+            ],
+        })
+        shared = self.store.import_store_text(
+            "【广东省】\n【惠州】惠州港惠新天地店", "全部规格门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [shared["id"]],
+            )
+
+        initial = self.store.resolve_deterministic("10001", "港惠新能用吗")
+        self.assertEqual("available", initial["store_status"])
+        # Reproduce the persisted context of an ordinary store lookup: shared
+        # store scopes do not have to include a precomputed SKU matrix.
+        context = {
+            "query": initial["store_query"], "matches": initial["store_matches"],
+            "status": "available", "verified": True,
+        }
+        for question in ("多少钱", "什么价", "都是什么价格", "售价多少呢", "怎么卖"):
+            with self.subTest(question=question):
+                result = self.store.resolve_deterministic(
+                    "10001", question, store_context=context,
+                )
+                self.assertEqual("stores_sku_recommendation", result["kind"])
+                self.assertEqual(
+                    "当前会话已确认门店与真实SKU门店绑定", result["source"],
+                )
+                self.assertIn("惠州港惠新天地店", result["reply"])
+                self.assertIn("港惠单人餐（售价158元）", result["reply"])
+                self.assertIn("港惠双人餐（售价298元）", result["reply"])
+                self.assertNotIn("当前商品有以下套餐规格", result["reply"])
+
+    def test_store_price_followup_excludes_skus_not_bound_to_that_store(self):
+        self.store.save_v2_product(
+            "10001", "门店差异规格商品",
+            "港惠单人餐：售价158元\n港惠双人餐：售价298元\n拍前请咨询门店：售价999元",
+        )
+        self.store.save_ai_summary("10001", "三个真实在售规格", {
+            "sale_options": [
+                {"name": "港惠单人餐", "sale_price": "158"},
+                {"name": "港惠双人餐", "sale_price": "298"},
+                {"name": "拍前请咨询门店", "sale_price": "999"},
+            ],
+        })
+        target = self.store.import_store_text(
+            "【广东省】\n【惠州】惠州港惠新天地店", "港惠门店", [],
+        )
+        other = self.store.import_store_text(
+            "【广东省】\n【深圳】深圳测试店", "咨询规格门店", [],
+        )
+        for sku in self.store.get_v2_product("10001")["skus"]:
+            list_id = other["id"] if "咨询" in sku["sku_name"] else target["id"]
+            self.store.set_sku_store_rule(
+                "10001", sku["sku_key"], sku["sku_name"], "custom", [list_id],
+            )
+
+        initial = self.store.resolve_deterministic("10001", "港惠新能用吗")
+        context = {
+            "query": initial["store_query"], "matches": initial["store_matches"],
+            "status": initial["store_status"], "verified": True,
+        }
+        result = self.store.resolve_deterministic(
+            "10001", "多少钱", store_context=context,
+        )
+
+        self.assertEqual("stores_sku_recommendation", result["kind"])
+        self.assertIn("港惠单人餐（售价158元）", result["reply"])
+        self.assertIn("港惠双人餐（售价298元）", result["reply"])
+        self.assertNotIn("拍前请咨询门店", result["reply"])
+        self.assertNotIn("999元", result["reply"])
+
     def test_store_reply_preserves_meaningful_marketplace_sku_names(self):
         meituan = {
             "sku_key": "meituan-200", "sku_name": "美团200（可叠加2张）",
@@ -1138,6 +1218,7 @@ class V2StoreTests(unittest.TestCase):
 
         stock = self.store.resolve_deterministic("sale-price-name", "169.9还有吗")
         self.assertEqual("sku_availability", stock["kind"])
+
         self.assertIn("一绪【深圳】超值单人", stock["reply"])
         self.assertIn("售价169.9元", stock["reply"])
 
@@ -1174,6 +1255,45 @@ class V2StoreTests(unittest.TestCase):
             "sale-price-name", "消费169.9元怎么买",
         )
         self.assertNotEqual("sku_price_lookup", amount_plan["kind"])
+
+    def test_purchase_action_before_amount_matches_real_sku_sale_price(self):
+        platform_summary = json.dumps({
+            "title": "無添寿司代金券",
+            "price": "72",
+            "sku": [
+                {
+                    "skuId": "weekday-100", "priceInCent": 7200, "quantity": 200,
+                    "propertyList": [{"actualValueText": "工作日100（可叠加2张）"}],
+                },
+                {
+                    "skuId": "weekend-200", "priceInCent": 15600, "quantity": 500,
+                    "propertyList": [{"actualValueText": "周末200（仅限一张）"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "purchase-price-sku", "title": "無添寿司代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "72",
+        })
+
+        for message in (
+            "直接拍72的是吗", "可以直接拍72吗", "是不是拍72的",
+            "拍72", "72的可以直接拍吗", "72的是吗",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("purchase-price-sku", message)
+                self.assertEqual("sku_price_lookup", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertIn("工作日100（可叠加2张）", result["reply"])
+                self.assertIn("售价72元", result["reply"])
+                self.assertNotIn("消费金额", result["reply"])
+                self.assertNotIn("没有不超过", result["reply"])
+
+        consumption = self.store.resolve_deterministic(
+            "purchase-price-sku", "消费72怎么拍",
+        )
+        self.assertEqual("consumption_plan", consumption["kind"])
+        self.assertNotIn("直接选择“工作日100", consumption["reply"])
 
     def test_synced_platform_skus_replace_stale_ai_rows_and_keep_store_bindings(self):
         self.store.save_v2_product(
@@ -6390,6 +6510,33 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertIn("可以用，根据“青岛市市北区万科未来城”", result["reply"])
 
+    def test_unique_reordered_mall_name_matches_without_city_prefix(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳万象前海店、深圳怀德万象汇店",
+            "深圳门店", ["10001"],
+        )
+
+        result = self.store.resolve_deterministic("10001", "前海万象店")
+
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("available", result["store_status"])
+        self.assertEqual(["深圳万象前海店"], [
+            row["branch"] for row in result["store_matches"]
+        ])
+        self.assertIn("深圳万象前海店", result["reply"])
+        self.assertNotIn("怀德万象汇店", result["reply"])
+
+    def test_reordered_mall_name_across_cities_requires_confirmation(self):
+        self.store.import_store_text(
+            "【广东省】\n【深圳】深圳万象前海店\n【广州】广州万象前海店",
+            "跨城市门店", ["10001"],
+        )
+
+        result = self.store.search_store("10001", "前海万象店")
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertEqual(2, len(result["matches"]))
+
     def test_county_level_city_alias_matches_parent_city_store_branch(self):
         self.store.import_store_text(
             "【浙江省】\n【温州】南虹广场店、五马街店",
@@ -7468,6 +7615,39 @@ class V2StoreTests(unittest.TestCase):
         profile = classify_buyer_message("好的，100抵扣券怎么拍")
         self.assertEqual("purchase", profile["primary_intent"])
         self.assertEqual("denomination_purchase", profile["primary_subtype"])
+
+    def test_bare_total_value_coupon_query_matches_real_bundle_sku(self):
+        self.store.save_v2_product(
+            "bare-total-coupon", "同仁四季美团电子券",
+            "同仁四季300（限一）：售价212.8元，发300元券1张\n"
+            "同仁四季100x2：售价113.8元，发100元券2张",
+        )
+        self.store.save_ai_summary("bare-total-coupon", "同仁四季真实规格", {
+            "products": [
+                {
+                    "name": "同仁四季300（限一）", "option_type": "代金券",
+                    "face_value": "300", "sale_price": "212.8",
+                    "composition": "300元券1张", "max_stack": 1,
+                },
+                {
+                    "name": "同仁四季100x2", "option_type": "代金券",
+                    "face_value": "200", "sale_price": "113.8",
+                    "composition": "100元券2张", "max_stack": 2,
+                },
+            ],
+        })
+
+        for message in ("200的代金券", "200元代金券", "200元的券", "我要200元代金券"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("bare-total-coupon", message)
+                self.assertEqual("sku_availability", result["kind"])
+                self.assertEqual("allow", result["decision"])
+                self.assertIn("同仁四季100x2", result["reply"])
+                self.assertIn("售价113.8元", result["reply"])
+                self.assertIn("发放2张100元代金券", result["reply"])
+                self.assertIn("共可抵扣200元", result["reply"])
+                self.assertNotIn("同仁四季300", result["reply"])
+                self.assertNotIn("暂时无法准确回答", result["reply"])
 
     def test_package_content_only_denies_when_sku_has_explicit_negative_evidence(self):
         product = {
