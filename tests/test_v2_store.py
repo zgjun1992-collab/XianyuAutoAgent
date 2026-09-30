@@ -1279,6 +1279,8 @@ class V2StoreTests(unittest.TestCase):
         for message in (
             "直接拍72的是吗", "可以直接拍72吗", "是不是拍72的",
             "拍72", "72的可以直接拍吗", "72的是吗",
+            "我拍72那个就行吧", "我要72的", "选72的对吧",
+            "点72那个是不是", "72怎么拍", "买72元的券",
         ):
             with self.subTest(message=message):
                 result = self.store.resolve_deterministic("purchase-price-sku", message)
@@ -1294,6 +1296,98 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertEqual("consumption_plan", consumption["kind"])
         self.assertNotIn("直接选择“工作日100", consumption["reply"])
+
+        denomination = self.store.resolve_deterministic(
+            "purchase-price-sku", "买100元的券",
+        )
+        self.assertNotEqual("sku_price_lookup", denomination["kind"])
+        self.assertIn("100元代金券", denomination["reply"])
+
+    def test_sale_price_selected_sku_routes_followup_facts_to_same_sku(self):
+        platform_summary = json.dumps({
+            "title": "無添寿司代金券",
+            "price": "72",
+            "sku": [
+                {
+                    "skuId": "weekday-100", "priceInCent": 7200, "quantity": 200,
+                    "propertyList": [{"actualValueText": "工作日100（可叠加2张）"}],
+                },
+                {
+                    "skuId": "weekend-200", "priceInCent": 15600, "quantity": 500,
+                    "propertyList": [{"actualValueText": "周末200（仅限一张）"}],
+                },
+            ],
+        }, ensure_ascii=False)
+        self.store.upsert_synced_product({
+            "item_id": "price-selected-facts", "title": "無添寿司代金券",
+            "platform_summary": platform_summary, "image_urls": [], "price": "72",
+        })
+
+        for message in (
+            "页面显示72的是哪个", "标价72的是啥", "显示72的是什么",
+            "最低价72是哪款",
+        ):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("price-selected-facts", message)
+                self.assertEqual("sku_price_lookup", result["kind"])
+                self.assertIn("工作日100（可叠加2张）", result["reply"])
+                self.assertIn("售价72元", result["reply"])
+
+        confirmations = {
+            "工作日100是72吗": ("allow", "是的"),
+            "72这个是工作日券吗": ("allow", "是的"),
+            "周末200是72吗": ("deny", "当前售价156元"),
+        }
+        for message, (decision, expected) in confirmations.items():
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("price-selected-facts", message)
+                self.assertEqual("sku_price_confirmation", result["kind"])
+                self.assertEqual(decision, result["decision"])
+                self.assertIn(expected, result["reply"])
+                self.assertTrue(result["query_context_update"]["selected_sku_key"])
+
+        face_relation = self.store.resolve_deterministic(
+            "price-selected-facts", "72是100代金券吗",
+        )
+        self.assertEqual("voucher_value", face_relation["kind"])
+        self.assertIn("工作日100（可叠加2张）售价72元", face_relation["reply"])
+
+        for message in ("72发什么券", "72买到几张券", "72一张对吧"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("price-selected-facts", message)
+                self.assertEqual("sku_price_details", result["kind"])
+                self.assertIn("售价72元", result["reply"])
+                self.assertIn("发放100元代金券", result["reply"])
+                self.assertIn("抵扣100元", result["reply"])
+
+        for message in ("72的能叠加几张", "72最多可以用多少张"):
+            with self.subTest(message=message):
+                result = self.store.resolve_deterministic("price-selected-facts", message)
+                self.assertEqual("sku_price_stacking", result["kind"])
+                self.assertIn("工作日100（可叠加2张）", result["reply"])
+                self.assertIn("最多使用2张", result["reply"])
+
+        weekday = self.store.resolve_deterministic(
+            "price-selected-facts", "72的工作日能用吗",
+        )
+        self.assertEqual("sku_price_day_use", weekday["kind"])
+        self.assertEqual("allow", weekday["decision"])
+        self.assertIn("支持工作日使用", weekday["reply"])
+
+        weekend = self.store.resolve_deterministic(
+            "price-selected-facts", "72的周末能用吗",
+        )
+        self.assertEqual("sku_price_day_use", weekend["kind"])
+        self.assertEqual("deny", weekend["decision"])
+        self.assertIn("仅支持工作日使用", weekend["reply"])
+        self.assertIn("周末200（仅限一张）（售价156元）", weekend["reply"])
+
+        two = self.store.resolve_deterministic(
+            "price-selected-facts", "72的买两张多少钱",
+        )
+        self.assertEqual("sku_price_quantity", two["kind"])
+        self.assertIn("共支付144元", two["reply"])
+        self.assertIn("发放2张100元代金券", two["reply"])
 
     def test_synced_platform_skus_replace_stale_ai_rows_and_keep_store_bindings(self):
         self.store.save_v2_product(
@@ -3027,6 +3121,43 @@ class V2StoreTests(unittest.TestCase):
         bound = self.store.bound_store_lists("10001")
         self.assertEqual([second["id"]], [item["id"] for item in bound])
         self.assertNotEqual(first["id"], second["id"])
+
+    def test_platform_extracted_store_list_cannot_leak_to_another_product(self):
+        manual = self.store.import_store_list(self.create_store_sheet(), "当前商品门店", ["10001"])
+        foreign = self.store._save_store_records(
+            [{
+                "brand": "其他品牌", "branch": "无关门店", "province": "广东",
+                "city": "深圳", "district": "龙岗", "address": "测试路",
+                "phone": "", "business_hours": "",
+            }],
+            "其他商品自动门店", "闲鱼页面自动提取:20002", ["20002"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "来自其他商品"):
+            self.store.set_product_store_lists("10001", [foreign["id"]])
+        self.assertEqual(
+            [manual["id"]], [row["id"] for row in self.store.bound_store_lists("10001")]
+        )
+        with self.assertRaisesRegex(ValueError, "来自其他商品"):
+            self.store.bind_store_list(foreign["id"], ["10001"])
+
+        # Legacy databases may already contain this invalid relation.  Reads
+        # must ignore it immediately, and opening the database again removes it.
+        with self.store._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO product_store_lists(item_id,list_id) VALUES(?,?)",
+                ("10001", foreign["id"]),
+            )
+        self.assertEqual(
+            [manual["id"]], [row["id"] for row in self.store.bound_store_lists("10001")]
+        )
+        reopened = V2Store(self.store.db_path)
+        with reopened._connect() as conn:
+            dirty_count = conn.execute(
+                "SELECT COUNT(*) FROM product_store_lists WHERE item_id=? AND list_id=?",
+                ("10001", foreign["id"]),
+            ).fetchone()[0]
+        self.assertEqual(0, dirty_count)
 
     def test_product_image_asset_match_is_scoped_and_has_cooldown(self):
         image_path = os.path.join(self.temp.name, "menu.png")

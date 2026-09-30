@@ -879,6 +879,31 @@ class V2Store(AppStore):
                 conn.execute(
                     "ALTER TABLE refund_orders ADD COLUMN order_url TEXT NOT NULL DEFAULT ''"
                 )
+            # A store list extracted from one Xianyu item is item-specific.  Old
+            # desktop builds allowed that list to be attached to another item,
+            # which made unrelated store prose look like the current product's
+            # availability.  Remove only those provably foreign relationships;
+            # manually imported lists remain intentionally shareable.
+            conn.execute(
+                """DELETE FROM product_store_lists
+                   WHERE EXISTS (
+                       SELECT 1 FROM store_lists sl
+                       WHERE sl.id=product_store_lists.list_id
+                         AND sl.source_file LIKE '闲鱼页面自动提取:%'
+                         AND SUBSTR(sl.source_file, LENGTH('闲鱼页面自动提取:') + 1)
+                             <> product_store_lists.item_id
+                   )"""
+            )
+            conn.execute(
+                """DELETE FROM product_sku_store_lists
+                   WHERE EXISTS (
+                       SELECT 1 FROM store_lists sl
+                       WHERE sl.id=product_sku_store_lists.list_id
+                         AND sl.source_file LIKE '闲鱼页面自动提取:%'
+                         AND SUBSTR(sl.source_file, LENGTH('闲鱼页面自动提取:') + 1)
+                             <> product_sku_store_lists.item_id
+                   )"""
+            )
         # Existing installations receive an initial editable first reply on upgrade.
         with self._connect() as conn:
             pending_first_replies = [
@@ -6120,6 +6145,62 @@ class V2Store(AppStore):
                     approximate.append(sku)
             return normalized, approximate, bool(approximate)
 
+        def selected_context(options: List[Dict]) -> Dict:
+            keys = [
+                str(sku.get("sku_key") or self.sku_key_for_option(sku))
+                for sku in options
+            ]
+            return {
+                "selected_sku_key": keys[0] if len(keys) == 1 else "",
+                "selected_sku_keys": keys,
+                "selected_sku_name": (
+                    str(options[0].get("sku_name") or "").strip()
+                    if len(options) == 1 else ""
+                ),
+            }
+
+        def named_sku_matches(subject: str) -> List[Dict]:
+            """Match a buyer-facing fragment to one real SKU name/denomination."""
+            subject_key = normalize_text(subject).lower()
+            subject_key = re.sub(
+                r"^(?:这个|那个|这款|那款)|"
+                r"(?:代金券|优惠券|抵扣券|现金券|券|规格|套餐|商品|款式)$",
+                "", subject_key,
+            )
+            if not subject_key:
+                return []
+            matched = []
+            for sku in sku_catalog:
+                name_key = normalize_text(sku.get("sku_name") or "").lower()
+                comparable_name = re.sub(
+                    r"(?:代金券|优惠券|抵扣券|现金券|券|规格|套餐|商品|款式)",
+                    "", name_key,
+                )
+                face = self._format_number(sku.get("face_value") or "")
+                if (
+                    subject_key in comparable_name
+                    or comparable_name in subject_key
+                    or (face and subject_key == face)
+                ):
+                    matched.append(sku)
+            return matched
+
+        def one_available_price_sku(raw_price: str) -> tuple[str, Optional[Dict], bool, List[Dict]]:
+            price, matched, approximate = sale_price_matches(raw_price)
+            available = [sku for sku in matched if sku.get("sellable", True)]
+            return price, available[0] if len(available) == 1 else None, approximate, available
+
+        def sku_detail_reply(sku: Dict, price: str, *, prefix: str = "") -> str:
+            name = buyer_sku_name(sku)
+            actual_price = self._format_number(sku.get("sale_price") or price)
+            option = {**sku, "name": name}
+            contents = self._purchase_contents_label(option)
+            total = self._option_total_value(option)
+            reply = f"{prefix}售价{actual_price}元的是{name}，购买1份后发放{contents}"
+            if total:
+                reply += f"，共可抵扣{total}元"
+            return reply + "。"
+
         # A bare number in "169.9的是哪个券" is the marketplace sale price,
         # not a voucher denomination.  Resolve it against the authoritative
         # source-SKU catalog before denomination/consumption planning gets a
@@ -6135,6 +6216,297 @@ class V2Store(AppStore):
         sku_word = r"(?:券|代金券|优惠券|规格|套餐|商品|选项|款式|档位|价位|SKU)?"
         question_tail = r"(?:吗|么|嘛|呀|啊|呢|哦|哈|哇)?"
         price_token = r"(?:￥|¥)?(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?"
+
+        # A named SKU and a displayed price form a direct fact check, for
+        # example “工作日100是72吗 / 72这个是工作日券吗”.  Match both sides
+        # against the source SKU instead of treating the second number as a
+        # bill amount or a voucher denomination.
+        named_price_match = None
+        for pattern in (
+            rf"(?P<name>.+?)(?:(?:售价|卖价|价格|价钱)(?:是|为)?|(?:是|为|卖))"
+            rf"{price_token}(?:的)?(?:对不对|是不是|对吧|没错吧|是吗|吗)",
+            rf"{price_token}(?:这个|那个|这款|那款|的)?(?:是|为)"
+            rf"(?P<name>.+?)(?:对不对|是不是|对吧|没错吧|是吗|吗)",
+        ):
+            named_price_match = re.fullmatch(pattern, compact, re.I)
+            if named_price_match:
+                break
+        plain_face_relation = bool(named_price_match and re.fullmatch(
+            r"\d+(?:\.\d+)?(?:元)?(?:的)?(?:代金券|优惠券|抵扣券|现金券|券)?",
+            str(named_price_match.group("name") or ""),
+        ))
+        if plain_face_relation:
+            # “200的券是108吗 / 108是200的券吗” is a sale-price versus
+            # denomination/composition relationship.  Preserve the richer
+            # voucher-value answer.  If its date-aware path omits a currently
+            # inapplicable SKU, fall back to the source SKU relationship itself;
+            # the buyer is checking what the SKU is, not asking whether it can
+            # be redeemed today.
+            relationship = self.voucher_value_confirmation_reply(product, compact)
+            if relationship:
+                return {
+                    "reply": relationship,
+                    "source": "当前商品真实售价、面额与发券组成",
+                    "decision": "allow", "kind": "voucher_value",
+                }
+            face_match = re.search(r"\d+(?:\.\d+)?", named_price_match.group("name"))
+            requested_face = self._format_number(face_match.group(0) if face_match else "")
+            asked_price, price_sku, _approximate, _available = one_available_price_sku(
+                named_price_match.group("price")
+            )
+            if price_sku and requested_face:
+                actual_total = self._option_total_value(price_sku)
+                actual_face = self._format_number(price_sku.get("face_value") or "")
+                option = {**price_sku, "name": buyer_sku_name(price_sku)}
+                if requested_face in {actual_total, actual_face}:
+                    return {
+                        "reply": "是的，" + self._atomic_voucher_option_text(option) + "。",
+                        "source": "当前商品源SKU售价、面额与发券组成",
+                        "decision": "allow", "kind": "voucher_value",
+                        "query_context_update": selected_context([price_sku]),
+                    }
+                face_skus = [
+                    sku for sku in sku_catalog
+                    if sku.get("sellable", True) and requested_face in {
+                        self._format_number(sku.get("face_value") or ""),
+                        self._option_total_value(sku),
+                    }
+                ]
+                correction = ""
+                if len(face_skus) == 1:
+                    correction = (
+                        f"；{requested_face}元券对应{buyer_sku_name(face_skus[0])}，"
+                        f"售价{self._format_number(face_skus[0].get('sale_price') or '')}元"
+                    )
+                return {
+                    "reply": (
+                        f"不是，售价{asked_price}元的是{buyer_sku_name(price_sku)}，"
+                        f"购买后发放{self._purchase_contents_label(option)}{correction}。"
+                    ),
+                    "source": "当前商品源SKU售价、面额与发券组成",
+                    "decision": "deny", "kind": "voucher_value",
+                    "query_context_update": selected_context([price_sku]),
+                }
+            named_price_match = None
+        if named_price_match:
+            named = [
+                sku for sku in named_sku_matches(named_price_match.group("name"))
+                if sku.get("sellable", True)
+            ]
+            if len(named) == 1:
+                sku = named[0]
+                asked_price = self._format_number(named_price_match.group("price"))
+                actual_price = self._format_number(sku.get("sale_price") or "")
+                name = buyer_sku_name(sku)
+                if asked_price == actual_price:
+                    reply = sku_detail_reply(sku, actual_price, prefix="是的，")
+                    decision = "allow"
+                else:
+                    _, price_sku, approximate, _ = one_available_price_sku(asked_price)
+                    correction = ""
+                    if price_sku and price_sku is not sku:
+                        qualifier = "整数价格对应" if approximate else "对应"
+                        correction = f"；{asked_price}元{qualifier}{buyer_sku_name(price_sku)}"
+                    reply = f"不是，{name}当前售价{actual_price}元{correction}。"
+                    decision = "deny"
+                return {
+                    "reply": reply,
+                    "source": "当前商品源SKU名称、售价与发券组成",
+                    "decision": decision, "kind": "sku_price_confirmation",
+                    "query_context_update": selected_context(named),
+                }
+
+        # Price-selected SKU details: issuance/composition, stack limit and
+        # weekday/weekend applicability all belong to the matched SKU.  These
+        # checks must run before generic stacking/date handlers, which otherwise
+        # see only the number and may answer for a different SKU.
+        quantity_price_match = None
+        for pattern in (
+            rf"{price_token}(?:的|这个|那个|这款|那款)?"
+            rf"(?:买|要|拍|来|购买|下单)?"
+            rf"(?P<count>[一二两三四五六七八九十百俩仨\d]+)"
+            rf"(?P<unit>张|份|套|个)(?:一共|合计|总共)?"
+            rf"(?:多少钱|多钱|什么价|啥价|要付多少|总价多少|怎么收费)",
+            rf"(?:买|要|拍|来|购买|下单)"
+            rf"(?P<count>[一二两三四五六七八九十百俩仨\d]+)"
+            rf"(?P<unit>张|份|套|个){price_token}(?:的|这个|那个|这款|那款)?"
+            rf"(?:多少钱|多钱|什么价|啥价|要付多少|总价多少|怎么收费)?",
+        ):
+            quantity_price_match = re.fullmatch(pattern, compact, re.I)
+            if quantity_price_match:
+                break
+        if quantity_price_match:
+            count = self._chinese_count(quantity_price_match.group("count"))
+            price, sku, _approximate, available = one_available_price_sku(
+                quantity_price_match.group("price")
+            )
+            if sku and count and 0 < count <= 99:
+                name = buyer_sku_name(sku)
+                actual_price = Decimal(str(sku.get("sale_price") or price))
+                total_price = self._format_number(actual_price * count)
+                option = {**sku, "name": name}
+                contents = self._purchase_contents_label(option, count)
+                unit_total = self._option_total_value(option)
+                reply = f"购买{count}份{name}，共支付{total_price}元"
+                if contents != "当前商品":
+                    reply += f"，发放{contents}"
+                if unit_total:
+                    reply += f"，共可抵扣{self._format_number(Decimal(unit_total) * count)}元"
+                limit = self._normalize_stack_limit(sku.get("max_stack") or "")
+                if limit:
+                    reply += f"；该规格每次最多使用{limit}张同面额券"
+                reply += "。"
+                return {
+                    "reply": reply,
+                    "source": "售价锁定的当前商品源SKU与购买数量",
+                    "decision": "allow", "kind": "sku_price_quantity",
+                    "query_context_update": selected_context([sku]),
+                }
+            if available:
+                return {
+                    "reply": "该售价对应多个规格，请补充规格名称后再计算购买数量。",
+                    "source": "售价锁定的当前商品源SKU与购买数量",
+                    "decision": "allow", "kind": "sku_price_quantity",
+                    "query_context_update": selected_context(available),
+                }
+
+        detail_match = None
+        for pattern in (
+            rf"{price_token}(?:的|这个|那个|这款|那款)?"
+            rf"(?:买到|收到|拿到|发|给|包含|对应)(?:的)?"
+            rf"(?:是)?(?:什么|啥|几张|多少张|多大面额|多少面额)?(?:代金券|优惠券|券)?{question_tail}",
+            rf"{price_token}(?:的)?(?:是|为)?"
+            rf"(?:一|二|两|三|四|五|六|七|八|九|十|\d+)张(?:代金券|优惠券|券)?"
+            rf"(?:对不对|是不是|对吧|没错吧|是吗|吗)",
+        ):
+            detail_match = re.fullmatch(pattern, compact, re.I)
+            if detail_match:
+                break
+        if detail_match:
+            price, sku, _approximate, available = one_available_price_sku(
+                detail_match.group("price")
+            )
+            if sku:
+                return {
+                    "reply": sku_detail_reply(sku, price),
+                    "source": "当前商品源SKU售价与发券组成",
+                    "decision": "allow", "kind": "sku_price_details",
+                    "query_context_update": selected_context([sku]),
+                }
+            if available:
+                choices = "、".join(buyer_sku_name(item) for item in available)
+                return {
+                    "reply": f"该售价对应多个规格：{choices}。请先确认具体规格。",
+                    "source": "当前商品源SKU售价与发券组成",
+                    "decision": "allow", "kind": "sku_price_details",
+                    "query_context_update": selected_context(available),
+                }
+
+        stack_match = None
+        for pattern in (
+            rf"{price_token}(?:的|这个|那个|这款|那款)?(?:一次)?"
+            rf"(?:能不能|可不可以|可以|能)?(?:叠加|同时用|一起用|混用)?"
+            rf"(?:最多)?(?:能|可以)?(?:用|叠加)?(?:几|多少)张{question_tail}",
+            rf"{price_token}(?:的|这个|那个|这款|那款)?(?:叠加|使用)"
+            rf"(?:上限|限制)(?:是|为)?(?:几|多少)张{question_tail}",
+        ):
+            stack_match = re.fullmatch(pattern, compact, re.I)
+            if stack_match:
+                break
+        if stack_match:
+            price, sku, _approximate, available = one_available_price_sku(
+                stack_match.group("price")
+            )
+            if sku:
+                actual_price = self._format_number(sku.get("sale_price") or price)
+                name = buyer_sku_name(sku)
+                limit = self._normalize_stack_limit(sku.get("max_stack") or "")
+                if limit:
+                    reply = f"售价{actual_price}元的是{name}，该规格每次最多使用{limit}张同面额券。"
+                else:
+                    reply = (
+                        f"售价{actual_price}元的是{name}，但当前资料未明确该规格每次最多使用几张。"
+                    )
+                return {
+                    "reply": reply,
+                    "source": "当前商品源SKU售价与单规格叠加上限",
+                    "decision": "allow", "kind": "sku_price_stacking",
+                    "query_context_update": selected_context([sku]),
+                }
+            if available:
+                return {
+                    "reply": "该售价对应多个规格，请补充规格名称后再确认叠加数量。",
+                    "source": "当前商品源SKU售价与单规格叠加上限",
+                    "decision": "allow", "kind": "sku_price_stacking",
+                    "query_context_update": selected_context(available),
+                }
+
+        day_match = None
+        for pattern in (
+            rf"{price_token}(?:的|这个|那个|这款|那款)?(?:在)?"
+            rf"(?P<day>工作日|平日|周一至周五|周末|星期六日|节假日|法定节假日)"
+            rf"(?:能不能|可不可以|可以|能|是否|还)?(?:使用|用|核销|可用){question_tail}",
+            rf"(?P<day>工作日|平日|周一至周五|周末|星期六日|节假日|法定节假日)"
+            rf"(?:能不能|可不可以|可以|能|是否|还)?(?:使用|用|核销)?"
+            rf"{price_token}(?:的|这个|那个|这款|那款)?{question_tail}",
+        ):
+            day_match = re.fullmatch(pattern, compact, re.I)
+            if day_match:
+                break
+        if day_match:
+            price, sku, _approximate, available = one_available_price_sku(
+                day_match.group("price")
+            )
+            if sku:
+                requested_day = self._requested_day_type(day_match.group("day"))
+                days = self._option_day_types(sku)
+                if requested_day and days:
+                    actual_price = self._format_number(sku.get("sale_price") or price)
+                    name = buyer_sku_name(sku)
+                    allowed = self._option_matches_time(sku, requested_day)
+                    requested_label = {
+                        "weekday": "工作日", "weekend": "周末", "holiday": "法定节假日",
+                    }.get(requested_day, day_match.group("day"))
+                    if allowed:
+                        reply = f"可以，售价{actual_price}元的{name}支持{requested_label}使用。"
+                        decision = "allow"
+                    else:
+                        labels = [
+                            label for key, label in (
+                                ("weekday", "工作日"), ("weekend", "周末"),
+                                ("holiday", "法定节假日"), ("any", "每日"),
+                            ) if key in days
+                        ]
+                        reply = (
+                            f"不可以，售价{actual_price}元的是{name}，"
+                            f"该规格仅支持{'/'.join(labels) or '已标明日期'}使用。"
+                        )
+                        alternatives = [
+                            item for item in sku_catalog
+                            if item is not sku and item.get("sellable", True)
+                            and self._option_matches_time(item, requested_day)
+                            and requested_day in self._option_day_types(item)
+                        ]
+                        if alternatives:
+                            reply += "可改选" + "、".join(
+                                f"{buyer_sku_name(item)}（售价{self._format_number(item.get('sale_price') or '')}元）"
+                                for item in alternatives
+                            ) + "。"
+                        decision = "deny"
+                    return {
+                        "reply": reply,
+                        "source": "当前商品源SKU售价与该规格适用日期",
+                        "decision": decision, "kind": "sku_price_day_use",
+                        "query_context_update": selected_context([sku]),
+                    }
+            if available:
+                return {
+                    "reply": "该售价对应多个规格，请补充规格名称后再确认使用日期。",
+                    "source": "当前商品源SKU售价与该规格适用日期",
+                    "decision": "allow", "kind": "sku_price_day_use",
+                    "query_context_update": selected_context(available),
+                }
+
         for pattern in (
             rf"(?:售价|卖价|价格|价钱)?{price_token}(?:的)?"
             rf"(?:对应(?:的)?(?:是)?|是|为|卖(?:的)?(?:是)?|属于)?"
@@ -6148,6 +6520,14 @@ class V2Store(AppStore):
             rf"(?:售价|卖价|价格|价钱)?{price_token}(?:的)?"
             rf"(?:券|代金券|优惠券|规格|套餐|商品|选项|款式|档位|价位)"
             rf"(?:对应(?:的)?(?:是)?|是|为)?{choice_word}{sku_word}{question_tail}",
+            rf"(?:页面|商品页|详情页|链接|选项|规格)(?:上|里|中)?"
+            rf"(?:显示|标价|写着|写的|有|是)?{price_token}(?:的)?"
+            rf"(?:是|对应)?{choice_word}{sku_word}{question_tail}",
+            rf"(?:(?:页面|商品页|详情页|链接|选项|规格)(?:上|里|中)?)?"
+            rf"(?:显示|标价|写着|写的|最低价|最便宜)(?:是|为)?"
+            rf"{price_token}(?:的)?(?:是|对应)?{choice_word}{sku_word}{question_tail}",
+            rf"(?:最低价|最便宜(?:的)?)(?:是|为)?{price_token}(?:的)?"
+            rf"(?:是|对应)?{choice_word}{sku_word}{question_tail}",
         ):
             identity_match = re.fullmatch(pattern, compact, re.I)
             if identity_match:
@@ -6157,22 +6537,43 @@ class V2Store(AppStore):
         # sale price, not a 72-yuan bill or voucher denomination.  Resolve the
         # amount only when it actually matches a source SKU; otherwise let the
         # ordinary purchase/consumption resolver continue.
+        explicit_voucher_amount = re.search(
+            r"(?P<amount>\d+(?:\.\d+)?)(?:元|块)?(?:的)?"
+            r"(?:代金券|优惠券|抵扣券|现金券|抵用券|券)",
+            compact,
+        )
+        real_voucher_values = {
+            value for sku in sku_catalog for value in (
+                self._format_number(sku.get("face_value") or ""),
+                self._option_total_value(sku),
+            ) if value
+        }
+        explicit_real_denomination = bool(
+            explicit_voucher_amount
+            and self._format_number(explicit_voucher_amount.group("amount"))
+            in real_voucher_values
+        )
         if not identity_match and not re.search(
             r"消费|账单|预算|用餐|结账|买单|应付|抵扣|合计|一共|总共",
             compact,
-        ) and not re.search(
-            r"\d+(?:\.\d+)?(?:元|块)?(?:的)?(?:代金券|优惠券|抵扣券|现金券|抵用券|券)",
-            compact,
-        ):
+        ) and not explicit_real_denomination:
             for pattern in (
-                r"(?:(?:是不是|是否|确认)?(?:可以|能|要|就|就是|应该)?(?:直接)?)"
-                r"(?:拍|买|下单|购买|选择)(?:售价|价格|卖价)?"
+                r"(?:我)?(?:(?:是不是|是否|确认)?(?:可以|能|要|就|就是|应该|想|想要)?(?:直接)?)"
+                r"(?:拍|买|下单|购买|选择|选|点)(?:售价|价格|卖价)?"
                 r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?"
-                r"(?:的|那个|那款|这个|这款|这一档|这个规格)?"
-                r"(?:是吗|对吗|没错吧|可以吗|行吗|吗)?",
+                r"(?:的)?(?:代金券|优惠券|券)?"
+                r"(?:那个|那款|这个|这款|这一档|这个规格)?"
+                r"(?:就行|就可以|可以|行|对|没错|是)?"
+                r"(?:是不是|是吗|对吗|没错吧|可以吗|行吗|吧|吗)?",
+                r"(?:我)?(?:要|想要|就要|选|选择|点)"
+                r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?"
+                r"(?:的|那个|那款|这个|这款|这一档|这个规格)"
+                r"(?:就行|就可以|可以|行|对|没错|是)?(?:是吗|对吗|没错吧|可以吗|行吗|吧|吗)?",
                 r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?(?:的)?"
                 r"(?:可以|能|要|就|就是|应该)?直接"
-                r"(?:拍|买|下单|购买|选择)(?:是吗|对吗|没错吧|可以吗|行吗|吗)?",
+                r"(?:拍|买|下单|购买|选择|选|点)(?:是吗|对吗|没错吧|可以吗|行吗|吗)?",
+                r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?(?:的)?"
+                r"(?:怎么|如何)(?:拍|买|下单|购买|选择|选)",
                 r"(?P<price>\d+(?:\.\d+)?)(?:元|块钱|块)?(?:的)?"
                 r"(?:是吗|对吗|没错吧)",
             ):
@@ -9465,6 +9866,41 @@ class V2Store(AppStore):
             output.append(item)
         return output
 
+    @staticmethod
+    def _platform_store_source_item(source_file: object) -> str:
+        """Return the owner item for a platform-extracted store list."""
+        value = str(source_file or "").strip()
+        prefix = "闲鱼页面自动提取:"
+        return value[len(prefix):].strip() if value.startswith(prefix) else ""
+
+    @classmethod
+    def _store_list_belongs_to_item(cls, store_list: Dict, item_id: object) -> bool:
+        owner_item_id = cls._platform_store_source_item(store_list.get("source_file"))
+        return not owner_item_id or owner_item_id == str(item_id or "").strip()
+
+    def _validated_store_list_ids_for_item(
+        self, item_id: str, list_ids: Iterable[object]
+    ) -> List[int]:
+        normalized_ids = sorted({int(value) for value in list_ids if str(value).strip()})
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT id,name,source_file FROM store_lists WHERE id IN ({placeholders})",
+                normalized_ids,
+            ).fetchall()]
+        by_id = {int(row["id"]): row for row in rows}
+        if set(normalized_ids) != set(by_id):
+            raise ValueError("选择的门店表不存在或已被删除")
+        foreign = [
+            row for row in rows if not self._store_list_belongs_to_item(row, item_id)
+        ]
+        if foreign:
+            names = "、".join(str(row.get("name") or row["id"]) for row in foreign)
+            raise ValueError(f"门店表“{names}”来自其他商品，不能绑定到当前商品")
+        return normalized_ids
+
     def bound_store_lists(self, item_id: str) -> List[Dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -9473,7 +9909,10 @@ class V2Store(AppStore):
                    WHERE psl.item_id=? ORDER BY sl.id DESC""",
                 (item_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            item for item in map(dict, rows)
+            if self._store_list_belongs_to_item(item, item_id)
+        ]
 
     @classmethod
     def sku_key_for_option(cls, option: Dict) -> str:
@@ -9760,15 +10199,7 @@ class V2Store(AppStore):
         valid_keys = {row["sku_key"]: row for row in self.list_product_skus(item_id)}
         if sku_key not in valid_keys:
             raise ValueError("商品规格不存在或已经失效")
-        ids = sorted({int(value) for value in (list_ids or [])})
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            with self._connect() as conn:
-                existing_ids = {int(row[0]) for row in conn.execute(
-                    f"SELECT id FROM store_lists WHERE id IN ({placeholders})", ids
-                ).fetchall()}
-            if existing_ids != set(ids):
-                raise ValueError("选择的门店表不存在或已被删除")
+        ids = self._validated_store_list_ids_for_item(item_id, list_ids or [])
         now = self._now()
         with self._connect() as conn:
             conn.execute(
@@ -12340,9 +12771,14 @@ class V2Store(AppStore):
         return False
 
     def bind_store_list(self, list_id: int, item_ids: List[str]):
+        normalized_item_ids = sorted({
+            str(value).strip() for value in item_ids if str(value).strip()
+        })
+        for item_id in normalized_item_ids:
+            self._validated_store_list_ids_for_item(item_id, [list_id])
         with self._connect() as conn:
             conn.execute("DELETE FROM product_store_lists WHERE list_id=?", (list_id,))
-            for item_id in {str(value).strip() for value in item_ids if str(value).strip()}:
+            for item_id in normalized_item_ids:
                 conn.execute(
                     "INSERT INTO product_store_lists(item_id,list_id) VALUES(?,?)",
                     (item_id, list_id),
@@ -12352,7 +12788,7 @@ class V2Store(AppStore):
         item_id = str(item_id or "").strip()
         if not item_id:
             raise ValueError("商品ID不能为空")
-        normalized_ids = {int(value) for value in list_ids if str(value).strip()}
+        normalized_ids = self._validated_store_list_ids_for_item(item_id, list_ids)
         with self._connect() as conn:
             conn.execute("DELETE FROM product_store_lists WHERE item_id=?", (item_id,))
             for list_id in normalized_ids:
@@ -12360,7 +12796,7 @@ class V2Store(AppStore):
                     "INSERT OR IGNORE INTO product_store_lists(item_id,list_id) VALUES(?,?)",
                     (item_id, list_id),
                 )
-        self.add_event("store_binding", f"更新商品 {item_id} 的门店表", {"list_ids": sorted(normalized_ids)})
+        self.add_event("store_binding", f"更新商品 {item_id} 的门店表", {"list_ids": normalized_ids})
 
     def list_stores(self, list_id: int, query: str = "", limit: int = 100) -> List[Dict]:
         query_norm = normalize_text(query)
