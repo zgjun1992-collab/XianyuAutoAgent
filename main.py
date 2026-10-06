@@ -17,7 +17,7 @@ from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from app_store import (
     AppStore, PolicyEngine, DEFAULT_POLICIES, MANUAL_REVIEW_NOTICE,
-    find_unauthorized_promises,
+    find_unauthorized_promises, non_manual_promise_replacement,
 )
 from privacy_guard import redact_sensitive_text
 
@@ -172,6 +172,9 @@ class XianyuLive:
     def sanitize_buyer_reply(text):
         """Remove internal vocabulary and unverified coverage claims."""
         value = str(text or "").strip()
+        safe_replacement = non_manual_promise_replacement(value)
+        if safe_replacement:
+            return safe_replacement
         if find_unauthorized_promises(value):
             return DEFAULT_POLICIES["manual_review_notice"]
         value = re.sub(r"(?i)sku", "商品规格", value)
@@ -2215,7 +2218,7 @@ class XianyuLive:
                 decision.action = "allow"
                 decision.reasons = []
                 decision.suggested_reply = bot_reply
-            reply_mode = policies.get("reply_mode", "review")
+            reply_mode = policies.get("reply_mode", "auto")
             requires_review = reply_mode == "review" or decision.action == "review"
             final_reply = self.sanitize_buyer_reply(decision.suggested_reply)
             audit_id = self.app_store.create_audit(

@@ -274,6 +274,8 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("数据库", text)
         self.assertNotIn("全国通用", text)
         self.assertNotIn("所有门店都能用", text)
+        self.assertIn("具体门店名称", text)
+        self.assertNotIn("人工", text)
 
     def test_buyer_reply_sanitizer_keeps_safe_coverage_denial_natural(self):
         text = XianyuLive.sanitize_buyer_reply("当前商品不是全国通用。")

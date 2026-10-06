@@ -237,9 +237,9 @@ class DesktopApp:
     def _build_policy(self):
         top = ttk.LabelFrame(self.policy_tab, text="发送模式", padding=12)
         top.pack(fill="x")
-        self.reply_mode_var = tk.StringVar(value="review")
-        ttk.Radiobutton(top, text="人工审核（推荐）", value="review", variable=self.reply_mode_var).pack(side="left")
-        ttk.Radiobutton(top, text="安全消息自动发送", value="auto", variable=self.reply_mode_var).pack(side="left", padx=20)
+        self.reply_mode_var = tk.StringVar(value="auto")
+        ttk.Radiobutton(top, text="人工审核（所有回复先确认）", value="review", variable=self.reply_mode_var).pack(side="left")
+        ttk.Radiobutton(top, text="自动回复（仅高风险转人工，推荐）", value="auto", variable=self.reply_mode_var).pack(side="left", padx=20)
 
         fallbacks = ttk.LabelFrame(self.policy_tab, text="高风险安全回复", padding=12)
         fallbacks.pack(fill="x", pady=10)

@@ -5,7 +5,8 @@ import unittest
 from app_store import (
     AppStore, DEFAULT_POLICIES, LEGACY_AFTERSALE_POLICY_RAW,
     LEGACY_AFTERSALE_POLICY_SUMMARY, LEGACY_GLOBAL_SYSTEM_PROMPT,
-    PolicyEngine, find_unauthorized_promises,
+    PRODUCT_USAGE_SAFE_REPLY, PolicyEngine, STORE_SCOPE_SAFE_REPLY,
+    find_unauthorized_promises,
 )
 from XianyuApis import XianyuApis, XianyuVerificationRequired
 
@@ -105,8 +106,34 @@ class AppStoreTests(unittest.TestCase):
         for phrase in phrases:
             with self.subTest(phrase=phrase):
                 result = PolicyEngine().evaluate("你好", phrase)
-                self.assertEqual("review", result.action)
-                self.assertEqual(DEFAULT_POLICIES["manual_review_notice"], result.suggested_reply)
+                if any(word in phrase for word in ("能用", "门店", "全国通用")):
+                    self.assertEqual("replace", result.action)
+                    self.assertEqual(STORE_SCOPE_SAFE_REPLY, result.suggested_reply)
+                    self.assertNotIn("人工", result.suggested_reply)
+                else:
+                    self.assertEqual("review", result.action)
+                    self.assertEqual(DEFAULT_POLICIES["manual_review_notice"], result.suggested_reply)
+
+    def test_store_scope_question_never_uses_manual_fallback(self):
+        decision = PolicyEngine().evaluate(
+            "哪里都能用吗？", "可以，所有门店都能用。",
+        )
+        self.assertEqual("replace", decision.action)
+        self.assertEqual(STORE_SCOPE_SAFE_REPLY, decision.suggested_reply)
+        self.assertNotIn("人工", decision.suggested_reply)
+
+        external = PolicyEngine().evaluate("怎么使用", "请去美团APP查看。")
+        self.assertEqual("replace", external.action)
+        self.assertEqual(PRODUCT_USAGE_SAFE_REPLY, external.suggested_reply)
+        self.assertNotIn("人工", external.suggested_reply)
+
+        for message in (
+            "武汉所有店铺都可以吗", "武汉全部门店能用吗", "武汉每家店都可以吗",
+        ):
+            with self.subTest(message=message):
+                scoped = PolicyEngine().evaluate(message, "请按已配置门店名单使用。")
+                self.assertEqual("allow", scoped.action)
+                self.assertNotIn("人工", scoped.suggested_reply)
 
     def test_safe_negation_does_not_become_a_false_promise(self):
         for draft in (
@@ -286,6 +313,23 @@ class AppStoreTests(unittest.TestCase):
     def test_discounted_total_question_is_not_treated_as_bargaining(self):
         decision = PolicyEngine(DEFAULT_POLICIES).evaluate("273优惠完多少", "正常凑单答复")
         self.assertEqual("allow", decision.action)
+
+    def test_generic_offer_question_is_not_sent_to_manual_review(self):
+        for message in ("今天啥优惠", "今日有什么优惠", "现在有优惠吗"):
+            with self.subTest(message=message):
+                decision = PolicyEngine(DEFAULT_POLICIES).evaluate(
+                    message, "当前商品优惠如下。",
+                )
+                self.assertEqual("allow", decision.action)
+
+        for message in ("还能优惠一点么", "还能优惠一点吗", "还能再优惠一点吗"):
+            with self.subTest(message=message):
+                bargain = PolicyEngine(DEFAULT_POLICIES).evaluate(message, "")
+                self.assertEqual("replace", bargain.action)
+                self.assertEqual(
+                    DEFAULT_POLICIES["price_fallback"], bargain.suggested_reply,
+                )
+                self.assertNotIn("人工", bargain.suggested_reply)
 
     def test_real_bargaining_still_uses_price_fallback(self):
         decision = PolicyEngine(DEFAULT_POLICIES).evaluate("还能再优惠一点吗", "")

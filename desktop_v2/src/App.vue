@@ -17,7 +17,7 @@ const snapshot = reactive({
 })
 const productDraft = reactive({ item_id: '', title: '', raw_text: '', enabled: true, ai_summary: '', ai_draft_summary: '', structured: {}, ai_draft_structured: {}, source_update: {}, time_rules: [], store_lists: [], store_list_ids: [], skus: [], image_assets: [], platform_summary: '', thumbnail_url: '', image_urls: [], price: '', item_status: 'onsale', source_type: 'manual', sync_status: 'manual', manual_edited: false, last_synced_at: '', first_reply_enabled: true, first_reply_text: '', first_reply_manual: false, first_reply_generated_at: '', coupon_type: 'meituan', coupon_type_custom: '', coupon_instructions: '', custom_policy_enabled: false, custom_policy_raw: '', custom_policy_summary: '', order_notice_enabled: true })
 const configDraft = reactive({ api_key: '', base_url: '', model: '', api_key_saved: false, cookie_saved: false, cookie_updated_at: '' })
-const policyDraft = reactive({ reply_mode: 'review', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
+const policyDraft = reactive({ reply_mode: 'auto', global_system_prompt: '', max_reply_rounds: 25, conversation_reset_hours: 24, safe_fallback: '', manual_review_notice: '', price_fallback: '', refund_fallback: '', forbidden_phrases_text: '', order_payment_notice_enabled: true, aftersale_policy_raw: '', aftersale_policy_summary: '' })
 const importDraft = reactive({ name: '', path: '', item_ids: [], text: '', preview: null })
 const imageDraft = reactive({ id: null, source_path: '', name: '', purpose: '', trigger_words_text: '', reply_text: '', enabled: true })
 const promotionQrDraft = reactive({ source_path: '' })
@@ -133,7 +133,7 @@ function applySnapshot(data) {
   if (!testDraft.item_id && data.products.length) testDraft.item_id = data.products[0].item_id
   if (!policiesLoaded && data.policies) {
     policiesLoaded = true
-    policyDraft.reply_mode = data.policies.reply_mode || 'review'
+    policyDraft.reply_mode = data.policies.reply_mode || 'auto'
     policyDraft.global_system_prompt = data.policies.global_system_prompt || ''
     policyDraft.max_reply_rounds = Number(data.policies.max_reply_rounds || 25)
     policyDraft.conversation_reset_hours = Number(data.policies.conversation_reset_hours || 24)

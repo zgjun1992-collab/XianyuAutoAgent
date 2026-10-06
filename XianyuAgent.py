@@ -5,7 +5,10 @@ import os
 import sys
 from openai import OpenAI
 from loguru import logger
-from app_store import DEFAULT_POLICIES, find_unauthorized_promises
+from app_store import (
+    DEFAULT_POLICIES, find_unauthorized_promises,
+    non_manual_promise_replacement,
+)
 from privacy_guard import redact_sensitive_text
 
 
@@ -78,12 +81,15 @@ class XianyuReplyBot:
             logger.error(f"加载提示词时出错: {e}")
             raise
 
-    def _safe_filter(self, text: str) -> str:
+    def _safe_filter(self, text: str, user_message: str = "") -> str:
         """安全过滤模块"""
         text = str(text or "").strip()
         blocked_phrases = ["微信", "QQ", "支付宝", "银行卡", "线下"]
         if any(p in text for p in blocked_phrases):
             return "请通过闲鱼平台沟通和交易。"
+        safe_replacement = non_manual_promise_replacement(text, user_message)
+        if safe_replacement:
+            return safe_replacement
         if find_unauthorized_promises(text):
             return DEFAULT_POLICIES["manual_review_notice"]
         text = re.sub(r"(?i)sku", "商品规格", text)

@@ -48,9 +48,18 @@ MANUAL_REVIEW_NOTICE = (
     "该事项已记录并转交人工核实。人工每天24点统一查阅一次，请留意后续回复。"
 )
 
+STORE_SCOPE_SAFE_REPLY = (
+    "当前商品仅限已确认的适用门店使用，并非所有门店通用。"
+    "请发送城市和具体门店名称，我帮您查询。"
+)
+PRODUCT_USAGE_SAFE_REPLY = (
+    "请以当前商品资料和闲鱼订单页面显示的领取、使用规则为准。"
+    "请告诉我具体规格或面额，我按当前商品资料确认操作方式。"
+)
+
 
 DEFAULT_POLICIES = {
-    "reply_mode": "review",
+    "reply_mode": "auto",
     "global_system_prompt": (
         LEGACY_GLOBAL_SYSTEM_PROMPT
         + "不同平台的卡券不得混用；商品资料未明确允许时，代金券不得与套餐、团购或其他优惠一起使用；"
@@ -138,6 +147,24 @@ def find_unauthorized_promises(text: str, configured_phrases=None) -> List[str]:
     return list(dict.fromkeys(hits))
 
 
+def non_manual_promise_replacement(
+    text: str, user_message: str = "", configured_phrases=None,
+) -> str:
+    """Replace coverage hallucinations safely instead of pretending to hand off."""
+    hits = find_unauthorized_promises(text, configured_phrases)
+    if not hits:
+        return ""
+    coverage_patterns = (
+        r"全国通用|门店|店铺|保证能用|肯定能用|建议联系门店",
+        r"(?:所有|全部|全国|任意).*(?:能用|可用|可以用|通用)",
+    )
+    if all(any(re.search(pattern, hit) for pattern in coverage_patterns) for hit in hits):
+        return STORE_SCOPE_SAFE_REPLY
+    if all(re.search(r"去美团", hit) for hit in hits):
+        return PRODUCT_USAGE_SAFE_REPLY
+    return ""
+
+
 @dataclass
 class PolicyDecision:
     action: str
@@ -184,6 +211,7 @@ class PolicyEngine:
         bargain_patterns = (
             r"(?:便宜(?:点|些)?|少(?:点|些)|砍价|最低价|底价|小刀|价格可谈)",
             r"(?:能|可以|可否|是否)[^。！？]{0,8}(?:优惠|便宜|少点|小刀)",
+            r"(?:能|可以|可否|是否|能不能)[^。！？]{0,8}(?:改价|降价)",
             r"\d+(?:\.\d+)?元?(?:可以|行吗|能卖|出吗)",
             r"能不能[^。！？]{0,8}(?:少|便宜|优惠)",
         )
@@ -199,12 +227,44 @@ class PolicyEngine:
         promise_hits = find_unauthorized_promises(
             draft, self.policies.get("forbidden_phrases")
         )
+        non_manual_replacement = non_manual_promise_replacement(
+            draft, user_message, self.policies.get("forbidden_phrases"),
+        )
+        if promise_hits and non_manual_replacement:
+            return PolicyDecision(
+                "replace",
+                ["草稿包含未经核实的门店通用范围，已改为查询具体门店"],
+                non_manual_replacement,
+            )
         risk_source = re.sub(r"优惠券|代金券|优惠规则|优惠活动|优惠叠加", "", user_message)
         informational_discount_question = bool(re.search(
             r"(?:\d+(?:\.\d+)?\s*(?:元|块)?\s*)?"
             r"(?:优惠完|优惠后|打折后)[^。！？]{0,8}(?:多少|多少钱)|"
             r"(?:实际|最后|合计|总共)[^。！？]{0,8}(?:花|付|支付)[^。！？]{0,4}多少|"
             r"(?:能|可以)?省多少",
+            user_message,
+        ))
+        compact_discount_query = re.sub(
+            r"[\s，,。.!！?？~～]+", "", user_message,
+        )
+        compact_discount_query = re.sub(
+            r"^(?:你好|您好|请问|老板|亲)+", "", compact_discount_query,
+        )
+        generic_offer_question = bool(re.fullmatch(
+            r"(?:(?:今天|今日|明天|明日|后天|现在|当前|目前))?"
+            r"(?:有|有没有|有啥|有什么|啥|什么|都有什么|有哪些|是啥|是什么|怎么)?"
+            r"优惠(?:活动|方案)?(?:吗|么|嘛|呢)?",
+            compact_discount_query,
+        ))
+        informational_discount_question = (
+            informational_discount_question or generic_offer_question
+        )
+        informational_store_scope_question = bool(re.search(
+            r"(?:哪里|哪儿|哪|随便哪|所有|全部|全国|全城|每家|每个|任意|通用)"
+            r"[^。！？\n]{0,10}(?:门店|店铺|店|地方)?[^。！？\n]{0,6}"
+            r"(?:都|全部|所有)?(?:通用|可用|能用|可以用|可以)(?:吗|么|嘛|呢|是吗)?|"
+            r"(?:门店|店铺|店)[^。！？\n]{0,6}(?:都|全部|所有)"
+            r"[^。！？\n]{0,4}(?:通用|可用|能用|可以用|可以)(?:吗|么|嘛|呢|是吗)?",
             user_message,
         ))
         # “不用改价/无需改价” confirms that the buyer will pay the displayed
@@ -230,6 +290,8 @@ class PolicyEngine:
             if p in risk_source and p not in {"退款", "退货"}
             and not (p == "优惠" and informational_discount_question)
             and not (p == "改价" and no_price_change_confirmation)
+            and not (p in {"所有门店", "全国通用", "保证", "承诺"}
+                     and informational_store_scope_question)
         ]
         if refund_needs_review:
             risk_hits.insert(0, "需要核验的退款事项")
