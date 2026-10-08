@@ -2312,6 +2312,19 @@ class V2StoreTests(unittest.TestCase):
             resolved["reply"],
         )
 
+    def test_unmatched_full_address_never_falls_through_to_model(self):
+        self.store.import_store_list(self.create_store_sheet(), "北京门店", ["10001"])
+        message = "解放中路276号奉发·古华庭16栋1楼101-102号"
+
+        result = self.store.resolve_deterministic("10001", message)
+
+        self.assertIsNotNone(result)
+        self.assertEqual("stores", result["kind"])
+        self.assertEqual("deny", result["decision"])
+        self.assertEqual("unavailable", result["store_status"])
+        self.assertIn("未查询到可用门店", result["reply"])
+        self.assertNotIn("可以用", result["reply"])
+
     def test_city_with_which_stores_wording_lists_only_that_city(self):
         self.store.import_store_text(
             "【广东省】\n【深圳】南昌品牌深圳店\n【江西省】\n【南昌】万寿宫店、北京东路店",

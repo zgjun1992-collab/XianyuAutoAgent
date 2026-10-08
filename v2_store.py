@@ -13001,6 +13001,20 @@ class V2Store(AppStore):
             return True
         if any(query_key.startswith(area) for area in known_areas if len(area) >= 2):
             return True
+        # A buyer may paste a full street address without saying “门店” and
+        # without supplying the city, for example “解放中路276号…16栋1楼101室”.
+        # Such text must stay inside the verified store-table path even when no
+        # row matches it.  Letting an unmatched address fall through to the
+        # language model can turn a real ``unavailable`` lookup into an invented
+        # positive coverage claim.
+        address_like = bool(re.search(
+            r"(?:路|街|巷|道|大道|街道|胡同|弄)\s*\d+[A-Za-z0-9-]*号?|"
+            r"\d+(?:号|栋|幢|座|单元|层|楼|室|铺)",
+            raw_query,
+            re.I,
+        ))
+        if address_like:
+            return True
         if re.search(
             r"(?:省|市|区|县|镇|乡|村|街道|大道|路|街|巷|"
             r"商圈|商场|广场|购物中心|门店|分店|店)$",

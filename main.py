@@ -214,6 +214,29 @@ class XianyuLive:
         if unsupported:
             detail = "、".join(f"{number}{unit}" for number, unit in unsupported[:5])
             return f"模型草稿包含资料中没有的数字：{detail}"
+
+        # This guard runs only after the deterministic resolver did not produce
+        # a verified answer.  A positive store-coverage statement from the model
+        # is therefore never evidence-backed.  In particular, pasted addresses
+        # may share a road name or house number with unrelated configured stores;
+        # the model must not infer availability from that resemblance.
+        message_text = str(user_message or "")
+        reply_text = str(reply or "")
+        store_location_query = bool(re.search(
+            r"门店|店铺|分店|商场|广场|购物中心|"
+            r"(?:路|街|巷|道|大道|街道|胡同|弄)\s*\d+[A-Za-z0-9-]*号?|"
+            r"\d+(?:号|栋|幢|座|单元|层|楼|室|铺)",
+            message_text,
+            re.I,
+        ))
+        positive_store_claim = bool(re.search(
+            r"(?:该|这|这个)?(?:门店|店铺|店)?(?:在)?(?:当前商品的)?(?:适用|可用)范围内|"
+            r"(?:该|这|这个)?(?:门店|店铺|店).{0,12}(?:可以用|可使用|能用|适用)|"
+            r"(?:可以用|可以使用|可用|能用|支持使用)",
+            reply_text,
+        ))
+        if store_location_query and positive_store_claim:
+            return "模型草稿在没有门店表匹配证据时声称门店可用"
         return ""
 
     @staticmethod
@@ -225,8 +248,14 @@ class XianyuLive:
                 "当前商品资料中暂未找到能确认的对应价格。"
                 "请告诉我具体商品规格、人数、使用日期或消费金额，我再为您准确查询。"
             )
-        if re.search(r"门店|店铺|地址|哪里|哪家|商场|广场", text):
-            return "请发送城市和具体店名，我会按当前商品的可用门店资料为您查询。"
+        if re.search(
+            r"门店|店铺|地址|哪里|哪家|商场|广场|购物中心|"
+            r"(?:路|街|巷|道|大道|街道|胡同|弄)\s*\d+[A-Za-z0-9-]*号?|"
+            r"\d+(?:号|栋|幢|座|单元|层|楼|室|铺)",
+            text,
+            re.I,
+        ):
+            return "当前地址或门店未在当前商品的可用门店资料中匹配到。请补充城市和具体店名，我继续为您核对。"
         return "当前商品资料暂时无法准确回答这个问题，请补充具体想查询的商品、门店或使用条件。"
 
     @staticmethod

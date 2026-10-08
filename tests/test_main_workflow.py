@@ -362,6 +362,25 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("55元", reason)
 
+    def test_model_grounding_blocks_unverified_positive_store_claim_for_address(self):
+        message = "解放中路276号奉发·古华庭16栋1楼101-102号"
+        reason = XianyuLive.model_reply_grounding_issue(
+            message,
+            "当前商品仅限已配置门店使用。",
+            [],
+            "该门店在适用范围内。",
+        )
+        self.assertIn("没有门店表匹配证据", reason)
+        self.assertEqual(
+            "",
+            XianyuLive.model_reply_grounding_issue(
+                message,
+                "当前商品仅限已配置门店使用。",
+                [],
+                "请补充城市和具体店名，我继续核对。",
+            ),
+        )
+
     def test_grounding_failure_uses_clarification_instead_of_fake_manual_transfer(self):
         price = XianyuLive.grounding_fallback_reply("388多少")
         self.assertIn("具体商品规格", price)
@@ -369,6 +388,11 @@ class MainWorkflowTests(unittest.IsolatedAsyncioTestCase):
         store = XianyuLive.grounding_fallback_reply("万达店在哪里")
         self.assertIn("城市和具体店名", store)
         self.assertNotIn("人工", store)
+        address = XianyuLive.grounding_fallback_reply(
+            "解放中路276号奉发·古华庭16栋1楼101-102号"
+        )
+        self.assertIn("未在当前商品的可用门店资料中匹配到", address)
+        self.assertNotIn("人工", address)
 
     def test_ordinary_review_does_not_lock_the_whole_conversation(self):
         self.assertFalse(XianyuLive.requires_persistent_manual_takeover(
