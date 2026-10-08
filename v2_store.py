@@ -11589,6 +11589,47 @@ class V2Store(AppStore):
                 "store_context_update": context_update,
             }
 
+        # A verified store answer also scopes a following bare SKU name such
+        # as “单人”, “双人呢” or “轻享”.  This must work even when every SKU
+        # inherits the same store list; the buyer is selecting a product
+        # specification, not asking whether SKU store scopes differ.
+        bare_named_skus = self._explicit_store_skus(item_id, text, product)
+        bare_reference = re.sub(
+            r"^(?:那|那么|这个|这款|就要|要|选|拍)", "",
+            normalize_match_text(compact),
+        )
+        bare_reference = re.sub(r"(?:的|呢|吧|呀|啊|吗)$", "", bare_reference)
+        bare_named_sku_followup = bool(
+            len(bare_named_skus) == 1
+            and bare_reference
+            and len(bare_reference) <= 16
+            and bare_reference in normalize_match_text(
+                bare_named_skus[0].get("sku_name") or ""
+            )
+            and not re.search(
+                r"多少钱|多钱|价格|售价|怎么|如何|能用|可以用|可用|"
+                r"有吗|有没有|能买吗|能拍|门店|店|今天|明天|工作日|周末|节假日",
+                compact,
+            )
+        )
+        if bare_named_sku_followup and matrix:
+            selected = bare_named_skus[0]
+            query = str(context.get("query") or "刚才查询的门店")
+            selection_context = {
+                "selected_sku_key": selected["sku_key"],
+                "selected_sku_name": selected.get("sku_name", ""),
+            }
+            return {
+                "reply": self._format_store_sku_matrix(query, matrix, [selected]),
+                "source": "当前会话已确认门店与真实SKU门店绑定",
+                "decision": "allow", "kind": "stores_sku_recommendation",
+                "store_matches": [row.get("store") or {} for row in matrix],
+                "store_query": query, "store_status": "available",
+                "store_sku_matrix": matrix,
+                "query_context_update": selection_context,
+                "store_context_update": selection_context,
+            }
+
         # Store-aware yes/no answers are valid only when SKU applicability
         # truly differs by physical store. Shared store scopes must keep amount
         # follow-ups on the ordinary purchase-recommendation path.
@@ -13642,6 +13683,21 @@ class V2Store(AppStore):
             "decision": "allow", "kind": "usage_scope",
         }
 
+    @staticmethod
+    def _merge_child_query_contexts(children) -> Dict:
+        """Keep follow-up slots produced by every branch of a compound reply."""
+        merged: Dict = {}
+        for child in children:
+            update = child.get("query_context_update") if isinstance(child, dict) else None
+            if not isinstance(update, dict):
+                continue
+            for key, value in update.items():
+                if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                    merged[key] = {**merged[key], **value}
+                else:
+                    merged[key] = value
+        return merged
+
     def resolve_multi_question(
         self, item_id: str, product: Dict, message: str,
         actual_paid_amount: object = None, store_context: Optional[Dict] = None,
@@ -14263,13 +14319,16 @@ class V2Store(AppStore):
                 kind for _, kind, _, _ in ordered_tasks
             ],
         }
+        merged_context = self._merge_child_query_contexts(child_results)
+        if merged_context:
+            result["query_context_update"] = merged_context
         store_child = next((
             child for child in child_results if "store_matches" in child
         ), None)
         if store_child:
             for key in (
                 "store_matches", "store_query", "store_status", "store_sku_matrix",
-                "store_context_update", "query_context_update",
+                "store_context_update",
             ):
                 if key in store_child:
                     result[key] = store_child[key]
@@ -14408,13 +14467,18 @@ class V2Store(AppStore):
             "resolved_intents": [intent for intent, _, _ in resolved],
             "semantic_assisted": True,
         }
+        merged_context = self._merge_child_query_contexts(
+            child for _, _, child in resolved
+        )
+        if merged_context:
+            result["query_context_update"] = merged_context
         store_child = next((
             child for _, _, child in resolved if "store_matches" in child
         ), None)
         if store_child:
             for key in (
                 "store_matches", "store_query", "store_status", "store_sku_matrix",
-                "store_context_update", "query_context_update",
+                "store_context_update",
             ):
                 if key in store_child:
                     result[key] = store_child[key]

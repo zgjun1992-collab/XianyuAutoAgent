@@ -847,6 +847,39 @@ class V2StoreTests(unittest.TestCase):
         )
         self.assertNotEqual("stores_sku_recommendation", promotion["kind"])
 
+    def test_shared_store_list_bare_sku_followup_keeps_verified_store(self):
+        self.store.save_v2_product(
+            "10001", "流浪泡泡烤肉自助",
+            "单人自助：售价56.6元\n"
+            "双人自助：售价113.2元\n"
+            "三人自助：售价169.8元",
+        )
+        self.store.import_store_text(
+            "【湖南省】\n【湘潭】湘潭高新万达广场店",
+            "湖南通用门店", ["10001"],
+        )
+        initial = self.store.resolve_deterministic("10001", "你好湘潭可以用吗")
+        self.assertEqual("stores", initial["kind"])
+        context = {
+            "query": initial["store_query"],
+            "matches": initial["store_matches"],
+            "status": initial["store_status"],
+        }
+
+        for message in ("单人", "单人呢", "这款单人"):
+            with self.subTest(message=message):
+                followup = self.store.resolve_deterministic(
+                    "10001", message, store_context=context,
+                )
+                self.assertEqual("stores_sku_recommendation", followup["kind"])
+                self.assertIn("湘潭高新万达广场店", followup["reply"])
+                self.assertIn("单人自助可以使用（售价56.6元）", followup["reply"])
+                self.assertNotIn("双人自助", followup["reply"])
+                self.assertEqual(
+                    "单人自助",
+                    followup["query_context_update"]["selected_sku_name"],
+                )
+
     def test_multi_sku_city_up_to_three_lists_each_store_specs(self):
         self.store.save_v2_product(
             "10001", "多规格代金券",
@@ -5956,6 +5989,34 @@ class V2StoreTests(unittest.TestCase):
         self.assertIn("共146.7元", result["reply"])
         self.assertIn("\n\n", result["reply"])
         self.assertNotIn("1. 适用门店", result["reply"])
+
+    def test_multi_intent_preserves_people_prompt_for_short_followups(self):
+        self.store.save_v2_product(
+            "10001", "鹤一烤肉自助餐",
+            "工作日午市单人：售价134元\n"
+            "工作日午市双人：售价268元\n"
+            "工作日午市三人：售价402元",
+        )
+        initial = self.store.resolve_deterministic(
+            "10001", "工作日中午可以直接拍吗",
+        )
+        self.assertEqual("multi_intent", initial["kind"])
+        self.assertIn("请问您是几个人用餐", initial["reply"])
+        self.assertEqual(
+            "people_count",
+            initial["query_context_update"]["price_filters"]["awaiting"],
+        )
+
+        for message in ("2个", "两个", "2人", "两位"):
+            with self.subTest(message=message):
+                followup = self.store.resolve_deterministic(
+                    "10001", message,
+                    store_context=initial["query_context_update"],
+                )
+                self.assertEqual("price", followup["kind"])
+                self.assertIn("工作日午市双人", followup["reply"])
+                self.assertIn("268元", followup["reply"])
+                self.assertNotIn("暂时无法准确", followup["reply"])
 
     def test_composed_sku_quantity_reply_uses_delivered_coupon_units(self):
         self.store.save_v2_product(
